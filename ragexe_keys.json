@@ -1,0 +1,12 @@
+{
+  "target_exe": "D:\\Jogos\\Ragnarok\\Ragexe.exe",
+  "is_packed": true,
+  "packer_detected": "Themida/WinLicense",
+  "candidates": [],
+  "keys": [
+    0,
+    0,
+    0
+  ],
+  "notes": "Nenhuma referencia direta exposta no binario estatico. Secoes detectadas: ['        ', '        ', '        ', '        ', '        ', '.debug', '.edata', '.idata', '.tls', '.rsrc', '.themida', '.boot', '.reloc']. Binario empacotado com Themida. Chave padrao [0, 0, 0] (trafego puro/sem ofuscacao)."
+}

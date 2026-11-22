@@ -1,0 +1,3 @@
+scapy>=2.6,<3
+psutil>=6.0.0
+ragx @ https://codeload.github.com/joaopedrosgs/ragx/zip/74607e6158df5f6a388cdb14a1a4e03fdb5228b3

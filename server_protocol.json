@@ -1,0 +1,24 @@
+{
+  "attack": {
+    "opcode": 1079,
+    "total_len": 8,
+    "gid_offset": 2,
+    "action": 7,
+    "trailer": 35,
+    "template_hex": "37048b0100000723",
+    "extra_bytes": "0723"
+  },
+  "move": {
+    "opcode": 863,
+    "move_len": 6,
+    "extra_bytes": "f3"
+  },
+  "pickup": {
+    "opcode": 866,
+    "total_len": 7,
+    "gid_offset": 2,
+    "trailer": 81,
+    "template_hex": "6203b23d010051",
+    "extra_bytes": "51"
+  }
+}
