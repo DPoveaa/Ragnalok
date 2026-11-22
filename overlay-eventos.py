@@ -289,6 +289,9 @@ class LiveFeed:
             for (kind, aid), entity in entities:
                 render_now = now - (0.12 if kind == "mob" else 0.0)
                 fx, fy = entity.track.cell(render_now)
+                # Ignora entidades com coordenadas inválidas (0, 0)
+                if fx <= 0 or fy <= 0:
+                    continue
                 # 1. Âncora no chão (sprite_z = 0.0)
                 anchor_u, anchor_v = project(fx, fy, 0.0)
                 # 2. Centro visual do sprite: sprite_z = 5.5 para mob/npc, 1.2 para drop/warp
@@ -314,6 +317,8 @@ class LiveFeed:
                     if now_m - p_t > 15.0:
                         continue
                     p_fx, p_fy = p_cell
+                    if p_fx <= 0 or p_fy <= 0:
+                        continue
                     p_anc_u, p_anc_v = project(p_fx, p_fy, 0.0)
                     p_clk_u, p_clk_v = project(p_fx, p_fy, 5.5)
                     if (-0.2 <= p_clk_u <= 1.2 and -0.2 <= p_clk_v <= 1.2) or (-0.2 <= p_anc_u <= 1.2 and -0.2 <= p_anc_v <= 1.2):
@@ -366,7 +371,7 @@ class MOUSEINPUT(ctypes.Structure):
         ("mouseData", wintypes.DWORD),
         ("dwFlags", wintypes.DWORD),
         ("time", wintypes.DWORD),
-        ("dwExtraInfo", ULONG_PTR),
+        ("dwExtraInfo", ctypes.c_void_p),
     ]
 
 
@@ -376,7 +381,7 @@ class KEYBDINPUT(ctypes.Structure):
         ("wScan", wintypes.WORD),
         ("dwFlags", wintypes.DWORD),
         ("time", wintypes.DWORD),
-        ("dwExtraInfo", ULONG_PTR),
+        ("dwExtraInfo", ctypes.c_void_p),
     ]
 
 
@@ -406,24 +411,8 @@ class INPUT(ctypes.Structure):
 
 assert ctypes.sizeof(INPUT) == 40, f"INPUT size={ctypes.sizeof(INPUT)}, expected 40"
 
-
-class _MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", wintypes.LONG),
-        ("dy", wintypes.LONG),
-        ("mouseData", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_void_p),
-    ]
-
-class _INPUT_UNION(ctypes.Union):
-    _fields_ = [("mi", _MOUSEINPUT), ("_pad", ctypes.c_byte * 32)]
-
-class _INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("union", _INPUT_UNION)]
-
-assert ctypes.sizeof(_INPUT) == 40, f"_INPUT size={ctypes.sizeof(_INPUT)}, expected 40"
+_MOUSEINPUT = MOUSEINPUT
+_INPUT = INPUT
 
 
 # --- Windows Native Touch Injection Structures ---
@@ -433,6 +422,7 @@ POINTER_FLAG_NEW = 0x00000001
 POINTER_FLAG_INRANGE = 0x00000002
 POINTER_FLAG_INCONTACT = 0x00000004
 POINTER_FLAG_PRIMARY = 0x00002000
+POINTER_FLAG_CONFIDENCE = 0x00000400
 POINTER_FLAG_DOWN = 0x00010000
 POINTER_FLAG_UPDATE = 0x00020000
 POINTER_FLAG_UP = 0x00040000
@@ -483,7 +473,7 @@ u32.SetCursorPos.restype = wintypes.BOOL
 u32.GetCursorPos.argtypes = (ctypes.POINTER(wintypes.POINT),)
 u32.GetCursorPos.restype = wintypes.BOOL
 
-u32.SendInput.argtypes = (wintypes.UINT, ctypes.c_void_p, ctypes.c_int)
+u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
 u32.SendInput.restype = wintypes.UINT
 
 u32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
@@ -492,11 +482,20 @@ u32.MapVirtualKeyW.restype = wintypes.UINT
 u32.mouse_event.argtypes = (wintypes.DWORD, ctypes.c_long, ctypes.c_long, wintypes.DWORD, ULONG_PTR)
 u32.mouse_event.restype = None
 
-u32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+u32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 u32.PostMessageW.restype = wintypes.BOOL
 
 u32.IsWindow.argtypes = (wintypes.HWND,)
 u32.IsWindow.restype = wintypes.BOOL
+
+u32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+u32.FindWindowW.restype = wintypes.HWND
+
+u32.BringWindowToTop.argtypes = (wintypes.HWND,)
+u32.BringWindowToTop.restype = wintypes.BOOL
+
+u32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+u32.SetForegroundWindow.restype = wintypes.BOOL
 
 u32.InitializeTouchInjection.argtypes = (wintypes.UINT, wintypes.DWORD)
 u32.InitializeTouchInjection.restype = wintypes.BOOL
@@ -901,7 +900,7 @@ class CameraTracker:
                 return u32.CallNextHookEx(self._wheel_hook, nCode, wParam, lParam)
 
             self._wheel_hook_proc = HOOKPROC(_wheel_proc)
-            h_mod = u32.GetModuleHandleW(None)
+            h_mod = ctypes.windll.kernel32.GetModuleHandleW(None)
             self._wheel_hook = u32.SetWindowsHookExW(WH_MOUSE_LL, self._wheel_hook_proc, h_mod, 0)
         except Exception:
             self._wheel_hook = None
@@ -953,36 +952,40 @@ class InterceptionDriver:
         self.context = None
         self.mouse_dev = None
         self.is_available = False
+        self.dll_loaded = False
+        self.context_failed = False
+        self.failure_reason = ""
 
-        paths_to_try = []
-        if dll_path:
-            paths_to_try.append(Path(dll_path))
         base_dir = Path(__file__).resolve().parent
-        paths_to_try.extend([
-            base_dir / "interception.dll",
-            base_dir / "bin" / "interception.dll",
-            Path("interception.dll"),
-        ])
+        fallback_path = (base_dir / "interception.dll").resolve()
 
-        target = None
-        for p in paths_to_try:
-            if p.is_file():
-                target = str(p)
-                break
+        if dll_path:
+            chosen_path = Path(dll_path).resolve()
+        else:
+            chosen_path = fallback_path
 
-        if not target:
-            try:
-                self.dll = ctypes.CDLL("interception.dll")
-                target = "interception.dll"
-            except Exception:
-                return
+        self.dll_path = str(chosen_path)
 
-        if not self.dll:
-            try:
-                self.dll = ctypes.CDLL(target)
-            except Exception as exc:
-                print(f"[HID] Falha ao carregar {target}: {exc}", flush=True)
-                return
+        target_file = None
+        if chosen_path.is_file():
+            target_file = chosen_path
+        else:
+            for alt in [base_dir / "bin" / "interception.dll", Path("interception.dll").resolve()]:
+                if alt.is_file():
+                    target_file = alt
+                    self.dll_path = str(target_file)
+                    break
+
+        if not target_file:
+            self.failure_reason = f"Arquivo {self.dll_path} não encontrado"
+            return
+
+        try:
+            self.dll = ctypes.CDLL(str(target_file))
+            self.dll_loaded = True
+        except Exception as exc:
+            self.failure_reason = f"Falha ao carregar DLL ({exc})"
+            return
 
         try:
             self.dll.interception_create_context.restype = ctypes.c_void_p
@@ -994,7 +997,9 @@ class InterceptionDriver:
 
             self.context = self.dll.interception_create_context()
             if not self.context:
-                print("[HID] Contexto do Interception retornou NULL (driver instalado no Windows?).", flush=True)
+                self.context_failed = True
+                self.failure_reason = "Driver interception.sys não instalado no Windows ou reboot pendente"
+                print(f"[HID] {self.failure_reason}", flush=True)
                 return
 
             for dev in range(1, 21):
@@ -1006,36 +1011,70 @@ class InterceptionDriver:
                 self.is_available = True
                 print(f"[HID] Driver interception.dll carregado com sucesso (MouseDevice={self.mouse_dev}).", flush=True)
             else:
-                print("[HID] Interception carregado, mas nenhum dispositivo de mouse detectado.", flush=True)
+                self.failure_reason = "Nenhum dispositivo de mouse detectado"
+                print(f"[HID] {self.failure_reason}", flush=True)
         except Exception as exc:
-            print(f"[HID] Erro inicializando Interception: {exc}", flush=True)
+            self.failure_reason = f"Erro inicializando Interception: {exc}"
+            print(f"[HID] {self.failure_reason}", flush=True)
 
     def send_click(self, sx: int, sy: int, screen_w: int = 1920, screen_h: int = 1080) -> bool:
         if not self.is_available or not self.context or not self.mouse_dev:
             return False
         try:
-            norm_x = int((sx * 65535) / max(1, screen_w))
-            norm_y = int((sy * 65535) / max(1, screen_h))
+            # 1. Posição atual do cursor para deslizamento suave até (sx, sy)
+            pt = wintypes.POINT()
+            u32.GetCursorPos(ctypes.byref(pt))
+            x0, y0 = pt.x, pt.y
+            dist = math.hypot(sx - x0, sy - y0)
 
-            # Mover (INTERCEPTION_MOUSE_MOVE_ABSOLUTE = 0x001)
-            stroke_move = InterceptionMouseStroke(
+            if dist > 8.0:
+                steps = max(5, min(12, int(dist / 55)))
+                for i in range(1, steps + 1):
+                    t = i / steps
+                    eased = 1.0 - (1.0 - t) ** 2
+                    if i == steps:
+                        ix, iy = int(sx), int(sy)
+                    else:
+                        ix = int(round(x0 + (sx - x0) * eased)) + random.choice([-2, -1, 1, 2])
+                        iy = int(round(y0 + (sy - y0) * eased)) + random.choice([-2, -1, 1, 2])
+                    norm_ix = max(0, min(65535, int((ix * 65535) / max(1, screen_w))))
+                    norm_iy = max(0, min(65535, int((iy * 65535) / max(1, screen_h))))
+                    stroke_step = InterceptionMouseStroke(
+                        state=0, flags=0x001, rolling=0, x=norm_ix, y=norm_iy, information=0
+                    )
+                    self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_step), 1)
+                    u32.SetCursorPos(ix, iy)
+                    time.sleep(0.006)
+
+            # Pouso exato em (sx, sy)
+            norm_x = max(0, min(65535, int((sx * 65535) / max(1, screen_w))))
+            norm_y = max(0, min(65535, int((sy * 65535) / max(1, screen_h))))
+            stroke_land = InterceptionMouseStroke(
                 state=0, flags=0x001, rolling=0, x=norm_x, y=norm_y, information=0
             )
-            self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_move), 1)
-            time.sleep(0.015)
+            self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_land), 1)
+            u32.SetCursorPos(int(sx), int(sy))
 
-            # Left Down (INTERCEPTION_MOUSE_LEFT_BUTTON_DOWN = 0x001)
+            # 2. Aguarda 45ms para o DirectInput do Ragexe.exe atualizar o cursor de hover
+            time.sleep(0.045)
+
+            # 3. INTERCEPTION_MOUSE_LEFT_BUTTON_DOWN = 0x0001
             stroke_down = InterceptionMouseStroke(
                 state=0x0001, flags=0, rolling=0, x=0, y=0, information=0
             )
             self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_down), 1)
-            time.sleep(0.025)
 
-            # Left Up (INTERCEPTION_MOUSE_LEFT_BUTTON_UP = 0x002)
+            # 4. Aguarda 50ms de retenção física
+            time.sleep(0.050)
+
+            # 5. INTERCEPTION_MOUSE_LEFT_BUTTON_UP = 0x0002
             stroke_up = InterceptionMouseStroke(
                 state=0x0002, flags=0, rolling=0, x=0, y=0, information=0
             )
             self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_up), 1)
+
+            # 6. Registra confirmação de envio
+            log_click_file(f"Interception ({sx},{sy}) sent=1")
             return True
         except Exception as exc:
             print(f"[HID] Erro ao enviar clique via Interception: {exc}", flush=True)
@@ -1064,8 +1103,11 @@ class SerialHID:
         self.baudrate = baudrate
         self._serial_obj = None
         self._handle = None
+        self.failure_reason = ""
         if self.port:
             self.connect(self.port, self.baudrate)
+        else:
+            self.failure_reason = "Porta serial não informada"
 
     @property
     def is_connected(self) -> bool:
@@ -1076,6 +1118,7 @@ class SerialHID:
     def connect(self, port: str, baudrate: int = 115200) -> bool:
         self.port = port
         self.baudrate = baudrate
+        self.failure_reason = ""
         # 1. Tenta pyserial se disponível
         try:
             import serial
@@ -1085,6 +1128,7 @@ class SerialHID:
         except ImportError:
             pass
         except Exception as exc:
+            self.failure_reason = f"pyserial falhou: {exc}"
             print(f"[SerialHID] pyserial falhou em {self.port}: {exc}. Tentando Win32 nativo...", flush=True)
 
         # 2. Fallback Win32 CreateFileW nativo (sem dependência externa)
@@ -1104,12 +1148,15 @@ class SerialHID:
             )
             if handle and handle != wintypes.HANDLE(-1).value and handle != -1:
                 self._handle = handle
+                self.failure_reason = ""
                 print(f"[SerialHID] Conectado nativamente (Win32) em {self.port}.", flush=True)
                 return True
             else:
                 err = ctypes.get_last_error()
+                self.failure_reason = f"Win32 CreateFileW falhou (LastError={err})"
                 print(f"[SerialHID] Falha ao abrir {self.port} nativamente: Win32 LastError={err}", flush=True)
         except Exception as exc:
+            self.failure_reason = f"Erro conectando porta: {exc}"
             print(f"[SerialHID] Erro conectando à porta {self.port}: {exc}", flush=True)
         return False
 
@@ -1265,7 +1312,8 @@ class CanvasPool:
 
 
 class Overlay:
-    def __init__(self, root, feed, names):
+    def __init__(self, root, feed, names, interception_dll=None, serial_port=None, serial_baud=115200):
+        self.root = root
         self.feed = feed
         self.names = names
         self.window = tk.Toplevel(root, bg=BG_KEY, highlightthickness=0, bd=0)
@@ -1362,9 +1410,10 @@ class Overlay:
             self.feed.world.on_pickup_ack_callback = self._on_pickup_ack
         # Suporte a hardware HID (driver Interception e/ou Serial USB HID para bypass de anti-cheat)
         import os as _os
-        self.interception = InterceptionDriver()
-        serial_env = _os.environ.get("RAG_SERIAL_PORT") or _os.environ.get("SERIAL_PORT")
-        self.serial_hid = SerialHID(port=serial_env)
+        interception_path = interception_dll or _os.environ.get("INTERCEPTION_DLL")
+        self.interception = InterceptionDriver(dll_path=interception_path)
+        port_to_use = serial_port or _os.environ.get("RAG_SERIAL_PORT") or _os.environ.get("SERIAL_PORT")
+        self.serial_hid = SerialHID(port=port_to_use, baudrate=serial_baud)
         self._anti_cheat_warning_shown = False
         # Admin check para feedback no HUD
         try:
@@ -1434,7 +1483,50 @@ class Overlay:
         self._kill_history_last_check = 0.0
         self._load_filters_config()
         self._create_hud_panel()
+        if hasattr(self, "root") and self.root:
+            self.root.update_idletasks()
+            self.root.update()
+        ensure_touch_injection()
         self._install_navi_hook()
+        self.log_backend_status()
+
+    def log_backend_status(self):
+        """Imprime no console o status exato de cada backend de clique e o método primário ativo."""
+        # 1. SerialHID
+        serial = getattr(self, "serial_hid", None)
+        if serial and serial.is_connected:
+            serial_msg = f"porta '{serial.port}' configurada e conectada ({getattr(serial, 'baudrate', 115200)} baud)"
+        elif serial and serial.port:
+            reason = getattr(serial, "failure_reason", "falha na abertura")
+            serial_msg = f"porta '{serial.port}' configurada, mas conexão falhou: {reason}"
+        else:
+            serial_msg = "não configurado (nenhuma porta informada; use --serial-port COMx ou RAG_SERIAL_PORT)"
+        print(f"[Backend] SerialHID: {serial_msg}", flush=True)
+
+        # 2. InterceptionDriver
+        inter = getattr(self, "interception", None)
+        if inter:
+            dll_p = getattr(inter, "dll_path", "interception.dll")
+            if getattr(inter, "is_available", False):
+                inter_msg = f"DLL carregada com sucesso ('{dll_p}'), contexto ativo, MouseDevice={inter.mouse_dev} pronto."
+            elif getattr(inter, "context_failed", False):
+                inter_msg = f"DLL carregada ('{dll_p}'), mas Driver interception.sys não instalado no Windows ou reboot pendente"
+            elif getattr(inter, "dll_loaded", False):
+                inter_msg = f"DLL carregada ('{dll_p}'), mas {inter.failure_reason or 'nenhum dispositivo de mouse detectado'}."
+            else:
+                inter_msg = f"DLL não encontrada/carregada ('{dll_p}'): {inter.failure_reason or 'arquivo não encontrado'}."
+        else:
+            inter_msg = "não instanciado"
+        print(f"[Backend] InterceptionDriver: {inter_msg}", flush=True)
+
+        # 3. Método primário ativo
+        if serial and serial.is_connected:
+            primary_msg = f"SerialHID (porta {serial.port})"
+        elif inter and getattr(inter, "is_available", False):
+            primary_msg = f"InterceptionDriver (MouseDevice={inter.mouse_dev})"
+        else:
+            primary_msg = f"fallback {getattr(self, '_click_method', 'touch_postmsg')}"
+        print(f"[Backend] Método primário ativo: {primary_msg}", flush=True)
 
     def _get_filters_config_path(self):
         return str(_get_base_dir() / "filters_config.json")
@@ -1498,11 +1590,38 @@ class Overlay:
         except Exception as exc:
             print(f"[HUD] Erro ao salvar filters_config.json: {exc}", flush=True)
 
+    def _set_hud_visible(self, visible: bool):
+        """Alterna a visibilidade do painel HUD sem chamar withdraw(), preservando a janela Win32 ativa para InjectTouchInput."""
+        self._hud_panel_visible = visible
+        hud = getattr(self, "_hud_panel", None)
+        if not hud or not hud.winfo_exists():
+            return
+        if visible:
+            sw = hud.winfo_screenwidth()
+            pos = getattr(self, "_hud_last_pos", None)
+            if pos:
+                hud.geometry(pos)
+            else:
+                hud.geometry(f"390x520+{max(0, sw - 420)}+50")
+            alpha = getattr(self, "_hud_alpha_var", None)
+            hud.attributes("-alpha", alpha.get() if alpha else 0.88)
+            hud.lift()
+            hud.attributes("-topmost", True)
+        else:
+            try:
+                self._hud_last_pos = f"{hud.winfo_width()}x{hud.winfo_height()}+{hud.winfo_x()}+{hud.winfo_y()}"
+            except Exception:
+                pass
+            # Oculta visualmente sem withdraw() para manter a janela Win32 ativável no Windows
+            hud.attributes("-alpha", 0.0)
+            hud.geometry("+99999+99999")
+
     def _create_hud_panel(self):
         """Cria painel de controle HUD dark-mode flutuante em 4 abas (F8 para alternar)."""
         try:
-            panel = tk.Toplevel(bg="#0F172A")
+            panel = self.root if hasattr(self, "root") and self.root else tk.Tk()
             panel.title("Ragnalok HUD")
+            panel.configure(bg="#0F172A")
             panel.overrideredirect(True)
             panel.resizable(False, False)
             panel.geometry("390x520+10+50")
@@ -1542,8 +1661,7 @@ class Overlay:
                     panel.geometry("390x520")
 
             def _hide_hud():
-                panel.withdraw()
-                self._hud_panel_visible = False
+                self._set_hud_visible(False)
 
             btn_close = tk.Button(title_bar, text="✕", command=_hide_hud, bg="#1E293B",
                                   fg="#94A3B8", activebackground="#EF4444", activeforeground="#FFFFFF",
@@ -2349,33 +2467,32 @@ class Overlay:
 
             self._hud_panel = panel
 
-            # ── Estilização Win32 (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) + keepontop loop ──
+            # ── Estilização Win32 (WS_EX_TOOLWINDOW) + keepontop loop ──
             def _apply_hud_win32_styles():
                 try:
                     panel.update_idletasks()
+                    panel.update()
                     hwnd = panel.winfo_id()
                     p_hwnd = ctypes.windll.user32.GetParent(hwnd)
                     hud_hwnd = p_hwnd if p_hwnd else hwnd
-                    # Apenas WS_EX_TOOLWINDOW (0x80) | WS_EX_NOACTIVATE (0x08000000) —
-                    # sem WS_DISABLED e sem GWLP_HWNDPARENT cruzado (causaria err=5 no InjectTouchInput).
+                    # Apenas WS_EX_TOOLWINDOW (0x80) — SEM WS_EX_NOACTIVATE (0x08000000) e SEM WS_EX_TRANSPARENT (0x00000020).
+                    # A janela principal Tk() do painel HUD deve permanecer visível e ativável para o InjectTouchInput funcionar.
                     ex_style = ctypes.windll.user32.GetWindowLongW(hud_hwnd, -20)
-                    ex_style = (ex_style | 0x00000080 | 0x08000000) & ~0x08000000  # TOOLWINDOW | NOACTIVATE; NOACTIVATE = 0x08000000
-                    # Reescrever: WS_EX_TOOLWINDOW=0x80, WS_EX_NOACTIVATE=0x08000000
-                    ex_style_new = (ctypes.windll.user32.GetWindowLongW(hud_hwnd, -20) | 0x00000080 | 0x08000000)
+                    ex_style_new = (ex_style | 0x00000080) & ~0x08000000 & ~0x00000020
                     ctypes.windll.user32.SetWindowLongW(hud_hwnd, -20, ex_style_new)
                     # Visibilidade: garante HUD na tela e no topo
                     panel.deiconify()
                     panel.lift()
                     panel.attributes("-topmost", True)
-                    panel.attributes("-alpha", 0.90)
+                    panel.attributes("-alpha", 0.88)
                     # Valida coordenadas: reposiciona se fora do monitor visível
                     px, py = panel.winfo_x(), panel.winfo_y()
                     sw = panel.winfo_screenwidth()
                     sh = panel.winfo_screenheight()
                     if px < 0 or px > sw - 50 or py < 0 or py > sh - 50:
                         panel.geometry(f"+{max(0, sw - 420)}+50")
-                    # HWND_TOPMOST | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-                    ctypes.windll.user32.SetWindowPos(hud_hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+                    # HWND_TOPMOST | SWP_NOMOVE | SWP_NOSIZE (sem SWP_NOACTIVATE)
+                    ctypes.windll.user32.SetWindowPos(hud_hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002)
                 except Exception as exc:
                     print(f"[HUD] Win32 style hook: {exc}", flush=True)
 
@@ -2387,7 +2504,7 @@ class Overlay:
                         hwnd = panel.winfo_id()
                         p_hwnd = ctypes.windll.user32.GetParent(hwnd)
                         hud_hwnd = p_hwnd if p_hwnd else hwnd
-                        ctypes.windll.user32.SetWindowPos(hud_hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+                        ctypes.windll.user32.SetWindowPos(hud_hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002)
                 except Exception:
                     pass
                 panel.after(500, _hud_keepontop_loop)
@@ -2413,7 +2530,12 @@ class Overlay:
                         w = st.get("weight", 0)
                         mw = st.get("max_weight", 1)
                         w_ratio = st.get("weight_ratio", 0.0)
-                        telem_map_lbl.config(text=f"Mapa: {m_name} {pos_str} | Nv. {b_lvl} | Peso: {w}/{mw} ({w_ratio*100:.0f}%)")
+
+                        hud_st = getattr(self, "hud_status", None)
+                        if hud_st and (m_name == "---" or not pos):
+                            telem_map_lbl.config(text=f"Status: {hud_st}")
+                        else:
+                            telem_map_lbl.config(text=f"Mapa: {m_name} {pos_str} | Nv. {b_lvl} | Peso: {w}/{mw} ({w_ratio*100:.0f}%)")
 
                         hp = st.get("hp", 0)
                         max_hp = max(1, st.get("max_hp", 1))
@@ -2432,6 +2554,8 @@ class Overlay:
                             status_str += f" | Spot: {self.last_farm_spot[0]}"
                         if getattr(self, "patrol_target_route", None):
                             status_str += f" | Rota: {self.patrol_target_route[0]}"
+                        if hud_st and (m_name == "---" or not pos):
+                            status_str = f"[{hud_st}]"
                         telem_status_lbl.config(text=status_str)
 
                     # 1. Atualização Estável de NPCs e Portais (Aba 3)
@@ -2795,13 +2919,8 @@ class Overlay:
             # Oculta todos os itens do pool sem destruí-los (preserva IDs válidos do canvas)
             self.canvas_pool.hide_all()
             self.last = None
-            if self._hud_panel and self._hud_panel.winfo_exists() and self._hud_panel.winfo_viewable():
-                self._hud_panel.withdraw()
             self.window.after(40, self.refresh)
             return
-        else:
-            if self._hud_panel and self._hud_panel.winfo_exists() and self._hud_panel_visible and not self._hud_panel.winfo_viewable():
-                self._hud_panel.deiconify()
 
         # Hotkeys: ← = Auto-Loot toggle, → = Auto-Farm toggle, F6 = Auto-Patrol toggle, F9 = Teste imediato
         left_now   = bool(self.user32.GetAsyncKeyState(0x25) & 0x8000)
@@ -2813,12 +2932,7 @@ class Overlay:
 
         if f8_now and not self._last_f8:
             if self._hud_panel and self._hud_panel.winfo_exists():
-                if self._hud_panel_visible:
-                    self._hud_panel.withdraw()
-                    self._hud_panel_visible = False
-                else:
-                    self._hud_panel.deiconify()
-                    self._hud_panel_visible = True
+                self._set_hud_visible(not self._hud_panel_visible)
 
         if (left_now and not self.last_left) or (insert_now and not self.last_insert):
             self.auto_loot = not self.auto_loot
@@ -2937,11 +3051,15 @@ class Overlay:
                     inp_esc = INPUT(type=INPUT_KEYBOARD)
                     inp_esc.ki.wVk = 0x1B
                     inp_esc.ki.dwFlags = 0
+                    ctypes.set_last_error(0)
                     u32.SendInput(1, ctypes.byref(inp_esc), ctypes.sizeof(INPUT))
+                    ctypes.get_last_error()
                     inp_esc_up = INPUT(type=INPUT_KEYBOARD)
                     inp_esc_up.ki.wVk = 0x1B
                     inp_esc_up.ki.dwFlags = 0x0002  # KEYEVENTF_KEYUP
+                    ctypes.set_last_error(0)
                     u32.SendInput(1, ctypes.byref(inp_esc_up), ctypes.sizeof(INPUT))
+                    ctypes.get_last_error()
                     self.feed.world.npc_dialog["open"] = False
                     if hasattr(self.feed, "_cam") and self.feed._cam:
                         bx = int(round(self.feed._cam[0]))
@@ -4444,6 +4562,45 @@ class Overlay:
             return new_hwnd
         return None
 
+    def _get_or_find_ragexe_pid(self):
+        """Obtém ou descobre o PID real do processo Ragexe.exe via psutil."""
+        pid = getattr(self, "_ragexe_pid", None)
+        if pid:
+            try:
+                p = psutil.Process(pid)
+                if p.is_running() and p.name().casefold() == "ragexe.exe":
+                    return pid
+            except Exception:
+                pass
+            self._ragexe_pid = None
+        for p in psutil.process_iter(["pid", "name"]):
+            try:
+                if p.info["name"] and p.info["name"].casefold() == "ragexe.exe":
+                    self._ragexe_pid = p.info["pid"]
+                    return self._ragexe_pid
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return None
+
+    def is_valid_ragexe_hwnd(self, h) -> bool:
+        """Valida se o HWND pertence ao Ragexe.exe e NUNCA ao overlay/HUD do próprio processo."""
+        if not h or not self.user32.IsWindow(h):
+            return False
+        w_pid = wintypes.DWORD()
+        self.user32.GetWindowThreadProcessId(h, ctypes.byref(w_pid))
+        if not w_pid.value or w_pid.value == getattr(self, "_own_pid", None):
+            return False
+        target_pid = self._get_or_find_ragexe_pid()
+        if target_pid and w_pid.value == target_pid:
+            return True
+        try:
+            if psutil.Process(w_pid.value).name().casefold() == "ragexe.exe":
+                self._ragexe_pid = w_pid.value
+                return True
+        except Exception:
+            pass
+        return False
+
     def test_click_f9(self):
         """Dispara 1 clique de teste imediato no centro da janela do Ragnarok e imprime diagnóstico completo."""
         print("\n" + "=" * 70, flush=True)
@@ -4528,15 +4685,47 @@ class Overlay:
             return False
         return bool((self.user32.GetAsyncKeyState(0x01) & 0x8000) != 0)
 
-    def _smooth_move_to(self, sx: int, sy: int, game_hwnd: int = None) -> None:
-        """Deslizamento interpolado ease-out do cursor até (sx, sy) para o DirectX reconhecer hover."""
+    def _smooth_move_to(self, sx: int, sy: int, game_hwnd: int = None) -> tuple[int | None, int | None]:
+        """Deslizamento ease-out com SetCursorPos (6ms) + PostMessageW + InjectTouchInput opcional para hover no DirectX."""
         ensure_touch_injection()
         pt = wintypes.POINT()
         u32.GetCursorPos(ctypes.byref(pt))
         x0, y0 = pt.x, pt.y
         dist = math.hypot(sx - x0, sy - y0)
-        if game_hwnd is None:
+        if game_hwnd is None or not u32.IsWindow(game_hwnd):
             game_hwnd = self.get_game_hwnd(None)
+
+        def _post_wm_move(x, y):
+            if not game_hwnd or not u32.IsWindow(game_hwnd):
+                return None, None
+            pt_cl = wintypes.POINT(x, y)
+            if not u32.ScreenToClient(game_hwnd, ctypes.byref(pt_cl)):
+                return None, None
+            lp = ((pt_cl.y & 0xFFFF) << 16) | (pt_cl.x & 0xFFFF)
+            ctypes.set_last_error(0)
+            r = int(u32.PostMessageW(game_hwnd, 0x0200, 0, lp))
+            e = ctypes.get_last_error()
+            return r, e
+
+        _FLAG_HOVER = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_CONFIDENCE | POINTER_FLAG_PRIMARY
+
+        def _make_contact(x: int, y: int, flags: int) -> POINTER_TOUCH_INFO:
+            c = POINTER_TOUCH_INFO()
+            c.pointerInfo.pointerType = PT_TOUCH
+            c.pointerInfo.pointerId = 0
+            c.pointerInfo.hwndTarget = 0
+            c.pointerInfo.ptPixelLocation.x = int(x)
+            c.pointerInfo.ptPixelLocation.y = int(y)
+            c.pointerInfo.pointerFlags = flags
+            c.touchFlags = TOUCH_FLAG_NONE
+            c.touchMask = 0x0003
+            c.rcContact.left   = int(x) - 2
+            c.rcContact.top    = int(y) - 2
+            c.rcContact.right  = int(x) + 2
+            c.rcContact.bottom = int(y) + 2
+            c.pressure = 512
+            c.orientation = 0
+            return c
 
         if dist > 8.0:
             steps = max(5, min(12, int(dist / 55)))
@@ -4544,58 +4733,32 @@ class Overlay:
                 t = i / steps
                 eased = 1.0 - (1.0 - t) ** 2
                 if i == steps:
-                    ix = int(sx)
-                    iy = int(sy)
+                    ix, iy = int(sx), int(sy)
                 else:
                     ix = int(round(x0 + (sx - x0) * eased)) + random.choice([-2, -1, 1, 2])
                     iy = int(round(y0 + (sy - y0) * eased)) + random.choice([-2, -1, 1, 2])
 
+                # Restaura movimentação física do cursor para o jogo e DirectX
                 u32.SetCursorPos(ix, iy)
-
-                contact = POINTER_TOUCH_INFO()
-                contact.pointerInfo.pointerType = PT_TOUCH
-                contact.pointerInfo.pointerId = 0
-                contact.pointerInfo.ptPixelLocation.x = ix
-                contact.pointerInfo.ptPixelLocation.y = iy
-                contact.pointerInfo.pointerFlags = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE
-                contact.touchFlags = TOUCH_FLAG_NONE
-                contact.touchMask = 0
-                contact.rcContact.left = ix - 2
-                contact.rcContact.top = iy - 2
-                contact.rcContact.right = ix + 2
-                contact.rcContact.bottom = iy + 2
-                u32.InjectTouchInput(1, ctypes.byref(contact))
-
-                if game_hwnd and u32.IsWindow(game_hwnd):
-                    pt_cl = wintypes.POINT(ix, iy)
-                    if u32.ScreenToClient(game_hwnd, ctypes.byref(pt_cl)):
-                        lparam_m = ((pt_cl.y & 0xFFFF) << 16) | (pt_cl.x & 0xFFFF)
-                        u32.PostMessageW(game_hwnd, 0x0200, 0, lparam_m)
-
+                try:
+                    c = _make_contact(ix, iy, _FLAG_HOVER)
+                    u32.InjectTouchInput(1, ctypes.byref(c))
+                except Exception:
+                    pass
+                _post_wm_move(ix, iy)
                 time.sleep(0.006)
 
-        # Pouso exato em (sx, sy)
+        # Pouso exato em (sx, sy) antes dos 45ms de hover
         u32.SetCursorPos(int(sx), int(sy))
-        contact_final = POINTER_TOUCH_INFO()
-        contact_final.pointerInfo.pointerType = PT_TOUCH
-        contact_final.pointerInfo.pointerId = 0
-        contact_final.pointerInfo.ptPixelLocation.x = int(sx)
-        contact_final.pointerInfo.ptPixelLocation.y = int(sy)
-        contact_final.pointerInfo.pointerFlags = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE
-        contact_final.touchFlags = TOUCH_FLAG_NONE
-        contact_final.touchMask = 0
-        contact_final.rcContact.left = int(sx) - 2
-        contact_final.rcContact.top = int(sy) - 2
-        contact_final.rcContact.right = int(sx) + 2
-        contact_final.rcContact.bottom = int(sy) + 2
-        u32.InjectTouchInput(1, ctypes.byref(contact_final))
-        if game_hwnd and u32.IsWindow(game_hwnd):
-            pt_cl = wintypes.POINT(int(sx), int(sy))
-            if u32.ScreenToClient(game_hwnd, ctypes.byref(pt_cl)):
-                lparam_m = ((pt_cl.y & 0xFFFF) << 16) | (pt_cl.x & 0xFFFF)
-                u32.PostMessageW(game_hwnd, 0x0200, 0, lparam_m)
+        try:
+            c_land = _make_contact(int(sx), int(sy), _FLAG_HOVER)
+            u32.InjectTouchInput(1, ctypes.byref(c_land))
+        except Exception:
+            pass
+        return _post_wm_move(int(sx), int(sy))
 
     def touch_postmsg(self, sx, sy, game_hwnd=None, *, test_mode=False):
+        """Movimentação suave + clique confiável via mouse_event (LEFTDOWN/UP 50ms) + PostMessage + Touch opcional."""
         now = time.perf_counter()
         if getattr(self, "_click_in_progress", False):
             return False
@@ -4605,15 +4768,10 @@ class Overlay:
         if now - last_ts < 0.35:
             return False
 
-        hwnd = int(getattr(self, "game_hwnd", 0) or game_hwnd or 0)
-        if not hwnd or not u32.IsWindow(hwnd):
-            hwnd = int(u32.FindWindowW(None, "Ragnarok") or 0)
-        if not hwnd or not u32.IsWindow(hwnd):
-            new_h, _, _ = find_ragnarok_window(getattr(self, "_ragexe_pid", None))
-            if new_h and u32.IsWindow(new_h):
-                hwnd = int(new_h)
-        if not hwnd or not u32.IsWindow(hwnd):
-            self._click_debug("touch_postmsg: janela do jogo indisponível")
+        # Valida hwnd: nunca aceitar a janela do overlay/HUD (somente Ragexe.exe)
+        hwnd = self.get_game_hwnd(game_hwnd or getattr(self, "game_hwnd", None))
+        if not hwnd or not self.is_valid_ragexe_hwnd(hwnd):
+            self._click_debug("touch_postmsg: janela do Ragexe indisponível")
             return False
         self.game_hwnd = hwnd
 
@@ -4623,6 +4781,16 @@ class Overlay:
         self._last_click_ts = self.last_bot_click_ts = now
 
         def _do_smooth_click():
+            d = ed = 0
+            d_hold = ed_hold = 0
+            d_up = ed_up = 0
+            d_exit = ed_exit = 0
+            lbtn = 0
+            post_move = post_move_err = None
+            mouse_down = mouse_up = 0
+            fb_pa_d = fb_pa_d_e = fb_pa_u = fb_pa_u_e = 0
+            fb_snm_d = fb_snm_d_e = fb_snm_u = fb_snm_u_e = 0
+            fb_pw_d = fb_pw_d_e = fb_pw_u = fb_pw_u_e = 0
             try:
                 ensure_input_desktop()
                 ensure_touch_injection()
@@ -4636,100 +4804,143 @@ class Overlay:
                 except Exception:
                     pass
 
-                # 1 e 2. Deslizamento interpolado suave (anti-teleporte para hover no Ragexe.exe)
-                self._smooth_move_to(sx, sy, hwnd)
+                # ── 1. Deslizamento suave ease-out até (sx, sy) ────────────────
+                post_move, post_move_err = self._smooth_move_to(sx, sy, hwnd)
 
-                # 3. Ao chegar exatamente em (sx, sy), aguarda 45ms para o cliente atualizar o cursor de hover
+                # ── 2. Espera de Hover: 45ms em (sx, sy) ───────────────────────
                 time.sleep(0.045)
+                if u32.GetForegroundWindow() != hwnd:
+                    self._click_debug("touch_postmsg: jogo perdeu o foco antes do clique")
+                    return
 
+                # Garante que o cursor físico está exatamente no alvo
+                u32.SetCursorPos(int(sx), int(sy))
+
+                # Coordenadas de cliente para mensagens Win32
                 pt_cl = wintypes.POINT(int(sx), int(sy))
-                u32.ScreenToClient(hwnd, ctypes.byref(pt_cl))
-                lparam = ((pt_cl.y & 0xFFFF) << 16) | (pt_cl.x & 0xFFFF)
+                has_cc = bool(u32.ScreenToClient(hwnd, ctypes.byref(pt_cl)))
+                lparam = (((pt_cl.y & 0xFFFF) << 16) | (pt_cl.x & 0xFFFF)) if has_cc else 0
 
-                SM_XVIRTUALSCREEN = 76
-                SM_YVIRTUALSCREEN = 77
-                SM_CXVIRTUALSCREEN = 78
-                SM_CYVIRTUALSCREEN = 79
-                v_left = u32.GetSystemMetrics(SM_XVIRTUALSCREEN)
-                v_top  = u32.GetSystemMetrics(SM_YVIRTUALSCREEN)
-                v_w    = u32.GetSystemMetrics(SM_CXVIRTUALSCREEN) or getattr(self, "_screen_w", 1920)
-                v_h    = u32.GetSystemMetrics(SM_CYVIRTUALSCREEN) or getattr(self, "_screen_h", 1080)
-                norm_x = max(0, min(65535, int(((sx - v_left) * 65535) / max(1, v_w - 1))))
-                norm_y = max(0, min(65535, int(((sy - v_top)  * 65535) / max(1, v_h - 1))))
-                abs_flags = 0x0001 | 0x8000 | 0x4000
-
-                contact = POINTER_TOUCH_INFO()
-                contact.pointerInfo.pointerType = PT_TOUCH
-                contact.pointerInfo.pointerId = 0
-                contact.pointerInfo.hwndTarget = 0
-                contact.pointerInfo.ptPixelLocation.x = int(sx)
-                contact.pointerInfo.ptPixelLocation.y = int(sy)
-                contact.touchFlags = 0
-                contact.touchMask = 0x0004
-                contact.rcContact.left = int(sx) - 2
-                contact.rcContact.top = int(sy) - 2
-                contact.rcContact.right = int(sx) + 2
-                contact.rcContact.bottom = int(sy) + 2
-
-                # Envia WM_LBUTTONDOWN (0x0201)
-                ctypes.set_last_error(0)
-                contact.pointerInfo.pointerFlags = POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
-                d = int(u32.InjectTouchInput(1, ctypes.byref(contact)))
-                ed = ctypes.get_last_error()
-
+                # ── 3. Clique Down via u32.mouse_event (LEFTDOWN) ──────────────
                 try:
-                    u32.PostMessageW(hwnd, 0x0201, 0x0001, lparam)
                     u32.mouse_event(0x0002, 0, 0, 0, 0)
+                    mouse_down = 1
+                except Exception:
+                    mouse_down = 0
+
+                # Envio simultâneo de mensagens para a janela do Ragexe
+                if has_cc and hwnd and u32.IsWindow(hwnd):
+                    ctypes.set_last_error(0)
+                    fb_pa_d = int(u32.PostMessageA(hwnd, 0x0201, 0x0001, lparam))
+                    fb_pa_d_e = ctypes.get_last_error()
+                    ctypes.set_last_error(0)
+                    fb_snm_d = int(u32.SendNotifyMessageW(hwnd, 0x0201, 0x0001, lparam))
+                    fb_snm_d_e = ctypes.get_last_error()
+                    ctypes.set_last_error(0)
+                    fb_pw_d = int(u32.PostMessageW(hwnd, 0x0201, 0x0001, lparam))
+                    fb_pw_d_e = ctypes.get_last_error()
+
+                # InjectTouchInput opcional (não aborta se falhar com e=87)
+                try:
+                    _FLAG_DOWN = (
+                        POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT |
+                        POINTER_FLAG_CONFIDENCE | POINTER_FLAG_PRIMARY
+                    )
+                    c_down = POINTER_TOUCH_INFO()
+                    c_down.pointerInfo.pointerType = PT_TOUCH
+                    c_down.pointerInfo.ptPixelLocation.x = int(sx)
+                    c_down.pointerInfo.ptPixelLocation.y = int(sy)
+                    c_down.pointerInfo.pointerFlags = _FLAG_DOWN
+                    c_down.touchMask = 0x0003
+                    c_down.rcContact.left = int(sx) - 2
+                    c_down.rcContact.top = int(sy) - 2
+                    c_down.rcContact.right = int(sx) + 2
+                    c_down.rcContact.bottom = int(sy) + 2
+                    c_down.pressure = 512
+                    ctypes.set_last_error(0)
+                    d = int(u32.InjectTouchInput(1, ctypes.byref(c_down)))
+                    ed = ctypes.get_last_error()
                 except Exception:
                     pass
 
-                # 50ms de retenção física antes de liberar o botão
-                time.sleep(0.050)
-
-                # Envia WM_LBUTTONUP (0x0202)
-                ctypes.set_last_error(0)
-                contact.pointerInfo.pointerFlags = POINTER_FLAG_UP
-                u = int(u32.InjectTouchInput(1, ctypes.byref(contact)))
-                eu = ctypes.get_last_error()
+                # ── 4. Retenção ativa (50ms) ───────────────────────────────────
+                time.sleep(0.025)
+                # Lê o estado real de VK_LBUTTON durante a retenção
+                lbtn = int(bool(u32.GetAsyncKeyState(0x01) & 0x8000))
 
                 try:
-                    u32.PostMessageW(hwnd, 0x0202, 0x0000, lparam)
-                    u32.mouse_event(0x0004, 0, 0, 0, 0)
+                    _FLAG_HOLD = (
+                        POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT |
+                        POINTER_FLAG_CONFIDENCE | POINTER_FLAG_PRIMARY
+                    )
+                    c_down.pointerInfo.pointerFlags = _FLAG_HOLD
+                    ctypes.set_last_error(0)
+                    d_hold = int(u32.InjectTouchInput(1, ctypes.byref(c_down)))
+                    ed_hold = ctypes.get_last_error()
                 except Exception:
                     pass
 
-                # Fallback SendInput se InjectTouchInput falhou
-                if d == 0 or u == 0:
-                    inp_d = INPUT()
-                    inp_d.type = 0
-                    inp_d.mi.dx = norm_x
-                    inp_d.mi.dy = norm_y
-                    inp_d.mi.dwFlags = abs_flags | 0x0002
-                    u32.SendInput(1, ctypes.byref(inp_d), ctypes.sizeof(INPUT))
-                    time.sleep(0.050)
-                    inp_u = INPUT()
-                    inp_u.type = 0
-                    inp_u.mi.dx = norm_x
-                    inp_u.mi.dy = norm_y
-                    inp_u.mi.dwFlags = abs_flags | 0x0004
-                    u32.SendInput(1, ctypes.byref(inp_u), ctypes.sizeof(INPUT))
+                time.sleep(0.025)
+                if not lbtn:
+                    lbtn = int(bool(u32.GetAsyncKeyState(0x01) & 0x8000))
+
+                # ── 5. Clique Up via u32.mouse_event (LEFTUP) ──────────────────
+                try:
+                    u32.mouse_event(0x0004, 0, 0, 0, 0)
+                    mouse_up = 1
+                except Exception:
+                    mouse_up = 0
+
+                if has_cc and hwnd and u32.IsWindow(hwnd):
+                    ctypes.set_last_error(0)
+                    fb_pa_u = int(u32.PostMessageA(hwnd, 0x0202, 0x0000, lparam))
+                    fb_pa_u_e = ctypes.get_last_error()
+                    ctypes.set_last_error(0)
+                    fb_snm_u = int(u32.SendNotifyMessageW(hwnd, 0x0202, 0x0000, lparam))
+                    fb_snm_u_e = ctypes.get_last_error()
+                    ctypes.set_last_error(0)
+                    fb_pw_u = int(u32.PostMessageW(hwnd, 0x0202, 0x0000, lparam))
+                    fb_pw_u_e = ctypes.get_last_error()
+
+                # InjectTouchInput opcional Up
+                try:
+                    _FLAG_UP = POINTER_FLAG_UP | POINTER_FLAG_INRANGE | POINTER_FLAG_CONFIDENCE | POINTER_FLAG_PRIMARY
+                    c_down.pointerInfo.pointerFlags = _FLAG_UP
+                    ctypes.set_last_error(0)
+                    d_up = int(u32.InjectTouchInput(1, ctypes.byref(c_down)))
+                    ed_up = ctypes.get_last_error()
+
+                    c_down.pointerInfo.pointerFlags = POINTER_FLAG_UPDATE | POINTER_FLAG_PRIMARY
+                    ctypes.set_last_error(0)
+                    d_exit = int(u32.InjectTouchInput(1, ctypes.byref(c_down)))
+                    ed_exit = ctypes.get_last_error()
+                except Exception:
+                    pass
 
                 now_end = time.perf_counter()
                 self._last_click_ts = self.last_bot_click_ts = self._last_click_end_ts = now_end
 
                 is_admin = getattr(self, "is_admin", False)
-                msg = (
-                    f"touch_postmsg ({sx},{sy}) hwnd={hex(hwnd)}: "
-                    f"is_admin={is_admin} HOVER=1 "
-                    f"INJ_DOWN={d}(err={ed}) INJ_UP={u}(err={eu})"
+                fb_info = (
+                    f" MOUSE=({mouse_down},{mouse_up})"
+                    f" PostA=({fb_pa_d}:{fb_pa_d_e}/{fb_pa_u}:{fb_pa_u_e})"
+                    f" SNM=({fb_snm_d}:{fb_snm_d_e}/{fb_snm_u}:{fb_snm_u_e})"
+                    f" PostW=({fb_pw_d}:{fb_pw_d_e}/{fb_pw_u}:{fb_pw_u_e})"
                 )
-                if 5 in (ed, eu):
-                    msg += " | Acesso negado (UIPI)."
+                msg = (
+                    f"[ClickDebug] touch_postmsg ({sx},{sy}) hwnd={hex(hwnd)} LBTN_STATE={lbtn}: "
+                    f"is_admin={is_admin} "
+                    f"INJ_D={d}(e={ed}) INJ_HOLD={d_hold}(e={ed_hold}) "
+                    f"INJ_UP={d_up}(e={ed_up}) INJ_EXIT={d_exit}(e={ed_exit}) "
+                    f"POST_MOVE={post_move}(e={post_move_err}){fb_info}"
+                )
+                if 5 in (ed, ed_hold, ed_up, ed_exit, fb_pa_d_e, fb_pa_u_e, fb_snm_d_e, fb_snm_u_e, fb_pw_d_e, fb_pw_u_e):
+                    msg += " | UIPI bloqueou."
                 log_click_file(msg)
+
             except Exception as exc:
                 self._last_click_ts = self.last_bot_click_ts = self._last_click_end_ts = time.perf_counter()
-                if test_mode:
-                    print(f"[ClickDebug] touch_postmsg erro _do_smooth_click: {exc}", flush=True)
+                print(f"[ClickDebug] touch_postmsg erro: {exc}", flush=True)
             finally:
                 self._click_in_progress = False
                 self._click_busy = False
@@ -4771,8 +4982,10 @@ class Overlay:
         inp_down.ki.wScan = scan
         inp_down.ki.dwFlags = flags
         inp_down.ki.time = 0
-        inp_down.ki.dwExtraInfo = 0
+        inp_down.ki.dwExtraInfo = None
+        ctypes.set_last_error(0)
         u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT))
+        ctypes.get_last_error()
 
         time.sleep(max(0.005, hold_ms / 1000.0))
 
@@ -4781,8 +4994,10 @@ class Overlay:
         inp_up.ki.wScan = scan
         inp_up.ki.dwFlags = flags | 0x0002  # KEYEVENTF_KEYUP
         inp_up.ki.time = 0
-        inp_up.ki.dwExtraInfo = 0
+        inp_up.ki.dwExtraInfo = None
+        ctypes.set_last_error(0)
         u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT))
+        ctypes.get_last_error()
 
         # Fallback PostMessageW para o Ragexe
         target_hwnd = getattr(getattr(self.feed, "viewport", None), "handle", None)
@@ -4845,6 +5060,20 @@ class Overlay:
             if vp and hasattr(self.feed.camera, "record_click"):
                 self.feed.camera.record_click(sx, sy, vp)
 
+        # ── 0. Hardware USB HID (Serial) Bypass se conectado ────────────────
+        if hasattr(self, "serial_hid") and self.serial_hid and getattr(self.serial_hid, "is_connected", False):
+            ok_serial = self.serial_hid.send_click(sx, sy)
+            if ok_serial:
+                self._click_debug(f"CLIQUE em ({sx},{sy}) via Serial HID ({self.serial_hid.port}): Sucesso")
+                return
+
+        # ── 0.1 Driver Kernel HID (interception.dll) ─────────────────────
+        if hasattr(self, "interception") and self.interception and getattr(self.interception, "is_available", False):
+            ok_inter = self.interception.send_click(sx, sy, self._screen_w, self._screen_h)
+            if ok_inter:
+                self._click_debug(f"CLIQUE em ({sx},{sy}) via Interception Driver: Sucesso [Kernel Filter Bypass]")
+                return
+
         method = self._click_method
 
         if method == "touch_postmsg":
@@ -4854,20 +5083,6 @@ class Overlay:
                 return
             self.touch_postmsg(sx, sy, self.get_game_hwnd(hwnd), test_mode=test_mode)
             return
-
-        # ── 0. Hardware USB HID (Serial) Bypass se conectado ────────────────
-        if not test_mode and hasattr(self, "serial_hid") and self.serial_hid and self.serial_hid.is_connected:
-            ok_serial = self.serial_hid.send_click(sx, sy)
-            if ok_serial:
-                self._click_debug(f"CLIQUE em ({sx},{sy}) via Serial HID ({self.serial_hid.port}): Sucesso")
-                return
-
-        # ── 0.1 Driver Kernel HID (interception.dll) ─────────────────────
-        if not test_mode and hasattr(self, "interception") and self.interception and self.interception.is_available:
-            ok_inter = self.interception.send_click(sx, sy, self._screen_w, self._screen_h)
-            if ok_inter:
-                self._click_debug(f"CLIQUE em ({sx},{sy}) via Interception Driver: Sucesso [Kernel Filter Bypass]")
-                return
 
         # Revalida/redetecta a janela do jogo
         hwnd = self.get_game_hwnd(hwnd)
@@ -4906,7 +5121,7 @@ class Overlay:
             inp_down.mi.dx = norm_x
             inp_down.mi.dy = norm_y
             inp_down.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | abs_flags
-            ctypes.windll.kernel32.SetLastError(0)
+            ctypes.set_last_error(0)
             r_si_down = int(u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT)))
             err_si_down = ctypes.get_last_error()
 
@@ -4917,7 +5132,7 @@ class Overlay:
             inp_up.mi.dx = norm_x
             inp_up.mi.dy = norm_y
             inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
-            ctypes.windll.kernel32.SetLastError(0)
+            ctypes.set_last_error(0)
             r_si_up = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
             err_si_up = ctypes.get_last_error()
 
@@ -4951,7 +5166,7 @@ class Overlay:
                     u32.BringWindowToTop(hwnd)
 
             # Posiciona cursor
-            ctypes.windll.kernel32.SetLastError(0)
+            ctypes.set_last_error(0)
             ok_pos = bool(u32.SetCursorPos(sx, sy))
             err_pos = ctypes.get_last_error()
 
@@ -4960,13 +5175,17 @@ class Overlay:
             inp_rel1.mi.dx = 1
             inp_rel1.mi.dy = 0
             inp_rel1.mi.dwFlags = MOUSEEVENTF_MOVE  # relativo (sem ABSOLUTE)
+            ctypes.set_last_error(0)
             u32.SendInput(1, ctypes.byref(inp_rel1), ctypes.sizeof(INPUT))
+            ctypes.get_last_error()
 
             inp_rel2 = INPUT(type=INPUT_MOUSE)
             inp_rel2.mi.dx = -1
             inp_rel2.mi.dy = 0
             inp_rel2.mi.dwFlags = MOUSEEVENTF_MOVE
+            ctypes.set_last_error(0)
             u32.SendInput(1, ctypes.byref(inp_rel2), ctypes.sizeof(INPUT))
+            ctypes.get_last_error()
 
             pt_before = wintypes.POINT()
             u32.GetCursorPos(ctypes.byref(pt_before))
@@ -4978,7 +5197,7 @@ class Overlay:
             inp_down.mi.dx = norm_x
             inp_down.mi.dy = norm_y
             inp_down.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | abs_flags
-            ctypes.windll.kernel32.SetLastError(0)
+            ctypes.set_last_error(0)
             r_si_down = int(u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT)))
             err_si_down = ctypes.get_last_error()
 
@@ -4989,7 +5208,7 @@ class Overlay:
             inp_up.mi.dx = norm_x
             inp_up.mi.dy = norm_y
             inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
-            ctypes.windll.kernel32.SetLastError(0)
+            ctypes.set_last_error(0)
             r_si_up = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
             err_si_up = ctypes.get_last_error()
 
@@ -5060,7 +5279,9 @@ class Overlay:
             inp_move.mi.dx = norm_x
             inp_move.mi.dy = norm_y
             inp_move.mi.dwFlags = MOUSEEVENTF_MOVE | abs_flags
+            ctypes.set_last_error(0)
             u32.SendInput(1, ctypes.byref(inp_move), ctypes.sizeof(INPUT))
+            ctypes.get_last_error()
 
             time.sleep(0.025)
 
@@ -5068,9 +5289,9 @@ class Overlay:
             err_pm_down = 0
             if hwnd and u32.IsWindow(hwnd):
                 lparam_click = ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
-                k32.SetLastError(0)
+                ctypes.set_last_error(0)
                 u32.PostMessageW(hwnd, 0x0200, 0, lparam_click)
-                k32.SetLastError(0)
+                ctypes.set_last_error(0)
                 r_down_pm = int(u32.PostMessageW(hwnd, 0x0201, 0x0001, lparam_click))
                 err_pm_down = ctypes.get_last_error()
 
@@ -5078,7 +5299,7 @@ class Overlay:
             inp_down.mi.dx = norm_x
             inp_down.mi.dy = norm_y
             inp_down.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | abs_flags
-            k32.SetLastError(0)
+            ctypes.set_last_error(0)
             r_down_si = int(u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT)))
             err_si_down = ctypes.get_last_error()
 
@@ -5088,7 +5309,7 @@ class Overlay:
             inp_up.mi.dx = norm_x
             inp_up.mi.dy = norm_y
             inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
-            k32.SetLastError(0)
+            ctypes.set_last_error(0)
             r_up_si = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
             err_si_up = ctypes.get_last_error()
 
@@ -5096,7 +5317,7 @@ class Overlay:
             err_pm_up = 0
             if hwnd and u32.IsWindow(hwnd):
                 lparam_click = ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
-                k32.SetLastError(0)
+                ctypes.set_last_error(0)
                 r_up_pm = int(u32.PostMessageW(hwnd, 0x0202, 0, lparam_click))
                 err_pm_up = ctypes.get_last_error()
 
@@ -5426,8 +5647,18 @@ class Overlay:
             return True
 
         left, top, width, height = snapshot.viewport
-        # SWP_NOZORDER | SWP_NOACTIVATE
-        if not self.user32.SetWindowPos(self.handle, None, left, top, width, height, 0x0014):
+        # Garante que o Toplevel transparente mantenha WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE
+        WS_EX_TOPMOST     = 0x00000008
+        WS_EX_TRANSPARENT = 0x00000020
+        WS_EX_LAYERED     = 0x00080000
+        WS_EX_NOACTIVATE  = 0x08000000
+        req_ex = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE
+        cur_ex = self.user32.GetWindowLongW(self.handle, -20)
+        if (cur_ex & req_ex) != req_ex:
+            self.user32.SetWindowLongW(self.handle, -20, cur_ex | req_ex)
+
+        # Alinha perfeitamente à área cliente do Ragexe.exe mantendo HWND_TOPMOST (-1) e SWP_NOACTIVATE (0x0010)
+        if not self.user32.SetWindowPos(self.handle, wintypes.HWND(-1), left, top, width, height, 0x0010):
             self.canvas_pool.hide_all()
             return False
 
@@ -5832,7 +6063,8 @@ def find_ragnarok_window(pid=None):
                     if w > 50 and h_dim > 50:
                         p_id = wintypes.DWORD()
                         u32.GetWindowThreadProcessId(h, ctypes.byref(p_id))
-                        windows.append((h, p_id.value, title_val))
+                        if p_id.value and p_id.value != os.getpid():
+                            windows.append((h, p_id.value, title_val))
         return True
 
     cb = WNDENUMPROC(enum_cb)
@@ -5843,7 +6075,7 @@ def find_ragnarok_window(pid=None):
     return None, None, None
 
 
-def autodetect_live_session(args):
+def autodetect_live_session(args, status_callback=None):
     """Autodetecta interface, server, port e window a partir de Ragexe.exe ativo."""
     last_status = None
     target_name = "ragexe.exe"
@@ -5866,6 +6098,8 @@ def autodetect_live_session(args):
             if status != last_status:
                 print(status, flush=True)
                 last_status = status
+                if status_callback:
+                    status_callback(status)
             time.sleep(1)
             continue
 
@@ -5884,6 +6118,8 @@ def autodetect_live_session(args):
             if status != last_status:
                 print(status, flush=True)
                 last_status = status
+                if status_callback:
+                    status_callback(status)
             time.sleep(1)
             continue
 
@@ -5894,6 +6130,8 @@ def autodetect_live_session(args):
             if status != last_status:
                 print(status, flush=True)
                 last_status = status
+                if status_callback:
+                    status_callback(status)
             time.sleep(1)
             continue
 
@@ -5904,6 +6142,8 @@ def autodetect_live_session(args):
             if status != last_status:
                 print(status, flush=True)
                 last_status = status
+                if status_callback:
+                    status_callback(status)
             time.sleep(1)
             continue
 
@@ -5962,6 +6202,8 @@ def autodetect_live_session(args):
     print(f"  Servidor:Porta: {args.server}:{args.port}", flush=True)
     print(f"  Janela:         {window_display}", flush=True)
     print("-" * 60, flush=True)
+    if status_callback:
+        status_callback(f"Ragexe.exe detectado (PID {target_proc.pid})")
 
 
 def run_live(root, args, names):
@@ -5999,23 +6241,15 @@ def run_live(root, args, names):
         thread.start()
         threads.append(thread)
 
-    if args.interface:
-        server, port = ("127.0.0.1", loop.port) if loop else (str(args.server), args.port)
-        ragexe_pid = getattr(args, "ragexe_pid", None)
-        start(lambda: capture(world, lengths, args.interface, server, port, args.local_port, stop, ready, ragexe_pid))
-        print(f"Captura TCP passiva em {args.interface}, servidor {server}:{port}.", flush=True)
-    else:
-        ready.set()
-    if loop:
-        def run_mock():
-            while not ready.wait(.1):
-                if stop.is_set():
-                    return
-            if not stop.is_set():
-                loop.run()
-
-        start(run_mock)
-    overlay = Overlay(root, LiveFeed(world, terrain, camera, viewport), names)
+    # 1. Constrói o Overlay e o painel HUD (root) imediatamente, sem qualquer withdraw()
+    overlay = Overlay(
+        root,
+        LiveFeed(world, terrain, camera, viewport),
+        names,
+        interception_dll=getattr(args, "interception_dll", None),
+        serial_port=getattr(args, "serial_port", None),
+        serial_baud=getattr(args, "serial_baud", 115200),
+    )
     world.on_pickup_ack_callback = overlay._on_pickup_ack
     overlay._click_method = args.click_method
     overlay._ragexe_pid = getattr(args, "ragexe_pid", None)
@@ -6025,11 +6259,64 @@ def run_live(root, args, names):
     if getattr(args, "route", None):
         r_map, r_x, r_y, r_target = args.route
         overlay.patrol_target_route = (r_map, int(r_x), int(r_y), r_target)
-    if getattr(args, "serial_port", None):
-        overlay.serial_hid.connect(args.serial_port, getattr(args, "serial_baud", 115200))
-    if getattr(args, "interception_dll", None):
-        overlay.interception = InterceptionDriver(args.interception_dll)
-    print(f"[Clique] Método de clique ativo: {overlay._click_method}", flush=True)
+    overlay.log_backend_status()
+
+    # Garante que root esteja construído, posicionado em tela e atualizado imediatamente
+    root.update_idletasks()
+    root.update()
+    ensure_touch_injection()
+
+    def _start_capture_session():
+        server, port = ("127.0.0.1", loop.port) if loop else (str(args.server), args.port)
+        ragexe_pid = getattr(args, "ragexe_pid", None)
+        start(lambda: capture(world, lengths, args.interface, server, port, args.local_port, stop, ready, ragexe_pid))
+        print(f"Captura TCP passiva em {args.interface}, servidor {server}:{port}.", flush=True)
+
+    if loop:
+        def run_mock():
+            while not ready.wait(.1):
+                if stop.is_set():
+                    return
+            if not stop.is_set():
+                loop.run()
+        start(run_mock)
+
+    if args.mock:
+        if args.interface:
+            _start_capture_session()
+        else:
+            ready.set()
+    else:
+        # Modo Live: se já tiver argumentos de rede completos, inicia imediatamente
+        if args.interface and args.server and args.port:
+            _start_capture_session()
+        else:
+            # Autodetecção não-bloqueante em thread em segundo plano com status no HUD
+            overlay.hud_status = "Aguardando Ragexe.exe..."
+            def _live_detect_worker():
+                def _update_status(msg):
+                    overlay.hud_status = msg
+                try:
+                    autodetect_live_session(args, status_callback=_update_status)
+                    if args.window_handle:
+                        viewport.handle = args.window_handle
+                        camera.target_hwnd = args.window_handle
+                        overlay.game_hwnd = args.window_handle
+                    if args.ragexe_pid:
+                        camera.pid = args.ragexe_pid
+                        overlay._ragexe_pid = args.ragexe_pid
+                    if args.window:
+                        viewport.title = args.window.casefold()
+
+                    _start_capture_session()
+                    overlay.hud_status = f"Conectado ao jogo (PID {args.ragexe_pid})"
+                except Exception as exc:
+                    print(f"[Live] Erro na autodetecção: {exc}", flush=True)
+                    overlay.hud_status = f"Erro autodetecção: {exc}"
+
+            detect_thread = Thread(target=_live_detect_worker, daemon=True)
+            detect_thread.start()
+            threads.append(detect_thread)
 
     def watch_worker():
         if errors:
@@ -6160,9 +6447,7 @@ def main():
             and args.player_speed > 0):
         parser.error("Parâmetros de câmera ou velocidade inválidos.")
 
-    if args.live:
-        autodetect_live_session(args)
-    elif args.mock and not args.port:
+    if args.mock and not args.port:
         args.port = 5121
 
     try:
@@ -6170,8 +6455,10 @@ def main():
     except Exception:
         pass
     root = tk.Tk()
-    root.configure(bg=BG_KEY, highlightthickness=0, bd=0)
-    root.withdraw()
+    root.configure(bg="#0F172A", highlightthickness=0, bd=0)
+    root.update_idletasks()
+    root.update()
+    ensure_touch_injection()
     names = read_catalogs(args.catalog)
     if args.live or args.mock:
         try:
@@ -6181,12 +6468,16 @@ def main():
     elif args.demo:
         with tempfile.TemporaryDirectory(prefix="ragnalok-feed-") as folder:
             path = Path(folder, "snapshot.json")
-            overlay = Overlay(root, SnapshotFeed(path), names)
+            overlay = Overlay(
+                root,
+                SnapshotFeed(path),
+                names,
+                interception_dll=getattr(args, "interception_dll", None),
+                serial_port=getattr(args, "serial_port", None),
+                serial_baud=getattr(args, "serial_baud", 115200),
+            )
             overlay._click_method = args.click_method
-            if getattr(args, "serial_port", None):
-                overlay.serial_hid.connect(args.serial_port, getattr(args, "serial_baud", 115200))
-            if getattr(args, "interception_dll", None):
-                overlay.interception = InterceptionDriver(args.interception_dll)
+            overlay.log_backend_status()
             try:
                 demo(root, path)
                 overlay.refresh()
@@ -6194,12 +6485,16 @@ def main():
             finally:
                 overlay.close()
     else:
-        overlay = Overlay(root, SnapshotFeed(args.source), names)
+        overlay = Overlay(
+            root,
+            SnapshotFeed(args.source),
+            names,
+            interception_dll=getattr(args, "interception_dll", None),
+            serial_port=getattr(args, "serial_port", None),
+            serial_baud=getattr(args, "serial_baud", 115200),
+        )
         overlay._click_method = args.click_method
-        if getattr(args, "serial_port", None):
-            overlay.serial_hid.connect(args.serial_port, getattr(args, "serial_baud", 115200))
-        if getattr(args, "interception_dll", None):
-            overlay.interception = InterceptionDriver(args.interception_dll)
+        overlay.log_backend_status()
         try:
             overlay.refresh()
             root.mainloop()

@@ -1292,74 +1292,56 @@ class World:
             # Layout ZC_ITEM_FALL_ENTRY moderno (rAthena Renewal, 24 bytes):
             #  0: opcode(2) | 2: ITAID(u32) | 6: ITID(u32) | 10: type(u16)
             # 12: IsIdentified(B) | 13: x(u16) | 15: y(u16) | 17: subX(B) | 18: subY(B) | 19: count(u16)
-            if len(data) >= 21:
-                aid  = u32(data, 2)
-                item = u32(data, 6)
-                x    = u16(data, 13)
-                y    = u16(data, 15)
-                cnt  = u16(data, 19)
-            elif len(data) >= 17:
-                # fallback para layout parcial (sem count)
-                aid  = u32(data, 2)
-                item = u32(data, 6)
-                x    = u16(data, 13)
-                y    = u16(data, 15)
-                cnt  = 1
+            aid  = u32(data, 2) if len(data) >= 6 else None
+            item = u32(data, 6) if len(data) >= 10 else None
+            cnt  = u16(data, 19) if len(data) >= 21 else 1
+            for off_x in (13, 11, 9):
+                if len(data) >= off_x + 4:
+                    cx = u16(data, off_x)
+                    cy = u16(data, off_x + 2)
+                    if 0 < cx < 2048 and 0 < cy < 2048:
+                        x, y = cx, cy
+                        break
 
         elif opcode in (0x0B14, 0x0B15):
-            # ZC_ITEM_ENTRY / ZC_ITEM_FALL_ENTRY5 moderno: suporta 19 e 21 bytes
-            if len(data) >= 15:
-                aid  = u32(data, 2)
-                item = u32(data, 6)
-                if len(data) >= 19:
-                    x21 = u16(data, 13)
-                    y21 = u16(data, 15)
-                    if 0 <= x21 < 2048 and 0 <= y21 < 2048 and (x21 > 0 or y21 > 0):
-                        x, y = x21, y21
-                        cnt = u16(data, 17) if len(data) >= 19 else 1
-                if x is None or y is None:
-                    if len(data) >= 15:
-                        x19 = u16(data, 11)
-                        y19 = u16(data, 13)
-                        x, y = x19, y19
-                        cnt = u16(data, 15) if len(data) >= 17 else 1
+            aid  = u32(data, 2) if len(data) >= 6 else None
+            item = u32(data, 6) if len(data) >= 10 else None
+            cnt  = 1
+            for off_x in (13, 11, 9):
+                if len(data) >= off_x + 4:
+                    cx = u16(data, off_x)
+                    cy = u16(data, off_x + 2)
+                    if 0 < cx < 2048 and 0 < cy < 2048:
+                        x, y = cx, cy
+                        cnt = u16(data, off_x + 4) if len(data) >= off_x + 6 else 1
+                        break
 
         elif opcode in (0x084A, 0x084B):
-            if len(data) >= 14:
-                aid  = u32(data, 2)
-                item = u32(data, 6) if (opcode == 0x084A and len(data) >= 19) else u16(data, 6)
-                if opcode == 0x084B:
-                    x   = u16(data, 10)
-                    y   = u16(data, 12)
-                    cnt = u16(data, 17) if len(data) >= 19 else 1
-                else:
-                    x   = u16(data, 9)
-                    y   = u16(data, 11)
-                    cnt = u16(data, 13) if len(data) >= 15 else 1
+            aid  = u32(data, 2) if len(data) >= 6 else None
+            item = u32(data, 6) if (opcode == 0x084A and len(data) >= 19) else (u16(data, 6) if len(data) >= 8 else None)
+            cnt  = u16(data, 17) if (opcode == 0x084B and len(data) >= 19) else 1
+            cand_offsets = (10, 9, 11) if opcode == 0x084B else (9, 10, 11)
+            for off_x in cand_offsets:
+                if len(data) >= off_x + 4:
+                    cx = u16(data, off_x)
+                    cy = u16(data, off_x + 2)
+                    if 0 < cx < 2048 and 0 < cy < 2048:
+                        x, y = cx, cy
+                        break
 
         elif opcode in (0x009D, 0x009E):
-            # 0x009D legacy (17 bytes) e moderno (19 bytes com ITID u32):
-            #   offset 2: ITAID u32 | offset 6: ITID u32 (19b) ou u16 (17b)
-            #   19 bytes: x=u16@11, y=u16@13, count=u16@15
-            #   17 bytes: x=u16@9,  y=u16@11, count=u16@13
-            if len(data) >= 19:
-                # Layout moderno: ITID de 4 bytes (u32)
-                # [DropRaw] real: 9D 00 C8 DE 00 00 8C 1D 00 00 01 36 00 DB 00 01 00 09 06
-                # offset 2=ITAID(u32), offset 6=ITID(u32), offset 10=IsIdentified(u8),
-                # offset 11=x(u16), offset 13=y(u16), offset 15=count(u16)
-                aid  = u32(data, 2)
-                item = u32(data, 6)
-                x    = u16(data, 11)
-                y    = u16(data, 13)
-                cnt  = u16(data, 15) if len(data) >= 17 else 1
-            elif len(data) >= 13:
-                # Layout legado: ITID de 2 bytes (u16)
-                # offset 2=ITAID(u32), offset 6=ITID(u16), offset 9=x(u16), offset 11=y(u16)
-                aid  = u32(data, 2)
-                item = u16(data, 6)
-                x    = u16(data, 9)
-                y    = u16(data, 11)
-                cnt  = u16(data, 16) if len(data) >= 18 else 1
+            # 0x009D legacy (17 bytes) e moderno (19 bytes com ITID u32)
+            aid  = u32(data, 2) if len(data) >= 6 else None
+            item = u32(data, 6) if len(data) >= 19 else (u16(data, 6) if len(data) >= 8 else None)
+            cnt  = u16(data, 15) if len(data) >= 17 else 1
+            cand_offsets = (11, 9, 13) if len(data) >= 19 else (9, 11, 13)
+            for off_x in cand_offsets:
+                if len(data) >= off_x + 4:
+                    cx = u16(data, off_x)
+                    cy = u16(data, off_x + 2)
+                    if 0 < cx < 2048 and 0 < cy < 2048:
+                        x, y = cx, cy
+                        break
 
         if aid is not None:
             self.recent_drop_gids[aid] = now
@@ -1367,7 +1349,7 @@ class World:
         if aid is not None and item is not None and x is not None and y is not None:
             px, py = self.player.cell(now) if self.player else (None, None)
             dist = max(abs(x - px), abs(y - py)) if px is not None else 0
-            if 0 <= x < 2048 and 0 <= y < 2048 and item and (px is None or dist <= 60):
+            if 0 < x < 2048 and 0 < y < 2048 and item and (px is None or dist <= 60):
                 cell = (x, y)
                 ownership = self._classify_drop(cell)
                 self.entities["drop", aid] = Entity(
@@ -1383,27 +1365,6 @@ class World:
                 })
                 if len(self.recent_seen_drops) > 40:
                     self.recent_seen_drops.pop(0)
-
-    # Detector automático de offset PosDir para pacotes 0x09FF/0x09FD deste servidor
-    # Testamos candidatos [63, 65, 67] e salvamos o que produz (x,y) dentro de ±25 do jogador
-
-    def _detect_posdir_offset(self, data: bytes, candidates: list, walking: bool = False) -> int | None:
-        """Testa offsets candidatos de PosDir contra a posição do jogador (±25 células)."""
-        if not self.player:
-            return None
-        now = time.monotonic()
-        px, py = self.player.cell(now)
-        for off in candidates:
-            test_off = (off + 4) if walking else off
-            if len(data) >= test_off + 3:
-                try:
-                    cx, cy = position(data, test_off)
-                    if 0 < cx < 1024 and 0 < cy < 1024:
-                        if max(abs(cx - px), abs(cy - py)) <= 25:
-                            return off
-                except Exception:
-                    pass
-        return None
 
     def _unit(self, opcode, data):
         if len(data) < 5:
@@ -1434,31 +1395,32 @@ class World:
                 return
         else:
             obj_type = data[4]
-            # Offset PosDir base calculado pelo protocolo
-            base_offset = 53 + 4 * has_aid + 4 * wide + 2 * (opcode >= 0x07F7)
-
-            # Para pacotes 0x09FF (90b idle) / 0x09FD (96b walk) deste servidor,
-            # usa detector automático de offset se o base_offset calculado falhar.
-            wide_mob = opcode in (0x09FD, 0x09FE, 0x09FF, 0x0AFD, 0x0AFE, 0x0AFF)
-            posdir_candidates = [base_offset, 63, 65, 67]
+            # Offset PosDir tabelado conforme opcode do protocolo rAthena/Hercules:
+            # 0x09FF (90b idle) / 0x09FD (96b walk): offset 63 (PosDir base)
+            if opcode in (0x09FD, 0x09FE, 0x09FF, 0x0AFD, 0x0AFE, 0x0AFF, 0x09DB, 0x09DC, 0x09DD):
+                effective_offset = 63
+            elif opcode in (0x0914, 0x090F, 0x0915):
+                effective_offset = 59
+            elif opcode in (0x0856, 0x0857, 0x0858, 0x07F7, 0x07F8, 0x07F9):
+                effective_offset = 55
+            elif opcode in (0x02EC, 0x02ED, 0x02EE):
+                effective_offset = 53
+            else:
+                effective_offset = 53 + 4 * has_aid + 4 * wide + 2 * (opcode >= 0x07F7)
 
             speed = max(1, u16(data, 9 + 4 * has_aid)) if len(data) >= 11 + 4 * has_aid else 150
             job = u16(data, 19 + 4 * has_aid) if len(data) >= 21 + 4 * has_aid else 1002
 
-            # Determina o offset PosDir efectivo para mobs
-            if wide_mob and self._posdir_offset is None:
-                detected = self._detect_posdir_offset(data, posdir_candidates, walking=walking)
-                if detected is not None:
-                    self._posdir_offset = detected
-                    print(
-                        f"[Feed] Offset PosDir detectado automaticamente: {detected} "
-                        f"(opcode=0x{opcode:04X} len={len(data)})",
-                        flush=True,
-                    )
-            effective_offset = self._posdir_offset if (wide_mob and self._posdir_offset is not None) else base_offset
             aid = u32(data, 5) if len(data) >= 9 else 0
             gid = u32(data, 9) if len(data) >= 13 else 0
             entity_id = aid if aid > 0 else gid
+
+        gat = self.get_gat()
+        map_w = getattr(gat, "width", 1024) or 1024
+        map_h = getattr(gat, "height", 1024) or 1024
+
+        def _is_valid_coord(cx, cy):
+            return 0 < cx < map_w and 0 < cy < map_h
 
         # Rastreia outros jogadores (BL_PC = 0)
         if obj_type == 0:
@@ -1468,13 +1430,25 @@ class World:
                 p_id = p_gid if p_gid >= 100000 else p_aid
                 self.aid_to_gid[p_aid] = p_id
                 if self.player_id is None or p_id != self.player_id:
-                    # Para jogadores usa offset base sem deteção extra
-                    if walking and len(data) >= effective_offset + 7:
-                        p_cell = position(data, effective_offset + 4)
-                    elif len(data) >= effective_offset + 3:
-                        p_cell = position(data, effective_offset)
-                    else:
-                        p_cell = None
+                    p_cell = None
+                    p_cands = [effective_offset, 63, 59, 55, 53, 46]
+                    for p_off in p_cands:
+                        if walking and len(data) >= p_off + 7:
+                            try:
+                                _, (p_dx, p_dy) = movement(data, p_off + 4)
+                                if _is_valid_coord(p_dx, p_dy):
+                                    p_cell = (p_dx, p_dy)
+                                    break
+                            except Exception:
+                                pass
+                        elif not walking and len(data) >= p_off + 3:
+                            try:
+                                p_cx, p_cy = position(data, p_off)
+                                if _is_valid_coord(p_cx, p_cy):
+                                    p_cell = (p_cx, p_cy)
+                                    break
+                            except Exception:
+                                pass
                     if p_cell:
                         self.other_players[p_id] = (p_cell, time.monotonic())
                         self.other_players[p_aid] = (p_cell, time.monotonic())
@@ -1485,17 +1459,36 @@ class World:
         if obj_type in (7, 8, 9, 10):
             return
 
-        if walking:
-            move_off = effective_offset + 4
-            if len(data) >= move_off + 5:
-                track = Track.walking(movement(data, move_off), speed, time.perf_counter() - 0.035, gat=self.get_gat())
+        track = None
+        candidates = [effective_offset, 63, 59, 55, 53, 46] if not is_legacy else [effective_offset]
+        seen_offs = set()
+        unique_candidates = [off for off in candidates if not (off in seen_offs or seen_offs.add(off))]
+
+        for off in unique_candidates:
+            if walking:
+                move_off = off + 4
+                if len(data) >= move_off + 5:
+                    try:
+                        (sx, sy), (dx, dy) = movement(data, move_off)
+                        if _is_valid_coord(dx, dy) and _is_valid_coord(sx, sy):
+                            effective_offset = off
+                            track = Track.walking(((sx, sy), (dx, dy)), speed, time.perf_counter() - 0.035, gat=gat)
+                            break
+                    except Exception:
+                        pass
             else:
-                return
-        else:
-            if len(data) >= effective_offset + 3:
-                track = Track.stationary(position(data, effective_offset))
-            else:
-                return
+                if len(data) >= off + 3:
+                    try:
+                        cx, cy = position(data, off)
+                        if _is_valid_coord(cx, cy):
+                            effective_offset = off
+                            track = Track.stationary((cx, cy), speed_ms=speed)
+                            break
+                    except Exception:
+                        pass
+
+        if not track:
+            return
 
         # Classificação da entidade:
         # - job == 45: portal de teleporte / warp
