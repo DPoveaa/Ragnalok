@@ -12,19 +12,14 @@ import json
 import math
 import os
 from pathlib import Path
-import random
 import re
 from subprocess import list2cmdline
 import tempfile
-import threading
-from threading import Event, Thread
 import time
 import tkinter as tk
-from tkinter import ttk
-import traceback
-import unicodedata
 import collections
 from dataclasses import dataclass
+from threading import Event, Thread
 
 import psutil
 from scapy.all import conf
@@ -88,28 +83,7 @@ MAX_SNAPSHOT_BYTES = 256_000
 MAX_OBJECTS = 200
 SNAPSHOT_TTL = .75
 DEFAULT_CATALOG = Path("D:/Jogos/Ragnarok/System/itemInfo.lua")
-
-
-def _get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-def _resolve_asset_file(filename: str) -> Path:
-    candidates = [
-        _get_base_dir() / filename,
-        getattr(sys, "_MEIPASS", None) and (Path(sys._MEIPASS) / filename),
-        Path(__file__).parent / filename,
-        Path(filename),
-    ]
-    for c in candidates:
-        if c and Path(c).is_file():
-            return Path(c)
-    return Path(__file__).with_name(filename)
-
-
-MOB_CATALOG = _resolve_asset_file("monstros-pt-br.json")
+MOB_CATALOG = Path(__file__).with_name("monstros-pt-br.json")
 
 
 @dataclass(frozen=True)
@@ -138,8 +112,6 @@ class Snapshot:
     weight_ratio: float = 0.0
     base_level: int = 1
     map: str = None
-    is_dead: bool = False
-    death_ts: float = 0.0
 
 
 def decode_snapshot(text):
@@ -289,9 +261,6 @@ class LiveFeed:
             for (kind, aid), entity in entities:
                 render_now = now - (0.12 if kind == "mob" else 0.0)
                 fx, fy = entity.track.cell(render_now)
-                # Ignora entidades com coordenadas inválidas (0, 0)
-                if fx <= 0 or fy <= 0:
-                    continue
                 # 1. Âncora no chão (sprite_z = 0.0)
                 anchor_u, anchor_v = project(fx, fy, 0.0)
                 # 2. Centro visual do sprite: sprite_z = 5.5 para mob/npc, 1.2 para drop/warp
@@ -317,8 +286,6 @@ class LiveFeed:
                     if now_m - p_t > 15.0:
                         continue
                     p_fx, p_fy = p_cell
-                    if p_fx <= 0 or p_fy <= 0:
-                        continue
                     p_anc_u, p_anc_v = project(p_fx, p_fy, 0.0)
                     p_clk_u, p_clk_v = project(p_fx, p_fy, 5.5)
                     if (-0.2 <= p_clk_u <= 1.2 and -0.2 <= p_clk_v <= 1.2) or (-0.2 <= p_anc_u <= 1.2 and -0.2 <= p_anc_v <= 1.2):
@@ -332,9 +299,7 @@ class LiveFeed:
             player=player,
             weight_ratio=getattr(player, "weight_ratio", 0.0) if player else 0.0,
             base_level=getattr(player, "base_level", 1) if player else 1,
-            map=name,
-            is_dead=getattr(player, "is_dead", False) if player else False,
-            death_ts=getattr(player, "death_ts", 0.0) if player else 0.0,
+            map=name
         )
 
 
@@ -371,7 +336,7 @@ class MOUSEINPUT(ctypes.Structure):
         ("mouseData", wintypes.DWORD),
         ("dwFlags", wintypes.DWORD),
         ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_void_p),
+        ("dwExtraInfo", ULONG_PTR),
     ]
 
 
@@ -381,7 +346,7 @@ class KEYBDINPUT(ctypes.Structure):
         ("wScan", wintypes.WORD),
         ("dwFlags", wintypes.DWORD),
         ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_void_p),
+        ("dwExtraInfo", ULONG_PTR),
     ]
 
 
@@ -411,9 +376,6 @@ class INPUT(ctypes.Structure):
 
 assert ctypes.sizeof(INPUT) == 40, f"INPUT size={ctypes.sizeof(INPUT)}, expected 40"
 
-_MOUSEINPUT = MOUSEINPUT
-_INPUT = INPUT
-
 
 # --- Windows Native Touch Injection Structures ---
 PT_TOUCH = 2
@@ -422,7 +384,6 @@ POINTER_FLAG_NEW = 0x00000001
 POINTER_FLAG_INRANGE = 0x00000002
 POINTER_FLAG_INCONTACT = 0x00000004
 POINTER_FLAG_PRIMARY = 0x00002000
-POINTER_FLAG_CONFIDENCE = 0x00000400
 POINTER_FLAG_DOWN = 0x00010000
 POINTER_FLAG_UPDATE = 0x00020000
 POINTER_FLAG_UP = 0x00040000
@@ -473,7 +434,7 @@ u32.SetCursorPos.restype = wintypes.BOOL
 u32.GetCursorPos.argtypes = (ctypes.POINTER(wintypes.POINT),)
 u32.GetCursorPos.restype = wintypes.BOOL
 
-u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+u32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
 u32.SendInput.restype = wintypes.UINT
 
 u32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
@@ -482,20 +443,11 @@ u32.MapVirtualKeyW.restype = wintypes.UINT
 u32.mouse_event.argtypes = (wintypes.DWORD, ctypes.c_long, ctypes.c_long, wintypes.DWORD, ULONG_PTR)
 u32.mouse_event.restype = None
 
-u32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+u32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 u32.PostMessageW.restype = wintypes.BOOL
 
 u32.IsWindow.argtypes = (wintypes.HWND,)
 u32.IsWindow.restype = wintypes.BOOL
-
-u32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
-u32.FindWindowW.restype = wintypes.HWND
-
-u32.BringWindowToTop.argtypes = (wintypes.HWND,)
-u32.BringWindowToTop.restype = wintypes.BOOL
-
-u32.SetForegroundWindow.argtypes = (wintypes.HWND,)
-u32.SetForegroundWindow.restype = wintypes.BOOL
 
 u32.InitializeTouchInjection.argtypes = (wintypes.UINT, wintypes.DWORD)
 u32.InitializeTouchInjection.restype = wintypes.BOOL
@@ -900,7 +852,7 @@ class CameraTracker:
                 return u32.CallNextHookEx(self._wheel_hook, nCode, wParam, lParam)
 
             self._wheel_hook_proc = HOOKPROC(_wheel_proc)
-            h_mod = ctypes.windll.kernel32.GetModuleHandleW(None)
+            h_mod = u32.GetModuleHandleW(None)
             self._wheel_hook = u32.SetWindowsHookExW(WH_MOUSE_LL, self._wheel_hook_proc, h_mod, 0)
         except Exception:
             self._wheel_hook = None
@@ -952,40 +904,36 @@ class InterceptionDriver:
         self.context = None
         self.mouse_dev = None
         self.is_available = False
-        self.dll_loaded = False
-        self.context_failed = False
-        self.failure_reason = ""
 
-        base_dir = Path(__file__).resolve().parent
-        fallback_path = (base_dir / "interception.dll").resolve()
-
+        paths_to_try = []
         if dll_path:
-            chosen_path = Path(dll_path).resolve()
-        else:
-            chosen_path = fallback_path
+            paths_to_try.append(Path(dll_path))
+        base_dir = Path(__file__).resolve().parent
+        paths_to_try.extend([
+            base_dir / "interception.dll",
+            base_dir / "bin" / "interception.dll",
+            Path("interception.dll"),
+        ])
 
-        self.dll_path = str(chosen_path)
+        target = None
+        for p in paths_to_try:
+            if p.is_file():
+                target = str(p)
+                break
 
-        target_file = None
-        if chosen_path.is_file():
-            target_file = chosen_path
-        else:
-            for alt in [base_dir / "bin" / "interception.dll", Path("interception.dll").resolve()]:
-                if alt.is_file():
-                    target_file = alt
-                    self.dll_path = str(target_file)
-                    break
+        if not target:
+            try:
+                self.dll = ctypes.CDLL("interception.dll")
+                target = "interception.dll"
+            except Exception:
+                return
 
-        if not target_file:
-            self.failure_reason = f"Arquivo {self.dll_path} não encontrado"
-            return
-
-        try:
-            self.dll = ctypes.CDLL(str(target_file))
-            self.dll_loaded = True
-        except Exception as exc:
-            self.failure_reason = f"Falha ao carregar DLL ({exc})"
-            return
+        if not self.dll:
+            try:
+                self.dll = ctypes.CDLL(target)
+            except Exception as exc:
+                print(f"[HID] Falha ao carregar {target}: {exc}", flush=True)
+                return
 
         try:
             self.dll.interception_create_context.restype = ctypes.c_void_p
@@ -997,9 +945,7 @@ class InterceptionDriver:
 
             self.context = self.dll.interception_create_context()
             if not self.context:
-                self.context_failed = True
-                self.failure_reason = "Driver interception.sys não instalado no Windows ou reboot pendente"
-                print(f"[HID] {self.failure_reason}", flush=True)
+                print("[HID] Contexto do Interception retornou NULL (driver instalado no Windows?).", flush=True)
                 return
 
             for dev in range(1, 21):
@@ -1011,70 +957,36 @@ class InterceptionDriver:
                 self.is_available = True
                 print(f"[HID] Driver interception.dll carregado com sucesso (MouseDevice={self.mouse_dev}).", flush=True)
             else:
-                self.failure_reason = "Nenhum dispositivo de mouse detectado"
-                print(f"[HID] {self.failure_reason}", flush=True)
+                print("[HID] Interception carregado, mas nenhum dispositivo de mouse detectado.", flush=True)
         except Exception as exc:
-            self.failure_reason = f"Erro inicializando Interception: {exc}"
-            print(f"[HID] {self.failure_reason}", flush=True)
+            print(f"[HID] Erro inicializando Interception: {exc}", flush=True)
 
     def send_click(self, sx: int, sy: int, screen_w: int = 1920, screen_h: int = 1080) -> bool:
         if not self.is_available or not self.context or not self.mouse_dev:
             return False
         try:
-            # 1. Posição atual do cursor para deslizamento suave até (sx, sy)
-            pt = wintypes.POINT()
-            u32.GetCursorPos(ctypes.byref(pt))
-            x0, y0 = pt.x, pt.y
-            dist = math.hypot(sx - x0, sy - y0)
+            norm_x = int((sx * 65535) / max(1, screen_w))
+            norm_y = int((sy * 65535) / max(1, screen_h))
 
-            if dist > 8.0:
-                steps = max(5, min(12, int(dist / 55)))
-                for i in range(1, steps + 1):
-                    t = i / steps
-                    eased = 1.0 - (1.0 - t) ** 2
-                    if i == steps:
-                        ix, iy = int(sx), int(sy)
-                    else:
-                        ix = int(round(x0 + (sx - x0) * eased)) + random.choice([-2, -1, 1, 2])
-                        iy = int(round(y0 + (sy - y0) * eased)) + random.choice([-2, -1, 1, 2])
-                    norm_ix = max(0, min(65535, int((ix * 65535) / max(1, screen_w))))
-                    norm_iy = max(0, min(65535, int((iy * 65535) / max(1, screen_h))))
-                    stroke_step = InterceptionMouseStroke(
-                        state=0, flags=0x001, rolling=0, x=norm_ix, y=norm_iy, information=0
-                    )
-                    self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_step), 1)
-                    u32.SetCursorPos(ix, iy)
-                    time.sleep(0.006)
-
-            # Pouso exato em (sx, sy)
-            norm_x = max(0, min(65535, int((sx * 65535) / max(1, screen_w))))
-            norm_y = max(0, min(65535, int((sy * 65535) / max(1, screen_h))))
-            stroke_land = InterceptionMouseStroke(
+            # Mover (INTERCEPTION_MOUSE_MOVE_ABSOLUTE = 0x001)
+            stroke_move = InterceptionMouseStroke(
                 state=0, flags=0x001, rolling=0, x=norm_x, y=norm_y, information=0
             )
-            self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_land), 1)
-            u32.SetCursorPos(int(sx), int(sy))
+            self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_move), 1)
+            time.sleep(0.015)
 
-            # 2. Aguarda 45ms para o DirectInput do Ragexe.exe atualizar o cursor de hover
-            time.sleep(0.045)
-
-            # 3. INTERCEPTION_MOUSE_LEFT_BUTTON_DOWN = 0x0001
+            # Left Down (INTERCEPTION_MOUSE_LEFT_BUTTON_DOWN = 0x001)
             stroke_down = InterceptionMouseStroke(
                 state=0x0001, flags=0, rolling=0, x=0, y=0, information=0
             )
             self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_down), 1)
+            time.sleep(0.025)
 
-            # 4. Aguarda 50ms de retenção física
-            time.sleep(0.050)
-
-            # 5. INTERCEPTION_MOUSE_LEFT_BUTTON_UP = 0x0002
+            # Left Up (INTERCEPTION_MOUSE_LEFT_BUTTON_UP = 0x002)
             stroke_up = InterceptionMouseStroke(
                 state=0x0002, flags=0, rolling=0, x=0, y=0, information=0
             )
             self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_up), 1)
-
-            # 6. Registra confirmação de envio
-            log_click_file(f"Interception ({sx},{sy}) sent=1")
             return True
         except Exception as exc:
             print(f"[HID] Erro ao enviar clique via Interception: {exc}", flush=True)
@@ -1103,11 +1015,8 @@ class SerialHID:
         self.baudrate = baudrate
         self._serial_obj = None
         self._handle = None
-        self.failure_reason = ""
         if self.port:
             self.connect(self.port, self.baudrate)
-        else:
-            self.failure_reason = "Porta serial não informada"
 
     @property
     def is_connected(self) -> bool:
@@ -1118,7 +1027,6 @@ class SerialHID:
     def connect(self, port: str, baudrate: int = 115200) -> bool:
         self.port = port
         self.baudrate = baudrate
-        self.failure_reason = ""
         # 1. Tenta pyserial se disponível
         try:
             import serial
@@ -1128,7 +1036,6 @@ class SerialHID:
         except ImportError:
             pass
         except Exception as exc:
-            self.failure_reason = f"pyserial falhou: {exc}"
             print(f"[SerialHID] pyserial falhou em {self.port}: {exc}. Tentando Win32 nativo...", flush=True)
 
         # 2. Fallback Win32 CreateFileW nativo (sem dependência externa)
@@ -1148,15 +1055,12 @@ class SerialHID:
             )
             if handle and handle != wintypes.HANDLE(-1).value and handle != -1:
                 self._handle = handle
-                self.failure_reason = ""
                 print(f"[SerialHID] Conectado nativamente (Win32) em {self.port}.", flush=True)
                 return True
             else:
                 err = ctypes.get_last_error()
-                self.failure_reason = f"Win32 CreateFileW falhou (LastError={err})"
                 print(f"[SerialHID] Falha ao abrir {self.port} nativamente: Win32 LastError={err}", flush=True)
         except Exception as exc:
-            self.failure_reason = f"Erro conectando porta: {exc}"
             print(f"[SerialHID] Erro conectando à porta {self.port}: {exc}", flush=True)
         return False
 
@@ -1312,8 +1216,7 @@ class CanvasPool:
 
 
 class Overlay:
-    def __init__(self, root, feed, names, interception_dll=None, serial_port=None, serial_baud=115200):
-        self.root = root
+    def __init__(self, root, feed, names):
         self.feed = feed
         self.names = names
         self.window = tk.Toplevel(root, bg=BG_KEY, highlightthickness=0, bd=0)
@@ -1328,8 +1231,9 @@ class Overlay:
         if not overlay_hwnd:
             raise RuntimeError("A janela do overlay não foi criada.")
         self.handle = overlay_hwnd
-        # Overlay 100% click-through: apenas WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE em GWL_EXSTYLE.
-        # WS_DISABLED (0x08000000) REMOVIDO de GWL_STYLE — afeta janelas filhas (HUD) via UIPI.
+        # Overlay 100% Zero-Interferência: WS_DISABLED (0x08000000) em GWL_STYLE (-16) e WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE (0x08080028) em GWL_EXSTYLE (-20)
+        style = u32.GetWindowLongW(overlay_hwnd, -16)
+        u32.SetWindowLongW(overlay_hwnd, -16, style | 0x08000000)
         ex_style = u32.GetWindowLongW(overlay_hwnd, -20)
         ctypes.set_last_error(0)
         previous_style = u32.SetWindowLongW(
@@ -1354,20 +1258,6 @@ class Overlay:
         self.is_sitting = False
         self._sit_retreat_state = None
         self._last_player_hp = None
-        self.flee_enabled = tk.BooleanVar(value=True)
-        self.flee_pct_var = tk.StringVar(value="35")
-        self.potion_key_enabled = tk.BooleanVar(value=False)
-        self.potion_key_var = tk.StringVar(value="F1")
-        self.auto_resurrect = tk.BooleanVar(value=False)
-        self.last_farm_spot = None
-        self.last_farm_modes = None
-        self._death_click_toggle = 0
-        self._death_start_ts = 0.0
-        self._respawn_state = None
-        self._last_healer_click_ts = 0.0
-        self.fleeing_mode = False
-        self._last_potion_press = 0.0
-        self._last_resurrect_press = 0.0
         self._ignore_tier3_always = tk.BooleanVar(value=False)
         self._last_decision_ts = 0.0
         self._cached_hud_rect = None
@@ -1410,10 +1300,9 @@ class Overlay:
             self.feed.world.on_pickup_ack_callback = self._on_pickup_ack
         # Suporte a hardware HID (driver Interception e/ou Serial USB HID para bypass de anti-cheat)
         import os as _os
-        interception_path = interception_dll or _os.environ.get("INTERCEPTION_DLL")
-        self.interception = InterceptionDriver(dll_path=interception_path)
-        port_to_use = serial_port or _os.environ.get("RAG_SERIAL_PORT") or _os.environ.get("SERIAL_PORT")
-        self.serial_hid = SerialHID(port=port_to_use, baudrate=serial_baud)
+        self.interception = InterceptionDriver()
+        serial_env = _os.environ.get("RAG_SERIAL_PORT") or _os.environ.get("SERIAL_PORT")
+        self.serial_hid = SerialHID(port=serial_env)
         self._anti_cheat_warning_shown = False
         # Admin check para feedback no HUD
         try:
@@ -1481,155 +1370,18 @@ class Overlay:
         self._loot_history = []
         self._session_kill_count = 0
         self._kill_history_last_check = 0.0
-        self._load_filters_config()
         self._create_hud_panel()
-        if hasattr(self, "root") and self.root:
-            self.root.update_idletasks()
-            self.root.update()
-        ensure_touch_injection()
         self._install_navi_hook()
-        self.log_backend_status()
-
-    def log_backend_status(self):
-        """Imprime no console o status exato de cada backend de clique e o método primário ativo."""
-        # 1. SerialHID
-        serial = getattr(self, "serial_hid", None)
-        if serial and serial.is_connected:
-            serial_msg = f"porta '{serial.port}' configurada e conectada ({getattr(serial, 'baudrate', 115200)} baud)"
-        elif serial and serial.port:
-            reason = getattr(serial, "failure_reason", "falha na abertura")
-            serial_msg = f"porta '{serial.port}' configurada, mas conexão falhou: {reason}"
-        else:
-            serial_msg = "não configurado (nenhuma porta informada; use --serial-port COMx ou RAG_SERIAL_PORT)"
-        print(f"[Backend] SerialHID: {serial_msg}", flush=True)
-
-        # 2. InterceptionDriver
-        inter = getattr(self, "interception", None)
-        if inter:
-            dll_p = getattr(inter, "dll_path", "interception.dll")
-            if getattr(inter, "is_available", False):
-                inter_msg = f"DLL carregada com sucesso ('{dll_p}'), contexto ativo, MouseDevice={inter.mouse_dev} pronto."
-            elif getattr(inter, "context_failed", False):
-                inter_msg = f"DLL carregada ('{dll_p}'), mas Driver interception.sys não instalado no Windows ou reboot pendente"
-            elif getattr(inter, "dll_loaded", False):
-                inter_msg = f"DLL carregada ('{dll_p}'), mas {inter.failure_reason or 'nenhum dispositivo de mouse detectado'}."
-            else:
-                inter_msg = f"DLL não encontrada/carregada ('{dll_p}'): {inter.failure_reason or 'arquivo não encontrado'}."
-        else:
-            inter_msg = "não instanciado"
-        print(f"[Backend] InterceptionDriver: {inter_msg}", flush=True)
-
-        # 3. Método primário ativo
-        if serial and serial.is_connected:
-            primary_msg = f"SerialHID (porta {serial.port})"
-        elif inter and getattr(inter, "is_available", False):
-            primary_msg = f"InterceptionDriver (MouseDevice={inter.mouse_dev})"
-        else:
-            primary_msg = f"fallback {getattr(self, '_click_method', 'touch_postmsg')}"
-        print(f"[Backend] Método primário ativo: {primary_msg}", flush=True)
-
-    def _get_filters_config_path(self):
-        return str(_get_base_dir() / "filters_config.json")
-
-    def _load_filters_config(self):
-        """Carrega filtros persistentes de filters_config.json."""
-        config_path = self._get_filters_config_path()
-        try:
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                m_mode = cfg.get("mob_filter_mode", "Todos")
-                if str(m_mode).lower() in ("all", "todos"):
-                    self._mob_filter_mode = "Todos"
-                elif str(m_mode).lower() in ("whitelist",):
-                    self._mob_filter_mode = "Whitelist"
-                elif str(m_mode).lower() in ("blacklist",):
-                    self._mob_filter_mode = "Blacklist"
-                else:
-                    self._mob_filter_mode = m_mode
-
-                d_mode = cfg.get("drop_filter_mode", "Todos")
-                if str(d_mode).lower() in ("all", "todos"):
-                    self._drop_filter_mode = "Todos"
-                elif str(d_mode).lower() in ("whitelist",):
-                    self._drop_filter_mode = "Whitelist"
-                elif str(d_mode).lower() in ("blacklist",):
-                    self._drop_filter_mode = "Blacklist"
-                else:
-                    self._drop_filter_mode = d_mode
-
-                self.mob_whitelist = set(cfg.get("mob_whitelist", []))
-                self.mob_whitelist_names = set(str(x).lower() for x in cfg.get("mob_whitelist_names", []))
-                self.mob_blacklist = set(cfg.get("mob_blacklist", []))
-                self.mob_blacklist_names = set(str(x).lower() for x in cfg.get("mob_blacklist_names", []))
-                self.drop_whitelist = set(cfg.get("drop_whitelist", []))
-                self.drop_whitelist_names = set(str(x).lower() for x in cfg.get("drop_whitelist_names", []))
-                self.drop_blacklist = set(cfg.get("drop_blacklist", []))
-                self.drop_blacklist_names = set(str(x).lower() for x in cfg.get("drop_blacklist_names", []))
-        except Exception as exc:
-            print(f"[HUD] Erro ao carregar filters_config.json: {exc}", flush=True)
-
-    def _save_filters_config(self):
-        """Salva filtros persistentes em filters_config.json."""
-        config_path = self._get_filters_config_path()
-        try:
-            cfg = {
-                "mob_filter_mode": self._mob_filter_mode,
-                "drop_filter_mode": self._drop_filter_mode,
-                "mob_whitelist": sorted(list(self.mob_whitelist)),
-                "mob_whitelist_names": sorted(list(self.mob_whitelist_names)),
-                "mob_blacklist": sorted(list(self.mob_blacklist)),
-                "mob_blacklist_names": sorted(list(self.mob_blacklist_names)),
-                "drop_whitelist": sorted(list(self.drop_whitelist)),
-                "drop_whitelist_names": sorted(list(self.drop_whitelist_names)),
-                "drop_blacklist": sorted(list(self.drop_blacklist)),
-                "drop_blacklist_names": sorted(list(self.drop_blacklist_names)),
-            }
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2, ensure_ascii=False)
-        except Exception as exc:
-            print(f"[HUD] Erro ao salvar filters_config.json: {exc}", flush=True)
-
-    def _set_hud_visible(self, visible: bool):
-        """Alterna a visibilidade do painel HUD sem chamar withdraw(), preservando a janela Win32 ativa para InjectTouchInput."""
-        self._hud_panel_visible = visible
-        hud = getattr(self, "_hud_panel", None)
-        if not hud or not hud.winfo_exists():
-            return
-        if visible:
-            sw = hud.winfo_screenwidth()
-            pos = getattr(self, "_hud_last_pos", None)
-            if pos:
-                hud.geometry(pos)
-            else:
-                hud.geometry(f"390x520+{max(0, sw - 420)}+50")
-            alpha = getattr(self, "_hud_alpha_var", None)
-            hud.attributes("-alpha", alpha.get() if alpha else 0.88)
-            hud.lift()
-            hud.attributes("-topmost", True)
-        else:
-            try:
-                self._hud_last_pos = f"{hud.winfo_width()}x{hud.winfo_height()}+{hud.winfo_x()}+{hud.winfo_y()}"
-            except Exception:
-                pass
-            # Oculta visualmente sem withdraw() para manter a janela Win32 ativável no Windows
-            hud.attributes("-alpha", 0.0)
-            hud.geometry("+99999+99999")
 
     def _create_hud_panel(self):
-        """Cria painel de controle HUD dark-mode flutuante em 4 abas (F8 para alternar)."""
+        """Cria painel de controle HUD dark-mode flutuante e integrado (F8 para alternar)."""
         try:
-            panel = self.root if hasattr(self, "root") and self.root else tk.Tk()
+            panel = tk.Toplevel(bg="#0F172A")
             panel.title("Ragnalok HUD")
-            panel.configure(bg="#0F172A")
             panel.overrideredirect(True)
             panel.resizable(False, False)
-            panel.geometry("390x520+10+50")
-            panel.attributes("-alpha", 0.88)
-            try:
-                panel.attributes("-toolwindow", True)
-            except Exception:
-                pass
+            panel.geometry("360x760+10+50")
+            panel.attributes("-alpha", 0.84)
             self._hud_panel_ref = panel
 
             self._drag_x = 0
@@ -1641,7 +1393,7 @@ class Overlay:
                                 highlightbackground="#334155", highlightcolor="#334155")
             main_box.pack(fill="both", expand=True)
 
-            # Barra superior customizada arrastável com acento #3B82F6
+            # Barra superior customizada arrastável com acento #3B82F6 / #8B5CF6
             title_bar = tk.Frame(main_box, bg="#1E293B", height=28)
             title_bar.pack(fill="x")
 
@@ -1652,16 +1404,17 @@ class Overlay:
             def _toggle_compact():
                 self._hud_compact = not self._hud_compact
                 if self._hud_compact:
-                    nb_frame.pack_forget()
+                    body_frame.pack_forget()
                     btn_min.config(text="▼")
-                    panel.geometry("390x135")
+                    panel.geometry("360x170")
                 else:
-                    nb_frame.pack(fill="both", expand=True, padx=4, pady=2)
+                    body_frame.pack(fill="both", expand=True, padx=4, pady=2)
                     btn_min.config(text="▲")
-                    panel.geometry("390x520")
+                    panel.geometry("360x760")
 
             def _hide_hud():
-                self._set_hud_visible(False)
+                panel.withdraw()
+                self._hud_panel_visible = False
 
             btn_close = tk.Button(title_bar, text="✕", command=_hide_hud, bg="#1E293B",
                                   fg="#94A3B8", activebackground="#EF4444", activeforeground="#FFFFFF",
@@ -1674,7 +1427,7 @@ class Overlay:
             btn_min.pack(side="right", padx=2, pady=2)
 
             # Controle de opacidade compacto (60%–100%) na barra de título
-            self._hud_alpha_var = tk.DoubleVar(value=0.88)
+            self._hud_alpha_var = tk.DoubleVar(value=0.84)
             def _set_alpha(val):
                 try:
                     panel.attributes("-alpha", float(val))
@@ -1684,20 +1437,15 @@ class Overlay:
                 title_bar, from_=0.60, to=1.0, resolution=0.01,
                 orient="horizontal", variable=self._hud_alpha_var, command=_set_alpha,
                 bg="#1E293B", fg="#94A3B8", troughcolor="#0F172A",
-                highlightthickness=0, length=55, showvalue=False, bd=0,
+                highlightthickness=0, length=60, showvalue=False, bd=0,
             )
             alpha_scale.pack(side="right", padx=4, pady=2)
 
-            self._last_drag_time = 0.0
             def _on_drag_start(e):
                 self._drag_x = e.x_root - panel.winfo_x()
                 self._drag_y = e.y_root - panel.winfo_y()
 
             def _on_drag(e):
-                now = time.monotonic()
-                if now - self._last_drag_time < 0.016:
-                    return
-                self._last_drag_time = now
                 panel.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
 
             title_bar.bind("<ButtonPress-1>", _on_drag_start)
@@ -1720,62 +1468,31 @@ class Overlay:
                 "highlightthickness": 1, "highlightbackground": "#334155",
             }
 
-            # ── Telemetria Integrada no Cabeçalho ──
+            # ── Telemetria Integrada no Topo (substitui overlay antigo do topo-esquerdo) ──
             telem_frame = tk.Frame(main_box, bg="#0F172A")
-            telem_frame.pack(fill="x", padx=6, pady=(3, 1))
+            telem_frame.pack(fill="x", padx=6, pady=(4, 2))
 
-            telem_map_lbl = tk.Label(telem_frame, text="Mapa: --- (X, Y) | Nv. 1 | Peso: 0/1 (0%)",
-                                     bg="#0F172A", fg="#38BDF8", font=("Segoe UI", 8, "bold"), anchor="w")
+            telem_map_lbl = tk.Label(telem_frame, text="Mapa: --- (X, Y)", bg="#0F172A",
+                                     fg="#38BDF8", font=("Segoe UI", 8, "bold"), anchor="w")
             telem_map_lbl.pack(fill="x")
 
-            telem_hp_sp_lbl = tk.Label(telem_frame, text="HP: 0/0 (0%) | SP: 0/0 (0%)",
-                                       bg="#0F172A", fg="#4ADE80", font=("Segoe UI", 8, "bold"), anchor="w")
-            telem_hp_sp_lbl.pack(fill="x")
+            telem_net_lbl = tk.Label(telem_frame, text="TCP: --- | Pkts OK: 0 | Porta: ---",
+                                     bg="#0F172A", fg="#94A3B8", font=("Segoe UI", 8), anchor="w")
+            telem_net_lbl.pack(fill="x")
 
             telem_cam_lbl = tk.Label(telem_frame, text="Câmera: 0° 50.0° d=399",
-                                     bg="#0F172A", fg="#94A3B8", font=("Segoe UI", 7), anchor="w")
+                                     bg="#0F172A", fg="#94A3B8", font=("Segoe UI", 8), anchor="w")
             telem_cam_lbl.pack(fill="x")
 
-            telem_status_lbl = tk.Label(telem_frame, text="[Farm: OFF] [Loot: OFF] [Patrol: OFF] [Sentar: OFF]",
-                                        bg="#0F172A", fg="#CBD5E1", font=("Segoe UI", 7, "bold"), anchor="w")
+            telem_status_lbl = tk.Label(telem_frame, text="[Farm: OFF] [Loot: OFF] [Patrol: OFF]",
+                                        bg="#0F172A", fg="#CBD5E1", font=("Segoe UI", 8, "bold"), anchor="w")
             telem_status_lbl.pack(fill="x")
 
             tk.Frame(main_box, bg="#334155", height=1).pack(fill="x", padx=4, pady=2)
 
-            # ── Contêiner do Notebook com 4 Abas ──
-            nb_frame = tk.Frame(main_box, bg="#0F172A")
-            nb_frame.pack(fill="both", expand=True, padx=4, pady=2)
-
-            nb_style = ttk.Style()
-            try:
-                nb_style.theme_use("default")
-            except Exception:
-                pass
-            nb_style.configure("Ragnalok.TNotebook", background="#0F172A", borderwidth=0)
-            nb_style.configure("Ragnalok.TNotebook.Tab", background="#1E293B", foreground="#94A3B8",
-                               padding=[8, 3], font=("Segoe UI", 8, "bold"))
-            nb_style.map("Ragnalok.TNotebook.Tab",
-                         background=[("selected", "#2563EB"), ("active", "#334155")],
-                         foreground=[("selected", "#FFFFFF"), ("active", "#F8FAFC")])
-
-            notebook = ttk.Notebook(nb_frame, style="Ragnalok.TNotebook")
-            notebook.pack(fill="both", expand=True)
-
-            tab_bot = tk.Frame(notebook, bg="#0F172A")
-            tab_filtros = tk.Frame(notebook, bg="#0F172A")
-            tab_npcs = tk.Frame(notebook, bg="#0F172A")
-            tab_historico = tk.Frame(notebook, bg="#0F172A")
-
-            notebook.add(tab_bot, text="Bot & Rotas")
-            notebook.add(tab_filtros, text="Filtros & Busca")
-            notebook.add(tab_npcs, text="NPCs & Portais")
-            notebook.add(tab_historico, text="Histórico")
-
-            # ══════════════════════════════════════════════════════════════
-            # ABA 1: BOT & ROTAS
-            # ══════════════════════════════════════════════════════════════
-            ctrl_frame = tk.Frame(tab_bot, bg="#0F172A")
-            ctrl_frame.pack(fill="x", padx=4, pady=2)
+            # Botões de controle primários
+            ctrl_frame = tk.Frame(main_box, bg="#0F172A")
+            ctrl_frame.pack(fill="x", padx=6, pady=2)
             self._hud_btns = {}
 
             def make_toggle_btn(parent, label_on, label_off, get_state, toggle_fn):
@@ -1810,7 +1527,7 @@ class Overlay:
 
             row_btn2 = tk.Frame(ctrl_frame, bg="#0F172A")
             row_btn2.pack(fill="x", pady=1)
-            btn_patrol, upd_patrol = make_toggle_btn(row_btn2, "Auto-Patrol [F6]: ON", "Auto-Patrol [F6]: OFF",
+            btn_patrol, upd_patrol = make_toggle_btn(row_btn2, "Auto-Patrol: ON", "Auto-Patrol: OFF",
                                                      lambda: self.auto_patrol,
                                                      lambda: setattr(self, "auto_patrol", not self.auto_patrol))
             btn_patrol.pack(side="left", fill="x", expand=True, padx=1)
@@ -1833,50 +1550,28 @@ class Overlay:
             btn_sit.pack(side="left", fill="x", expand=True, padx=1)
             self._hud_btns["sit"] = (btn_sit, upd_sit)
 
-            # ══════════════════════════════════════════════════════════════
-            # ABA 1: BOT & ROTAS (Toggles, Checkboxes, Rotas)
-            # ══════════════════════════════════════════════════════════════
-            tk.Frame(tab_bot, bg="#334155", height=1).pack(fill="x", padx=4, pady=2)
+            # Corpo colapsável com listas e filtros
+            body_frame = tk.Frame(main_box, bg="#0F172A")
+            body_frame.pack(fill="both", expand=True, padx=4, pady=2)
 
-            # Checkboxes Visuais
-            toggles_frame1 = tk.Frame(tab_bot, bg="#0F172A")
-            toggles_frame1.pack(fill="x", padx=4, pady=1)
+            # ── Toggles Visuais na Tela (Mobs, Drops, NPCs, Portais, Players) ──
+            toggles_frame = tk.Frame(body_frame, bg="#0F172A")
+            toggles_frame.pack(fill="x", pady=2)
             chk_opts = {"bg": "#0F172A", "fg": "#CBD5E1", "activebackground": "#0F172A",
                         "activeforeground": "#F8FAFC", "selectcolor": "#1E293B",
                         "font": ("Segoe UI", 7), "bd": 0, "highlightthickness": 0}
-            tk.Checkbutton(toggles_frame1, text="Mobs", variable=self._show_mobs, **chk_opts).pack(side="left", padx=2)
-            tk.Checkbutton(toggles_frame1, text="Drops", variable=self._show_drops, **chk_opts).pack(side="left", padx=2)
-            tk.Checkbutton(toggles_frame1, text="NPCs", variable=self._show_npcs, **chk_opts).pack(side="left", padx=2)
-            toggles_frame2 = tk.Frame(tab_bot, bg="#0F172A")
-            toggles_frame2.pack(fill="x", padx=4, pady=1)
-            tk.Checkbutton(toggles_frame2, text="Portais", variable=self._show_warps, **chk_opts).pack(side="left", padx=2)
-            tk.Checkbutton(toggles_frame2, text="Players", variable=self._show_players, **chk_opts).pack(side="left", padx=2)
-            tk.Checkbutton(toggles_frame2, text="Ignorar Lixo >60%", variable=self._ignore_tier3_always, **chk_opts).pack(side="left", padx=2)
+            tk.Checkbutton(toggles_frame, text="Mobs", variable=self._show_mobs, **chk_opts).pack(side="left", padx=2)
+            tk.Checkbutton(toggles_frame, text="Drops", variable=self._show_drops, **chk_opts).pack(side="left", padx=2)
+            tk.Checkbutton(toggles_frame, text="NPCs", variable=self._show_npcs, **chk_opts).pack(side="left", padx=2)
+            tk.Checkbutton(toggles_frame, text="Portais", variable=self._show_warps, **chk_opts).pack(side="left", padx=2)
+            tk.Checkbutton(toggles_frame, text="Players", variable=self._show_players, **chk_opts).pack(side="left", padx=2)
+            tk.Checkbutton(toggles_frame, text="Ignorar Lixo", variable=self._ignore_tier3_always, **chk_opts).pack(side="left", padx=2)
 
-            toggles_frame3 = tk.Frame(tab_bot, bg="#0F172A")
-            toggles_frame3.pack(fill="x", padx=4, pady=1)
-            tk.Checkbutton(toggles_frame3, text="Fugir <", variable=self.flee_enabled, **chk_opts).pack(side="left", padx=(2, 0))
-            tk.Entry(toggles_frame3, textvariable=self.flee_pct_var, width=3, **style_entry).pack(side="left", padx=1)
-            tk.Label(toggles_frame3, text="% HP", **style_lbl).pack(side="left", padx=(0, 4))
-            tk.Checkbutton(toggles_frame3, text="Auto-Ressuscitar", variable=self.auto_resurrect, **chk_opts).pack(side="left", padx=2)
+            tk.Frame(body_frame, bg="#334155", height=1).pack(fill="x", pady=2)
 
-            toggles_frame4 = tk.Frame(tab_bot, bg="#0F172A")
-            toggles_frame4.pack(fill="x", padx=4, pady=1)
-            tk.Checkbutton(toggles_frame4, text="Asa/Poção <20% HP:", variable=self.potion_key_enabled, **chk_opts).pack(side="left", padx=(2, 1))
-            f_keys = [f"F{i}" for i in range(1, 10)]
-            potion_menu = tk.OptionMenu(toggles_frame4, self.potion_key_var, *f_keys)
-            potion_menu.config(bg="#1E293B", fg="#E2E8F0", activebackground="#334155",
-                               activeforeground="#F8FAFC", relief="flat", bd=0,
-                               highlightthickness=1, highlightbackground="#334155",
-                               font=("Segoe UI", 7), cursor="hand2")
-            potion_menu["menu"].config(bg="#1E293B", fg="#E2E8F0", activebackground="#3B82F6")
-            potion_menu.pack(side="left", padx=2)
-
-            tk.Frame(tab_bot, bg="#334155", height=1).pack(fill="x", padx=4, pady=2)
-
-            # Controles de Rota e Destino
-            city_frame = tk.Frame(tab_bot, bg="#0F172A")
-            city_frame.pack(fill="x", padx=4, pady=1)
+            # ── Seletor "Ir para Cidade" ──
+            city_frame = tk.Frame(body_frame, bg="#0F172A")
+            city_frame.pack(fill="x", pady=2)
             tk.Label(city_frame, text="Cidade:", **style_lbl).pack(side="left", padx=(0, 2))
             cities = ["Prontera", "Izlude", "Geffen", "Payon", "Morocc", "Alberta",
                       "Aldebaran", "Rachel", "Veins", "Juno", "Comodo", "Einbroch", "Lighthalzen", "Hugel"]
@@ -1885,13 +1580,14 @@ class Overlay:
             city_menu.config(bg="#1E293B", fg="#E2E8F0", activebackground="#334155",
                              activeforeground="#F8FAFC", relief="flat", bd=0,
                              highlightthickness=1, highlightbackground="#334155",
-                             font=("Segoe UI", 7), cursor="hand2")
+                             font=("Segoe UI", 8), cursor="hand2")
             city_menu["menu"].config(bg="#1E293B", fg="#E2E8F0", activebackground="#3B82F6")
             city_menu.pack(side="left", fill="x", expand=True, padx=2)
 
             def _travel_to_city():
                 tgt = self._target_city_var.get().strip()
                 curr = getattr(getattr(self.feed, "world", None), "map", "") or ""
+                # Passo 1: Detectar Kafra na tela primeiro
                 kafra_found = None
                 snap = self.feed.current()
                 if snap:
@@ -1902,6 +1598,7 @@ class Overlay:
                             if c_id in (112, 113, 114, 115, 116, 117) or any(k in n for k in ("kafra", "funcionaria", "funcionária")):
                                 kafra_found = obj
                                 break
+
                 if kafra_found is not None:
                     self._click_debug(f"CIDADE: Kafra visível detectada na tela (#{kafra_found.catalog_id})!")
                     k_cell = self.feed.world.get_entity_cell("npc", kafra_found.key) if hasattr(self.feed, "world") else None
@@ -1920,205 +1617,216 @@ class Overlay:
                     if mode == "already_there":
                         self._click_debug(f"CIDADE: {plan.get('message')}")
                         return
-                    if mode == "walk":
-                        self._click_debug(f"CIDADE: {plan.get('message')}")
-                        self._city_travel_state = {
-                            "mode": "walk",
-                            "target_city": tgt,
-                            "route": plan.get("route", []),
-                            "step_idx": 0,
-                        }
-                        self.auto_patrol = True
+                    elif mode == "walk":
+                        self._click_debug(f"CIDADE: Rota a pé para {tgt} ({plan.get('distance_maps')} mapas)")
+                        self._city_travel_state = {"mode": "walk", "target_city": tgt, "route": plan.get("route", []), "step_idx": 0}
+                        if plan.get("route"):
+                            m_f, _, p_x, p_y = plan["route"][0]
+                            self.nav_goal = (m_f, p_x, p_y)
                     elif mode == "kafra":
-                        self._click_debug(f"CIDADE: {plan.get('message')}")
-                        kafra_coords = plan.get("kafra_coords", (150, 150))
+                        self._click_debug(f"CIDADE: Teleporte Kafra para {tgt} (Custo: {plan.get('cost')}z)")
+                        kx, ky = plan.get("kafra_pos", (150, 150))
                         self._city_travel_state = {
                             "mode": "kafra",
                             "target_city": tgt,
-                            "kafra_pos": kafra_coords,
+                            "kafra_pos": (kx, ky),
                             "state": "walking_to_kafra",
                             "last_action_time": 0.0,
                         }
-                        self.nav_goal = (curr, kafra_coords[0], kafra_coords[1])
+                        self.nav_goal = (curr, kx, ky)
                     else:
-                        self._click_debug(f"CIDADE: Não foi possível planejar rota para {tgt}")
+                        self._click_debug(f"CIDADE: {plan.get('message', 'Erro ao calcular rota')}")
+                game_hwnd = self.get_game_hwnd(None)
+                if game_hwnd:
+                    u32.SetForegroundWindow(game_hwnd)
+                for _, upd in self._hud_btns.values():
+                    try: upd()
+                    except Exception: pass
 
-            tk.Button(city_frame, text="Viajar (Cidade)", command=_travel_to_city,
-                      bg="#1D4ED8", fg="#E2E8F0", relief="flat", font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="right")
+            tk.Button(city_frame, text="Viajar", command=_travel_to_city,
+                      bg="#2563EB", fg="#F8FAFC", relief="flat",
+                      font=("Segoe UI", 8, "bold"), cursor="hand2").pack(side="left", padx=2)
 
-            # Ir Andando (X, Y)
-            walk_frame = tk.Frame(tab_bot, bg="#0F172A")
-            walk_frame.pack(fill="x", padx=4, pady=1)
-            tk.Label(walk_frame, text="Ir Andando:", **style_lbl).pack(side="left")
-            self._walk_x_var = tk.StringVar(value="150")
-            self._walk_y_var = tk.StringVar(value="150")
-            tk.Label(walk_frame, text="X:", **style_lbl).pack(side="left", padx=(4, 1))
-            tk.Entry(walk_frame, textvariable=self._walk_x_var, width=5, **style_entry).pack(side="left", padx=1)
-            tk.Label(walk_frame, text="Y:", **style_lbl).pack(side="left", padx=(4, 1))
-            tk.Entry(walk_frame, textvariable=self._walk_y_var, width=5, **style_entry).pack(side="left", padx=1)
+            # ── Ir para Coordenada ──
+            coord_frame = tk.Frame(body_frame, bg="#0F172A")
+            coord_frame.pack(fill="x", pady=2)
+            tk.Label(coord_frame, text="X:", **style_lbl).pack(side="left")
+            self._route_x_var = tk.StringVar()
+            tk.Entry(coord_frame, textvariable=self._route_x_var, width=5, **style_entry).pack(side="left", padx=2)
+            tk.Label(coord_frame, text="Y:", **style_lbl).pack(side="left")
+            self._route_y_var = tk.StringVar()
+            tk.Entry(coord_frame, textvariable=self._route_y_var, width=5, **style_entry).pack(side="left", padx=2)
 
-            def _walk_to_coords():
+            def _go_coord():
                 try:
-                    wx = int(self._walk_x_var.get().strip())
-                    wy = int(self._walk_y_var.get().strip())
-                    curr = getattr(getattr(self.feed, "world", None), "map", "") or ""
-                    self.nav_goal = (curr, wx, wy)
-                    self.patrol_target_route = (curr, wx, wy, None)
-                    self.active_nav_color = "#38BDF8"
-                    self.auto_patrol = True
-                    self._click_debug(f"ROTA: Andando até ({wx}, {wy}) no mapa {curr}")
-                except Exception as exc:
-                    self._click_debug(f"ROTA: Coordenadas inválidas: {exc}")
+                    rx = int(self._route_x_var.get())
+                    ry = int(self._route_y_var.get())
+                    curr_map = getattr(getattr(self.feed, "world", None), "map", "") or ""
+                    # nav_goal: rota direcionada independente do auto_patrol
+                    self.nav_goal = (curr_map.lower().removesuffix(".gat").removesuffix(".rsw"), rx, ry)
+                    game_hwnd = self.get_game_hwnd(None)
+                    if game_hwnd:
+                        u32.SetForegroundWindow(game_hwnd)
+                    self._click_debug(f"NAV: Ir Andando para ({rx},{ry}) em {curr_map}")
+                    for _, upd in self._hud_btns.values():
+                        try: upd()
+                        except Exception: pass
+                except ValueError:
+                    pass
 
-            tk.Button(walk_frame, text="Ir", command=_walk_to_coords,
-                      bg="#1E293B", fg="#38BDF8", relief="flat", font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="left", padx=3)
-
-            # Entrada /navi
-            navi_frame = tk.Frame(tab_bot, bg="#0F172A")
-            navi_frame.pack(fill="x", padx=4, pady=1)
-            tk.Label(navi_frame, text="/navi:", **style_lbl).pack(side="left", padx=(0, 2))
-            self._navi_entry_var = tk.StringVar(value="/navi morocc 150 150")
-            tk.Entry(navi_frame, textvariable=self._navi_entry_var, **style_entry).pack(side="left", fill="x", expand=True, padx=2)
-
-            def _run_navi_cmd():
-                raw = self._navi_entry_var.get().strip()
-                if not raw:
-                    return
-                parts = raw.replace("/", " ").replace(",", " ").split()
-                if parts and parts[0].lower() == "navi":
-                    parts = parts[1:]
-                if len(parts) >= 3:
-                    tgt_map = parts[0]
-                    try:
-                        tx = int(parts[1])
-                        ty = int(parts[2])
-                        curr = getattr(getattr(self.feed, "world", None), "map", "") or ""
-                        plan = get_city_travel_plan(curr, tgt_map)
-                        if plan.get("mode") == "walk":
-                            self._city_travel_state = {"mode": "walk", "target_city": tgt_map, "route": plan.get("route", []), "step_idx": 0}
-                        else:
-                            self.patrol_target_route = (tgt_map, tx, ty, None)
-                        self.nav_goal = (tgt_map, tx, ty)
-                        self.auto_patrol = True
-                        self._click_debug(f"NAVI: Navegando para {tgt_map} ({tx}, {ty})")
-                    except Exception as exc:
-                        self._click_debug(f"NAVI: Erro ao interpretar: {exc}")
-
-            tk.Button(navi_frame, text="Navegar", command=_run_navi_cmd,
-                      bg="#1E293B", fg="#C084FC", relief="flat", font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="right")
-
-            def _stop_all_routes():
-                self.nav_goal = None
+            def _stop_route():
                 self.patrol_target_route = None
+                self.nav_goal = None
                 self._city_travel_state = None
-                self.auto_patrol = False
-                self._click_debug("ROTA: Todas as rotas e A* cancelados.")
 
-            tk.Button(tab_bot, text="⛔ Parar Rota / A*", command=_stop_all_routes,
-                      bg="#DC2626", fg="#FFFFFF", activebackground="#B91C1C", relief="flat",
-                      font=("Segoe UI", 8, "bold"), cursor="hand2").pack(fill="x", padx=4, pady=3)
+            tk.Button(coord_frame, text="Ir Andando", command=_go_coord,
+                      bg="#1D4ED8", fg="#E2E8F0", relief="flat",
+                      font=("Segoe UI", 8, "bold"), cursor="hand2").pack(side="left", padx=2)
+            tk.Button(coord_frame, text="Parar", command=_stop_route,
+                      bg="#7F1D1D", fg="#E2E8F0", relief="flat",
+                      font=("Segoe UI", 8), cursor="hand2").pack(side="left")
 
-            # ══════════════════════════════════════════════════════════════
-            # ABA 2: FILTROS & BUSCA
-            # ══════════════════════════════════════════════════════════════
-            tk.Label(tab_filtros, text="Monstros Vivos Agora (Mais Próximos):", **style_lbl).pack(anchor="w", padx=4, pady=(2, 0))
-            alive_frame = tk.Frame(tab_filtros, bg="#0F172A")
-            alive_frame.pack(fill="x", padx=4, pady=1)
-            alive_scroll = tk.Scrollbar(alive_frame, orient="vertical", bg="#1E293B", troughcolor="#0F172A")
-            self._alive_mobs_listbox = tk.Listbox(alive_frame, bg="#1E293B", fg="#FFA294",
-                                                  selectbackground="#3B82F6", font=("Segoe UI", 7),
-                                                  relief="flat", bd=0, height=3, yscrollcommand=alive_scroll.set)
-            alive_scroll.config(command=self._alive_mobs_listbox.yview)
-            self._alive_mobs_listbox.pack(side="left", fill="x", expand=True)
-            alive_scroll.pack(side="right", fill="y")
-            self._alive_mobs_data = []
+            # ── Campo /navi ──
+            navi_frame = tk.Frame(body_frame, bg="#0F172A")
+            navi_frame.pack(fill="x", pady=1)
+            tk.Label(navi_frame, text="/navi:", **style_lbl).pack(side="left")
+            self._navi_entry_var = tk.StringVar()
+            navi_entry = tk.Entry(navi_frame, textvariable=self._navi_entry_var,
+                                  bg="#1E293B", fg="#A78BFA", insertbackground="#A78BFA",
+                                  font=("Segoe UI", 8), relief="flat", bd=2, width=20)
+            navi_entry.pack(side="left", fill="x", expand=True, padx=2)
 
-            alive_btn_frame = tk.Frame(tab_filtros, bg="#0F172A")
-            alive_btn_frame.pack(fill="x", padx=4, pady=1)
+            def _do_navi(*_a):
+                txt = self._navi_entry_var.get().strip()
+                curr_map = getattr(getattr(self.feed, "world", None), "map", "") or ""
+                result = parse_navi_command(txt, curr_map)
+                if result:
+                    self.nav_goal = (result["map"], result["x"], result["y"])
+                    self._click_debug(f"[Navi] Rota definida: {result['map']} ({result['x']},{result['y']})")
+                    game_hwnd = self.get_game_hwnd(None)
+                    if game_hwnd:
+                        u32.SetForegroundWindow(game_hwnd)
+                else:
+                    self._click_debug(f"[Navi] Formato inválido: '{txt}'")
 
-            def _refresh_filters_list():
-                if not hasattr(self, "_active_filters_listbox") or not self._active_filters_listbox:
-                    return
-                self._active_filters_listbox.delete(0, tk.END)
-                self._active_filters_data = []
-                for cid in sorted(self.mob_whitelist):
-                    name = self.names.get("mob", {}).get(cid, "")
-                    label = f"[MOB WL] #{cid} {name}".strip()
-                    self._active_filters_data.append(("mob_wl_id", cid))
-                    self._active_filters_listbox.insert(tk.END, label)
-                for name in sorted(self.mob_whitelist_names):
-                    label = f"[MOB WL] {name}"
-                    self._active_filters_data.append(("mob_wl_name", name))
-                    self._active_filters_listbox.insert(tk.END, label)
-                for cid in sorted(self.mob_blacklist):
-                    name = self.names.get("mob", {}).get(cid, "")
-                    label = f"[MOB BL] #{cid} {name}".strip()
-                    self._active_filters_data.append(("mob_bl_id", cid))
-                    self._active_filters_listbox.insert(tk.END, label)
-                for name in sorted(self.mob_blacklist_names):
-                    label = f"[MOB BL] {name}"
-                    self._active_filters_data.append(("mob_bl_name", name))
-                    self._active_filters_listbox.insert(tk.END, label)
-                for iid in sorted(self.drop_whitelist):
-                    name = self.names.get("drop", {}).get(iid, "")
-                    label = f"[DROP WL] #{iid} {name}".strip()
-                    self._active_filters_data.append(("drop_wl_id", iid))
-                    self._active_filters_listbox.insert(tk.END, label)
-                for name in sorted(self.drop_whitelist_names):
-                    label = f"[DROP WL] {name}"
-                    self._active_filters_data.append(("drop_wl_name", name))
-                    self._active_filters_listbox.insert(tk.END, label)
-                for iid in sorted(self.drop_blacklist):
-                    name = self.names.get("drop", {}).get(iid, "")
-                    label = f"[DROP BL] #{iid} {name}".strip()
-                    self._active_filters_data.append(("drop_bl_id", iid))
-                    self._active_filters_listbox.insert(tk.END, label)
-                for name in sorted(self.drop_blacklist_names):
-                    label = f"[DROP BL] {name}"
-                    self._active_filters_data.append(("drop_bl_name", name))
-                    self._active_filters_listbox.insert(tk.END, label)
+            navi_entry.bind("<Return>", _do_navi)
+            tk.Button(navi_frame, text="Ir (/navi)", command=_do_navi,
+                      bg="#4C1D95", fg="#E2E8F0", relief="flat",
+                      font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="right")
 
-            def _add_alive_mob_wl():
-                sel = self._alive_mobs_listbox.curselection()
-                if sel and sel[0] < len(self._alive_mobs_data):
-                    cid, mname = self._alive_mobs_data[sel[0]]
+            tk.Frame(body_frame, bg="#334155", height=1).pack(fill="x", pady=2)
+
+            # ── Seção de Monstros: Modo + Mini-Lista de Próximos / Abatidos ──
+            mob_hdr = tk.Frame(body_frame, bg="#0F172A")
+            mob_hdr.pack(fill="x")
+            tk.Label(mob_hdr, text="Monstros:", **style_lbl).pack(side="left")
+            self._mob_mode_var = tk.StringVar(value="Todos")
+            def _change_mob_mode(val):
+                self._mob_filter_mode = val
+            mob_menu = tk.OptionMenu(mob_hdr, self._mob_mode_var, "Todos", "Whitelist", "Blacklist", command=_change_mob_mode)
+            mob_menu.config(bg="#1E293B", fg="#E2E8F0", relief="flat", bd=0, highlightthickness=0,
+                            font=("Segoe UI", 7), cursor="hand2")
+            mob_menu["menu"].config(bg="#1E293B", fg="#E2E8F0")
+            mob_menu.pack(side="right")
+
+            mob_list_frame = tk.Frame(body_frame, bg="#0F172A")
+            mob_list_frame.pack(fill="x", pady=1)
+            self._mobs_listbox = tk.Listbox(mob_list_frame, bg="#1E293B", fg="#FFA294",
+                                            selectbackground="#3B82F6", font=("Segoe UI", 8),
+                                            relief="flat", bd=0, height=3)
+            self._mobs_listbox.pack(side="left", fill="x", expand=True)
+            self._mobs_list_data = []
+
+            def _add_mob_whitelist():
+                sel = self._mobs_listbox.curselection()
+                if sel and sel[0] < len(self._mobs_list_data):
+                    cid, m_name = self._mobs_list_data[sel[0]]
                     self.mob_whitelist.add(cid)
-                    if mname: self.mob_whitelist_names.add(mname.lower())
-                    self._save_filters_config()
-                    _refresh_filters_list()
-                    self._click_debug(f"FILTRO: Adicionado à Whitelist: {mname} (#{cid})")
+                    if m_name: self.mob_whitelist_names.add(m_name.lower())
+                    self._click_debug(f"MONSTRO: Adicionado à Whitelist: {m_name} (#{cid})")
 
-            def _add_alive_mob_bl():
-                sel = self._alive_mobs_listbox.curselection()
-                if sel and sel[0] < len(self._alive_mobs_data):
-                    cid, mname = self._alive_mobs_data[sel[0]]
+            def _add_mob_blacklist():
+                sel = self._mobs_listbox.curselection()
+                if sel and sel[0] < len(self._mobs_list_data):
+                    cid, m_name = self._mobs_list_data[sel[0]]
                     self.mob_blacklist.add(cid)
-                    if mname: self.mob_blacklist_names.add(mname.lower())
-                    self._save_filters_config()
-                    _refresh_filters_list()
-                    self._click_debug(f"FILTRO: Adicionado à Blacklist: {mname} (#{cid})")
+                    if m_name: self.mob_blacklist_names.add(m_name.lower())
+                    self._click_debug(f"MONSTRO: Adicionado à Blacklist: {m_name} (#{cid})")
 
-            tk.Button(alive_btn_frame, text="+ Whitelist Selecionado", command=_add_alive_mob_wl,
+            mob_btn_frame = tk.Frame(body_frame, bg="#0F172A")
+            mob_btn_frame.pack(fill="x", pady=1)
+            tk.Button(mob_btn_frame, text="+ Whitelist", command=_add_mob_whitelist,
                       bg="#1E293B", fg="#4ADE80", relief="flat", font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="left", padx=1)
-            tk.Button(alive_btn_frame, text="+ Blacklist Selecionado", command=_add_alive_mob_bl,
+            tk.Button(mob_btn_frame, text="+ Blacklist", command=_add_mob_blacklist,
                       bg="#1E293B", fg="#F87171", relief="flat", font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="left", padx=1)
+            tk.Button(mob_btn_frame, text="Limpar", command=lambda: (self.mob_whitelist.clear(), self.mob_blacklist.clear(), self.mob_whitelist_names.clear(), self.mob_blacklist_names.clear()),
+                      bg="#1E293B", fg="#94A3B8", relief="flat", font=("Segoe UI", 7), cursor="hand2").pack(side="left", padx=1)
 
-            tk.Frame(tab_filtros, bg="#334155", height=1).pack(fill="x", padx=4, pady=2)
+            # ── Seção de Drops: Modo + Mini-Lista de Vistos / Coletados ──
+            drop_hdr = tk.Frame(body_frame, bg="#0F172A")
+            drop_hdr.pack(fill="x", pady=(2, 0))
+            tk.Label(drop_hdr, text="Drops:", **style_lbl).pack(side="left")
+            self._drop_mode_var = tk.StringVar(value="Todos")
+            def _change_drop_mode(val):
+                self._drop_filter_mode = val
+            drop_menu = tk.OptionMenu(drop_hdr, self._drop_mode_var, "Todos", "Whitelist", "Blacklist", command=_change_drop_mode)
+            drop_menu.config(bg="#1E293B", fg="#E2E8F0", relief="flat", bd=0, highlightthickness=0,
+                             font=("Segoe UI", 7), cursor="hand2")
+            drop_menu["menu"].config(bg="#1E293B", fg="#E2E8F0")
+            drop_menu.pack(side="right")
 
-            # Busca Inteligente de Monstro / Carta / Item
-            search_hdr = tk.Frame(tab_filtros, bg="#0F172A")
-            search_hdr.pack(fill="x", padx=4, pady=(1, 0))
+            drop_list_frame = tk.Frame(body_frame, bg="#0F172A")
+            drop_list_frame.pack(fill="x", pady=1)
+            self._drops_listbox = tk.Listbox(drop_list_frame, bg="#1E293B", fg="#FBBF24",
+                                             selectbackground="#3B82F6", font=("Segoe UI", 8),
+                                             relief="flat", bd=0, height=3)
+            self._drops_listbox.pack(side="left", fill="x", expand=True)
+            self._drops_list_data = []
+
+            def _add_drop_whitelist():
+                sel = self._drops_listbox.curselection()
+                if sel and sel[0] < len(self._drops_list_data):
+                    item_id, d_name = self._drops_list_data[sel[0]]
+                    self.drop_whitelist.add(item_id)
+                    if d_name: self.drop_whitelist_names.add(d_name.lower())
+                    self._click_debug(f"DROP: Adicionado à Whitelist: {d_name} (#{item_id})")
+
+            def _add_drop_blacklist():
+                sel = self._drops_listbox.curselection()
+                if sel and sel[0] < len(self._drops_list_data):
+                    item_id, d_name = self._drops_list_data[sel[0]]
+                    self.drop_blacklist.add(item_id)
+                    if d_name: self.drop_blacklist_names.add(d_name.lower())
+                    self._click_debug(f"DROP: Adicionado à Blacklist: {d_name} (#{item_id})")
+
+            drop_btn_frame = tk.Frame(body_frame, bg="#0F172A")
+            drop_btn_frame.pack(fill="x", pady=1)
+            tk.Button(drop_btn_frame, text="+ Whitelist", command=_add_drop_whitelist,
+                      bg="#1E293B", fg="#4ADE80", relief="flat", font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="left", padx=1)
+            tk.Button(drop_btn_frame, text="+ Blacklist", command=_add_drop_blacklist,
+                      bg="#1E293B", fg="#F87171", relief="flat", font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="left", padx=1)
+            tk.Button(drop_btn_frame, text="Limpar", command=lambda: (self.drop_whitelist.clear(), self.drop_blacklist.clear(), self.drop_whitelist_names.clear(), self.drop_blacklist_names.clear()),
+                      bg="#1E293B", fg="#94A3B8", relief="flat", font=("Segoe UI", 7), cursor="hand2").pack(side="left", padx=1)
+
+            tk.Frame(body_frame, bg="#334155", height=1).pack(fill="x", pady=2)
+
+            # ── Seção de Busca Inteligente de Monstro / Drop / Item ──
+            search_hdr = tk.Frame(body_frame, bg="#0F172A")
+            search_hdr.pack(fill="x", pady=(2, 0))
             tk.Label(search_hdr, text="Buscar Monstro / Carta / Item:", **style_lbl).pack(side="left")
 
-            search_input_frame = tk.Frame(tab_filtros, bg="#0F172A")
-            search_input_frame.pack(fill="x", padx=4, pady=1)
+            search_input_frame = tk.Frame(body_frame, bg="#0F172A")
+            search_input_frame.pack(fill="x", pady=1)
             self._search_entry_var = tk.StringVar()
-            search_entry = tk.Entry(search_input_frame, textvariable=self._search_entry_var, **style_entry)
+            search_entry = tk.Entry(search_input_frame, textvariable=self._search_entry_var,
+                                    bg="#1E293B", fg="#F8FAFC", insertbackground="#F8FAFC",
+                                    font=("Segoe UI", 8), relief="flat", bd=2)
             search_entry.pack(side="left", fill="x", expand=True, padx=(0, 2))
 
             self._search_results_data = []
-            search_list_frame = tk.Frame(tab_filtros, bg="#0F172A")
-            search_list_frame.pack(fill="x", padx=4, pady=1)
+
+            search_list_frame = tk.Frame(body_frame, bg="#0F172A")
+            search_list_frame.pack(fill="x", pady=1)
             search_scroll = tk.Scrollbar(search_list_frame, orient="vertical", bg="#1E293B", troughcolor="#0F172A")
             self._search_listbox = tk.Listbox(search_list_frame, bg="#1E293B", fg="#38BDF8",
                                               selectbackground="#3B82F6", font=("Segoe UI", 7),
@@ -2160,8 +1868,6 @@ class Overlay:
                     self._mob_filter_mode = "Whitelist"
                     if hasattr(self, "_mob_mode_var"):
                         self._mob_mode_var.set("Whitelist")
-                    self._save_filters_config()
-                    _refresh_filters_list()
                     self._click_debug(f"BUSCA: Monstro focado na Whitelist: {mname} (#{jid})")
 
             def _go_to_searched_mob_map():
@@ -2188,140 +1894,28 @@ class Overlay:
                         self.patrol_target_route = (tgt_map, 150, 150, None)
                         self.auto_patrol = True
 
-            search_btn_frame = tk.Frame(tab_filtros, bg="#0F172A")
-            search_btn_frame.pack(fill="x", padx=4, pady=1)
+            search_btn_frame = tk.Frame(body_frame, bg="#0F172A")
+            search_btn_frame.pack(fill="x", pady=1)
             tk.Button(search_btn_frame, text="Focar Monstro", command=_focus_searched_mob,
                       bg="#1E293B", fg="#4ADE80", relief="flat", font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="left", padx=1)
             tk.Button(search_btn_frame, text="Ir para Mapa", command=_go_to_searched_mob_map,
                       bg="#1E293B", fg="#38BDF8", relief="flat", font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="left", padx=1)
 
-            tk.Frame(tab_filtros, bg="#334155", height=1).pack(fill="x", padx=4, pady=2)
+            tk.Frame(body_frame, bg="#334155", height=1).pack(fill="x", pady=2)
 
-            # Modos e Caixas Visíveis de Whitelist e Blacklist
-            mode_frame = tk.Frame(tab_filtros, bg="#0F172A")
-            mode_frame.pack(fill="x", padx=4, pady=1)
-
-            tk.Label(mode_frame, text="Mobs:", **style_lbl).pack(side="left")
-            self._mob_mode_var = tk.StringVar(value=self._mob_filter_mode)
-            def _on_mob_mode_change(val):
-                self._mob_filter_mode = val
-                self._save_filters_config()
-            mob_menu = tk.OptionMenu(mode_frame, self._mob_mode_var, "Todos", "Whitelist", "Blacklist", command=_on_mob_mode_change)
-            mob_menu.config(bg="#1E293B", fg="#E2E8F0", relief="flat", bd=0, font=("Segoe UI", 7), cursor="hand2")
-            mob_menu["menu"].config(bg="#1E293B", fg="#E2E8F0")
-            mob_menu.pack(side="left", padx=(1, 6))
-
-            tk.Label(mode_frame, text="Drops:", **style_lbl).pack(side="left")
-            self._drop_mode_var = tk.StringVar(value=self._drop_filter_mode)
-            def _on_drop_mode_change(val):
-                self._drop_filter_mode = val
-                self._save_filters_config()
-            drop_menu = tk.OptionMenu(mode_frame, self._drop_mode_var, "Todos", "Whitelist", "Blacklist", command=_on_drop_mode_change)
-            drop_menu.config(bg="#1E293B", fg="#E2E8F0", relief="flat", bd=0, font=("Segoe UI", 7), cursor="hand2")
-            drop_menu["menu"].config(bg="#1E293B", fg="#E2E8F0")
-            drop_menu.pack(side="left", padx=1)
-
-            # Entrada manual rápida
-            manual_frame = tk.Frame(tab_filtros, bg="#0F172A")
-            manual_frame.pack(fill="x", padx=4, pady=1)
-            self._filter_manual_var = tk.StringVar()
-            tk.Entry(manual_frame, textvariable=self._filter_manual_var, **style_entry).pack(side="left", fill="x", expand=True, padx=(0, 2))
-
-            def _add_manual_filter(target_kind):
-                txt = self._filter_manual_var.get().strip()
-                if not txt:
-                    return
-                is_id = txt.isdigit() or (txt.startswith("#") and txt[1:].isdigit())
-                val_id = int(txt.replace("#", "")) if is_id else None
-                val_name = txt.lower() if not is_id else None
-                if target_kind == "mob_wl":
-                    if val_id: self.mob_whitelist.add(val_id)
-                    if val_name: self.mob_whitelist_names.add(val_name)
-                elif target_kind == "mob_bl":
-                    if val_id: self.mob_blacklist.add(val_id)
-                    if val_name: self.mob_blacklist_names.add(val_name)
-                elif target_kind == "drop_wl":
-                    if val_id: self.drop_whitelist.add(val_id)
-                    if val_name: self.drop_whitelist_names.add(val_name)
-                elif target_kind == "drop_bl":
-                    if val_id: self.drop_blacklist.add(val_id)
-                    if val_name: self.drop_blacklist_names.add(val_name)
-                self._save_filters_config()
-                _refresh_filters_list()
-                self._filter_manual_var.set("")
-
-            tk.Button(manual_frame, text="+ Mob WL", command=lambda: _add_manual_filter("mob_wl"),
-                      bg="#1E293B", fg="#4ADE80", relief="flat", font=("Segoe UI", 7), cursor="hand2").pack(side="left", padx=1)
-            tk.Button(manual_frame, text="+ Mob BL", command=lambda: _add_manual_filter("mob_bl"),
-                      bg="#1E293B", fg="#F87171", relief="flat", font=("Segoe UI", 7), cursor="hand2").pack(side="left", padx=1)
-            tk.Button(manual_frame, text="+ Item WL", command=lambda: _add_manual_filter("drop_wl"),
-                      bg="#1E293B", fg="#38BDF8", relief="flat", font=("Segoe UI", 7), cursor="hand2").pack(side="left", padx=1)
-            tk.Button(manual_frame, text="+ Item BL", command=lambda: _add_manual_filter("drop_bl"),
-                      bg="#1E293B", fg="#FB923C", relief="flat", font=("Segoe UI", 7), cursor="hand2").pack(side="left", padx=1)
-
-            filt_list_frame = tk.Frame(tab_filtros, bg="#0F172A")
-            filt_list_frame.pack(fill="x", padx=4, pady=1)
-            filt_scroll = tk.Scrollbar(filt_list_frame, orient="vertical", bg="#1E293B", troughcolor="#0F172A")
-            self._active_filters_listbox = tk.Listbox(filt_list_frame, bg="#1E293B", fg="#E2E8F0",
-                                                      selectbackground="#3B82F6", font=("Segoe UI", 7),
-                                                      relief="flat", bd=0, height=3, yscrollcommand=filt_scroll.set)
-            filt_scroll.config(command=self._active_filters_listbox.yview)
-            self._active_filters_listbox.pack(side="left", fill="x", expand=True)
-            filt_scroll.pack(side="right", fill="y")
-            self._active_filters_data = []
-
-            def _remove_selected_filter():
-                sel = self._active_filters_listbox.curselection()
-                if sel and sel[0] < len(self._active_filters_data):
-                    f_kind, val = self._active_filters_data[sel[0]]
-                    if f_kind == "mob_wl_id": self.mob_whitelist.discard(val)
-                    elif f_kind == "mob_wl_name": self.mob_whitelist_names.discard(val)
-                    elif f_kind == "mob_bl_id": self.mob_blacklist.discard(val)
-                    elif f_kind == "mob_bl_name": self.mob_blacklist_names.discard(val)
-                    elif f_kind == "drop_wl_id": self.drop_whitelist.discard(val)
-                    elif f_kind == "drop_wl_name": self.drop_whitelist_names.discard(val)
-                    elif f_kind == "drop_bl_id": self.drop_blacklist.discard(val)
-                    elif f_kind == "drop_bl_name": self.drop_blacklist_names.discard(val)
-                    self._save_filters_config()
-                    _refresh_filters_list()
-
-            def _clear_all_filters():
-                self.mob_whitelist.clear()
-                self.mob_whitelist_names.clear()
-                self.mob_blacklist.clear()
-                self.mob_blacklist_names.clear()
-                self.drop_whitelist.clear()
-                self.drop_whitelist_names.clear()
-                self.drop_blacklist.clear()
-                self.drop_blacklist_names.clear()
-                self._save_filters_config()
-                _refresh_filters_list()
-
-            filt_btn_frame = tk.Frame(tab_filtros, bg="#0F172A")
-            filt_btn_frame.pack(fill="x", padx=4, pady=1)
-            tk.Button(filt_btn_frame, text="Remover Selecionado", command=_remove_selected_filter,
-                      bg="#1E293B", fg="#F87171", relief="flat", font=("Segoe UI", 7), cursor="hand2").pack(side="left", padx=1)
-            tk.Button(filt_btn_frame, text="Limpar Todos", command=_clear_all_filters,
-                      bg="#1E293B", fg="#94A3B8", relief="flat", font=("Segoe UI", 7), cursor="hand2").pack(side="left", padx=1)
-
-            _refresh_filters_list()
-
-            # ══════════════════════════════════════════════════════════════
-            # ABA 3: NPCS & PORTAIS
-            # ══════════════════════════════════════════════════════════════
-            tk.Label(tab_npcs, text="NPCs e Portais Próximos (<= 30 células):", **style_lbl).pack(anchor="w", padx=4, pady=(2, 0))
-            npc_frame = tk.Frame(tab_npcs, bg="#0F172A")
-            npc_frame.pack(fill="both", expand=True, padx=4, pady=1)
+            # ── Lista Estável de NPCs e Portais Próximos ──
+            tk.Label(body_frame, text="NPCs e Portais Próximos:", **style_lbl).pack(anchor="w")
+            npc_frame = tk.Frame(body_frame, bg="#0F172A")
+            npc_frame.pack(fill="both", expand=True, pady=1)
             npc_scroll = tk.Scrollbar(npc_frame, orient="vertical", bg="#1E293B", troughcolor="#0F172A")
             self._npc_listbox = tk.Listbox(
                 npc_frame, bg="#1E293B", fg="#C084FC",
                 selectbackground="#3B82F6", font=("Segoe UI", 8),
-                relief="flat", bd=0, height=10, yscrollcommand=npc_scroll.set,
+                relief="flat", bd=0, height=4, yscrollcommand=npc_scroll.set,
             )
             npc_scroll.config(command=self._npc_listbox.yview)
             self._npc_listbox.pack(side="left", fill="both", expand=True)
             npc_scroll.pack(side="right", fill="y")
-            self._npc_list_data = []
 
             def _go_interact():
                 sel = self._npc_listbox.curselection()
@@ -2331,186 +1925,125 @@ class Overlay:
                 if idx < len(self._npc_list_data):
                     _aid, _kind, tx, ty, _name = self._npc_list_data[idx]
                     curr_map = getattr(getattr(self.feed, "world", None), "map", "") or ""
+                    # Verifica distância atual
                     now_i = time.monotonic()
                     px_i, py_i = None, None
                     if hasattr(self.feed, "world") and self.feed.world.player:
                         px_i, py_i = self.feed.world.player.cell(now_i)
                     dist_i = math.hypot(px_i - tx, py_i - ty) if px_i is not None else 999.0
+                    gat_i = None
+                    if hasattr(self.feed, "terrain") and self.feed.terrain:
+                        try:
+                            gat_i = self.feed.terrain.for_map(curr_map)
+                        except Exception:
+                            pass
 
-                    # Se diálogo já estiver aberto, encerra navegação imediatamente
-                    dialog_obj = getattr(getattr(self.feed, "world", None), "npc_dialog", {})
-                    if dialog_obj.get("open"):
-                        self.nav_goal = None
-                        self.patrol_target_route = None
-                        self._npc_interact_state = None
-                        return
+                    # Checa caminho livre se gat disponível
+                    has_path = True
+                    if gat_i and px_i is not None:
+                        start_c = (int(round(px_i)), int(round(py_i)))
+                        has_path = bool(gat_i.find_path(start_c, (tx, ty), blocked_cells=self.temp_blocked_cells))
 
-                    # Nunca clica a > 3.8 células: navega via A* até <= 3.5 células
-                    if dist_i > 3.8:
-                        self.nav_goal = (curr_map, tx, ty)
-                        self.patrol_target_route = (curr_map, tx, ty, _aid)
-                        self.active_nav_color = "#A78BFA"
-                        self._npc_interact_state = {"clicks": 0, "last_click": 0.0}
-                        self.auto_patrol = True
-                        self._click_debug(f"INTERAGIR: Longe ({dist_i:.1f}c > 3.8c), aproximando via A* até {_name}...")
-                        return
-
-                    # Já está a <= 3.8 células: clica no centro do sprite (max 2 tentativas, cadence 950ms)
-                    st_i = getattr(self, "_npc_interact_state", None) or {"clicks": 0, "last_click": 0.0}
-                    if st_i["clicks"] >= 2:
-                        self._click_debug("INTERAGIR: Limite de 2 tentativas atingido sem abrir diálogo. Encerrando.")
-                        self.nav_goal = None
-                        self.patrol_target_route = None
-                        self._npc_interact_state = None
-                        return
-
-                    if now_i - st_i["last_click"] < 0.950:
-                        return
-
-                    snap_i = self.feed.current()
-                    if snap_i:
-                        gat_i = getattr(self.feed, "terrain", None).for_map(curr_map) if getattr(self.feed, "terrain", None) else None
-                        h_fn_i = getattr(gat_i, "get_elevation", None) if gat_i else None
-                        cam_i = getattr(self.feed, "_cam", None) or (px_i, py_i)
-                        proj_i = self.feed.camera.projector(snap_i.viewport, cam_i, h_fn_i)
-                        sprite_z_i = 5.5 if _kind == "npc" else 1.2
-                        u_i, v_i = proj_i(tx, ty, sprite_z_i)
-                        left_i, top_i, w_i, h_i = snap_i.viewport
-                        sx_i = left_i + int(u_i * w_i)
-                        sy_i = top_i + int(v_i * h_i)
-
-                        if self._is_point_in_game_ui(sx_i, sy_i):
-                            self._side_step_to_reveal((tx, ty), px_i, py_i)
+                    if dist_i <= 4.0 and has_path:
+                        # Próximo (<= 4.0 células): clica direto no centro do sprite sem forçar o personagem a colar
+                        snap_i = self.feed.current()
+                        if snap_i:
+                            vp_i = snap_i.viewport
+                            left_i, top_i, w_i, h_i = vp_i
+                            sprite_z_i = 5.5 if _kind == "npc" else 1.2
+                            h_fn_i = getattr(gat_i, "get_elevation", None) if gat_i else None
+                            cam_i = getattr(self.feed, "_cam", None) or (px_i, py_i)
+                            proj_i = self.feed.camera.projector(vp_i, cam_i, h_fn_i)
+                            u_i, v_i = proj_i(tx, ty, sprite_z_i)
+                            sx_i = left_i + int(u_i * w_i)
+                            sy_i = top_i + int(v_i * h_i)
+                            g_hwnd_i = self.get_game_hwnd(None)
+                            if g_hwnd_i:
+                                u32.SetForegroundWindow(g_hwnd_i)
+                            if self._is_point_in_hud(sx_i, sy_i):
+                                self._side_step_to_reveal((tx, ty), px_i, py_i)
+                            else:
+                                self._click_debug(f"INTERAGIR: clique direto a {dist_i:.1f} células em ({sx_i},{sy_i})")
+                                self._send_click(g_hwnd_i, sx_i, sy_i)
                             return
 
-                        g_hwnd_i = self.get_game_hwnd(None)
-                        if g_hwnd_i:
-                            u32.SetForegroundWindow(g_hwnd_i)
-
-                        st_i["clicks"] += 1
-                        st_i["last_click"] = now_i
-                        self._npc_interact_state = st_i
-                        self._click_debug(f"INTERAGIR: clique {st_i['clicks']}/2 em ({sx_i},{sy_i}) para {_name} a {dist_i:.1f}c")
-                        self._send_click(g_hwnd_i, sx_i, sy_i)
-
-                        if st_i["clicks"] >= 2:
-                            self.nav_goal = None
-                            self.patrol_target_route = None
-                            self._npc_interact_state = None
+                    # Longe (> 4.0 células): traça rota A* e caminha até ficar a <= 3.8 células via nav_goal
+                    self.nav_goal = (curr_map, tx, ty)
+                    self.patrol_target_route = (curr_map, tx, ty, _aid)
+                    self.active_nav_color = "#A78BFA"
+                    game_hwnd = self.get_game_hwnd(None)
+                    if game_hwnd:
+                        u32.SetForegroundWindow(game_hwnd)
+                    for _, upd in self._hud_btns.values():
+                        try: upd()
+                        except Exception: pass
 
             self._npc_listbox.bind("<Double-Button-1>", lambda _e: _go_interact())
-            tk.Button(tab_npcs, text="Ir / Interagir (ou Duplo-Clique)", command=_go_interact,
+            tk.Button(body_frame, text="Ir / Interagir (ou Duplo-Clique)", command=_go_interact,
                       bg="#1D4ED8", fg="#E2E8F0", relief="flat",
-                      font=("Segoe UI", 8, "bold"), cursor="hand2").pack(fill="x", padx=4, pady=3)
+                      font=("Segoe UI", 8, "bold"), cursor="hand2").pack(fill="x", pady=2)
 
-            # ══════════════════════════════════════════════════════════════
-            # ABA 4: HISTÓRICO
-            # ══════════════════════════════════════════════════════════════
-            self._kills_lbl = tk.Label(tab_historico, text=f"Kills Recentes (Total Abatidos: {self._session_kill_count}):", **style_lbl)
-            self._kills_lbl.pack(anchor="w", padx=4, pady=(2, 0))
-            kills_frame = tk.Frame(tab_historico, bg="#0F172A")
-            kills_frame.pack(fill="both", expand=True, padx=4, pady=1)
-            kills_scroll = tk.Scrollbar(kills_frame, orient="vertical", bg="#1E293B", troughcolor="#0F172A")
-            self._kills_listbox = tk.Listbox(kills_frame, bg="#1E293B", fg="#F87171",
-                                             selectbackground="#3B82F6", font=("Segoe UI", 7),
-                                             relief="flat", bd=0, height=5, yscrollcommand=kills_scroll.set)
-            kills_scroll.config(command=self._kills_listbox.yview)
-            self._kills_listbox.pack(side="left", fill="both", expand=True)
-            kills_scroll.pack(side="right", fill="y")
-
-            tk.Frame(tab_historico, bg="#334155", height=1).pack(fill="x", padx=4, pady=2)
-
-            tk.Label(tab_historico, text="Loot Coletado Recentemente (0x00A0):", **style_lbl).pack(anchor="w", padx=4, pady=(1, 0))
-            loot_frame = tk.Frame(tab_historico, bg="#0F172A")
-            loot_frame.pack(fill="both", expand=True, padx=4, pady=1)
-            loot_scroll = tk.Scrollbar(loot_frame, orient="vertical", bg="#1E293B", troughcolor="#0F172A")
-            self._picked_listbox = tk.Listbox(loot_frame, bg="#1E293B", fg="#4ADE80",
-                                              selectbackground="#3B82F6", font=("Segoe UI", 7),
-                                              relief="flat", bd=0, height=5, yscrollcommand=loot_scroll.set)
-            loot_scroll.config(command=self._picked_listbox.yview)
-            self._picked_listbox.pack(side="left", fill="both", expand=True)
-            loot_scroll.pack(side="right", fill="y")
-
-            loot_btn_frame = tk.Frame(tab_historico, bg="#0F172A")
-            loot_btn_frame.pack(fill="x", padx=4, pady=2)
+            # ── Itens Coletados Recentemente (0x00A0) ──
+            tk.Frame(body_frame, bg="#334155", height=1).pack(fill="x", pady=2)
+            tk.Label(body_frame, text="Itens Coletados Recentemente:", **style_lbl).pack(anchor="w")
+            picked_frame = tk.Frame(body_frame, bg="#0F172A")
+            picked_frame.pack(fill="x", pady=1)
+            self._picked_listbox = tk.Listbox(
+                picked_frame, bg="#1E293B", fg="#4ADE80",
+                selectbackground="#3B82F6", font=("Segoe UI", 8),
+                relief="flat", bd=0, height=3,
+            )
+            self._picked_listbox.pack(side="left", fill="x", expand=True)
 
             def _add_picked_whitelist():
                 sel = self._picked_listbox.curselection()
-                if sel and sel[0] < len(getattr(self, "_loot_history", [])):
-                    _h, iname, _cnt, iid = self._loot_history[sel[0]]
-                    if iid: self.drop_whitelist.add(iid)
+                if sel and sel[0] < len(getattr(self, "_picked_list_data", [])):
+                    item_id, iname = self._picked_list_data[sel[0]]
+                    if item_id: self.drop_whitelist.add(item_id)
                     if iname: self.drop_whitelist_names.add(iname.lower())
-                    self._save_filters_config()
-                    _refresh_filters_list()
-                    self._click_debug(f"COLETADO: Adicionado à Whitelist: {iname} (#{iid})")
+                    self._click_debug(f"COLETADO: Adicionado à Whitelist: {iname} (#{item_id})")
 
             def _add_picked_blacklist():
                 sel = self._picked_listbox.curselection()
-                if sel and sel[0] < len(getattr(self, "_loot_history", [])):
-                    _h, iname, _cnt, iid = self._loot_history[sel[0]]
-                    if iid: self.drop_blacklist.add(iid)
+                if sel and sel[0] < len(getattr(self, "_picked_list_data", [])):
+                    item_id, iname = self._picked_list_data[sel[0]]
+                    if item_id: self.drop_blacklist.add(item_id)
                     if iname: self.drop_blacklist_names.add(iname.lower())
-                    self._save_filters_config()
-                    _refresh_filters_list()
-                    self._click_debug(f"COLETADO: Adicionado à Blacklist: {iname} (#{iid})")
+                    self._click_debug(f"COLETADO: Adicionado à Blacklist: {iname} (#{item_id})")
 
-            def _clear_loot_history():
-                self._loot_history.clear()
-                self._picked_listbox.delete(0, tk.END)
-
-            tk.Button(loot_btn_frame, text="+ Whitelist Selecionado", command=_add_picked_whitelist,
+            picked_btn_frame = tk.Frame(body_frame, bg="#0F172A")
+            picked_btn_frame.pack(fill="x", pady=1)
+            tk.Button(picked_btn_frame, text="+ Whitelist", command=_add_picked_whitelist,
                       bg="#1E293B", fg="#4ADE80", relief="flat", font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="left", padx=1)
-            tk.Button(loot_btn_frame, text="+ Blacklist Selecionado", command=_add_picked_blacklist,
+            tk.Button(picked_btn_frame, text="+ Blacklist", command=_add_picked_blacklist,
                       bg="#1E293B", fg="#F87171", relief="flat", font=("Segoe UI", 7, "bold"), cursor="hand2").pack(side="left", padx=1)
-            tk.Button(loot_btn_frame, text="Limpar", command=_clear_loot_history,
-                      bg="#1E293B", fg="#94A3B8", relief="flat", font=("Segoe UI", 7), cursor="hand2").pack(side="left", padx=1)
+            self._picked_list_data = []
 
             self._hud_panel = panel
+            panel.protocol("WM_DELETE_WINDOW", lambda: panel.withdraw())
 
-            # ── Estilização Win32 (WS_EX_TOOLWINDOW) + keepontop loop ──
+            # ── Estilização Win32 (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE e GWLP_HWNDPARENT) ──
             def _apply_hud_win32_styles():
                 try:
                     panel.update_idletasks()
-                    panel.update()
                     hwnd = panel.winfo_id()
                     p_hwnd = ctypes.windll.user32.GetParent(hwnd)
-                    hud_hwnd = p_hwnd if p_hwnd else hwnd
-                    # Apenas WS_EX_TOOLWINDOW (0x80) — SEM WS_EX_NOACTIVATE (0x08000000) e SEM WS_EX_TRANSPARENT (0x00000020).
-                    # A janela principal Tk() do painel HUD deve permanecer visível e ativável para o InjectTouchInput funcionar.
-                    ex_style = ctypes.windll.user32.GetWindowLongW(hud_hwnd, -20)
-                    ex_style_new = (ex_style | 0x00000080) & ~0x08000000 & ~0x00000020
-                    ctypes.windll.user32.SetWindowLongW(hud_hwnd, -20, ex_style_new)
-                    # Visibilidade: garante HUD na tela e no topo
-                    panel.deiconify()
-                    panel.lift()
-                    panel.attributes("-topmost", True)
-                    panel.attributes("-alpha", 0.88)
-                    # Valida coordenadas: reposiciona se fora do monitor visível
-                    px, py = panel.winfo_x(), panel.winfo_y()
-                    sw = panel.winfo_screenwidth()
-                    sh = panel.winfo_screenheight()
-                    if px < 0 or px > sw - 50 or py < 0 or py > sh - 50:
-                        panel.geometry(f"+{max(0, sw - 420)}+50")
-                    # HWND_TOPMOST | SWP_NOMOVE | SWP_NOSIZE (sem SWP_NOACTIVATE)
-                    ctypes.windll.user32.SetWindowPos(hud_hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002)
+                    target_hwnd = p_hwnd if p_hwnd else hwnd
+                    # WS_EX_TOOLWINDOW (0x80) | WS_EX_NOACTIVATE (0x08000000)
+                    ex_style = ctypes.windll.user32.GetWindowLongW(target_hwnd, -20)
+                    ex_style |= (0x00000080 | 0x08000000)
+                    ctypes.windll.user32.SetWindowLongW(target_hwnd, -20, ex_style)
+
+                    game_hwnd = getattr(self, "_game_hwnd", None) or self.get_game_hwnd(None)
+                    if game_hwnd:
+                        try:
+                            ctypes.windll.user32.SetWindowLongPtrW(target_hwnd, -8, game_hwnd)
+                        except AttributeError:
+                            ctypes.windll.user32.SetWindowLongW(target_hwnd, -8, game_hwnd)
                 except Exception as exc:
                     print(f"[HUD] Win32 style hook: {exc}", flush=True)
 
-            def _hud_keepontop_loop():
-                try:
-                    if not panel.winfo_exists():
-                        return
-                    if getattr(self, "_hud_panel_visible", True):
-                        hwnd = panel.winfo_id()
-                        p_hwnd = ctypes.windll.user32.GetParent(hwnd)
-                        hud_hwnd = p_hwnd if p_hwnd else hwnd
-                        ctypes.windll.user32.SetWindowPos(hud_hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002)
-                except Exception:
-                    pass
-                panel.after(500, _hud_keepontop_loop)
-
             panel.after(100, _apply_hud_win32_styles)
-            panel.after(600, _hud_keepontop_loop)
 
             def _update_hud():
                 try:
@@ -2526,39 +2059,26 @@ class Overlay:
                         m_name = st.get("current_map") or st.get("map") or "---"
                         pos = st.get("pos")
                         pos_str = f"({int(pos[0])}, {int(pos[1])})" if pos else "---"
+                        port = st.get("port")
+                        port_str = f"Porta: {port}" if port else "Porta: ---"
+                        pkts = st.get("packets_ok", 0)
+                        tcp_b = st.get("tcp_bytes", 0)
+                        b_str = f"{tcp_b} B" if tcp_b < 1024 else (f"{tcp_b/1024:.1f} KB" if tcp_b < 1048576 else f"{tcp_b/1048576:.2f} MB")
                         b_lvl = st.get("base_level", 1)
                         w = st.get("weight", 0)
                         mw = st.get("max_weight", 1)
                         w_ratio = st.get("weight_ratio", 0.0)
-
-                        hud_st = getattr(self, "hud_status", None)
-                        if hud_st and (m_name == "---" or not pos):
-                            telem_map_lbl.config(text=f"Status: {hud_st}")
-                        else:
-                            telem_map_lbl.config(text=f"Mapa: {m_name} {pos_str} | Nv. {b_lvl} | Peso: {w}/{mw} ({w_ratio*100:.0f}%)")
-
-                        hp = st.get("hp", 0)
-                        max_hp = max(1, st.get("max_hp", 1))
-                        hp_pct = (hp / max_hp) * 100
-                        sp = st.get("sp", 0)
-                        max_sp = max(1, st.get("max_sp", 1))
-                        sp_pct = (sp / max_sp) * 100
-                        telem_hp_sp_lbl.config(text=f"HP: {hp}/{max_hp} ({hp_pct:.0f}%) | SP: {sp}/{max_sp} ({sp_pct:.0f}%)")
-
+                        telem_map_lbl.config(text=f"Mapa: {m_name} {pos_str} | Nv. {b_lvl} | Peso: {w}/{mw} ({w_ratio*100:.0f}%)")
+                        telem_net_lbl.config(text=f"TCP: {b_str} | Pkts OK: {pkts} | {port_str} | Mobs: {st.get('mobs', 0)} Drops: {st.get('drops', 0)}")
                         if hasattr(self.feed, "camera"):
                             cam = self.feed.camera
                             telem_cam_lbl.config(text=f"Câmera: Yaw {cam.yaw_deg:.0f}° | Pitch {cam.pitch_deg:.1f}° | Dist {cam.distance:.0f}")
-
-                        status_str = f"[Farm: {'ON' if self.auto_farm else 'OFF'}] [Loot: {'ON' if self.auto_loot else 'OFF'}] [Patrol: {'ON' if self.auto_patrol else 'OFF'}] [Sentar: {'ON' if getattr(self, 'auto_sit', False) else 'OFF'}]"
-                        if getattr(self, "last_farm_spot", None):
-                            status_str += f" | Spot: {self.last_farm_spot[0]}"
+                        status_str = f"[Farm: {'ON' if self.auto_farm else 'OFF'}] [Loot: {'ON' if self.auto_loot else 'OFF'}] [Patrol: {'ON' if self.auto_patrol else 'OFF'}]"
                         if getattr(self, "patrol_target_route", None):
                             status_str += f" | Rota: {self.patrol_target_route[0]}"
-                        if hud_st and (m_name == "---" or not pos):
-                            status_str = f"[{hud_st}]"
                         telem_status_lbl.config(text=status_str)
 
-                    # 1. Atualização Estável de NPCs e Portais (Aba 3)
+                    # 1. Atualização Estável de NPCs e Portais (preserva seleção e scroll)
                     if hasattr(self.feed, "world") and self._npc_listbox:
                         w = self.feed.world
                         now_t = time.monotonic()
@@ -2571,33 +2091,29 @@ class Overlay:
                         if px_h is not None:
                             for (ekind, aid_h), ent_h in ents_h:
                                 if ekind in ("npc", "warp"):
-                                    c_id = getattr(ent_h, "catalog_id", 0)
-                                    name_h = names_h.get(aid_h, "")
-                                    # Filtra NPCs invisíveis ou gatilhos de script sem nome real
-                                    if ekind == "npc" and c_id in (111, 139, 32767) and not name_h:
-                                        continue
                                     tx_h = int(ent_h.track.target[0])
                                     ty_h = int(ent_h.track.target[1])
-                                    dist_h = math.hypot(tx_h - px_h, ty_h - py_h)
-                                    if dist_h <= 30.0:
-                                        display_name = name_h if name_h else (f"NPC #{c_id}" if ekind == "npc" else f"Portal #{aid_h}")
-                                        new_npc_data.append((aid_h, ekind, tx_h, ty_h, display_name, dist_h))
-                            new_npc_data.sort(key=lambda x: x[5])
+                                    if max(abs(tx_h - int(px_h)), abs(ty_h - int(py_h))) <= 30:
+                                        name_h = names_h.get(aid_h, (f"NPC #{ent_h.catalog_id}" if ekind == "npc" else f"Portal #{aid_h}"))
+                                        new_npc_data.append((aid_h, ekind, tx_h, ty_h, name_h))
+                            new_npc_data.sort(key=lambda x: max(abs(x[2] - int(px_h)), abs(x[3] - int(py_h))))
 
-                        curr_sig = [(item[0], item[4]) for item in new_npc_data[:25]]
+                        # Compara assinaturas para evitar redraw constante
+                        curr_sig = [(item[0], item[4]) for item in new_npc_data[:20]]
                         if curr_sig != getattr(self, "_last_rendered_npc_items", None):
+                            # Salva seleção atual
                             cur_sel_aid = None
                             cur_sel = self._npc_listbox.curselection()
                             if cur_sel and cur_sel[0] < len(self._npc_list_data):
                                 cur_sel_aid = self._npc_list_data[cur_sel[0]][0]
                             y_scroll = self._npc_listbox.yview()
 
-                            self._npc_list_data = [(x[0], x[1], x[2], x[3], x[4]) for x in new_npc_data[:25]]
+                            self._npc_list_data = new_npc_data[:20]
                             self._npc_listbox.delete(0, tk.END)
                             restore_idx = None
-                            for i, (aid_h, ekind, tx_h, ty_h, name_h, dist_h) in enumerate(new_npc_data[:25]):
+                            for i, (aid_h, ekind, tx_h, ty_h, name_h) in enumerate(self._npc_list_data):
                                 icon = "⬟" if ekind == "warp" else "◈"
-                                self._npc_listbox.insert(tk.END, f"{icon} {name_h} ({tx_h},{ty_h}) {dist_h:.1f}c")
+                                self._npc_listbox.insert(tk.END, f"{icon} {name_h} ({tx_h},{ty_h})")
                                 if cur_sel_aid is not None and aid_h == cur_sel_aid:
                                     restore_idx = i
                             if restore_idx is not None:
@@ -2608,63 +2124,81 @@ class Overlay:
                                 pass
                             self._last_rendered_npc_items = curr_sig
 
-                    # 2. Atualização dos Monstros Vivos Agora (Aba 2 - estritamente vivos, ordenados por distância)
-                    if hasattr(self.feed, "world") and hasattr(self, "_alive_mobs_listbox") and self._alive_mobs_listbox:
+                    # 2. Atualização da mini-lista de Monstros (Vivos + Abatidos via 0x0080)
+                    if hasattr(self.feed, "world") and hasattr(self, "_mobs_listbox") and self._mobs_listbox:
                         w = self.feed.world
-                        now_m = time.monotonic()
-                        px_m, py_m = (None, None)
-                        alive_ents = []
+                        alive_mobs = []
                         with w.lock:
-                            if w.player: px_m, py_m = w.player.cell(now_m)
-                            for (ekind, gid_k), ent in w.entities.items():
+                            for (ekind, _), ent in w.entities.items():
                                 if ekind == "mob":
-                                    if getattr(ent, "hp", 1) is None or getattr(ent, "hp", 1) > 0:
-                                        alive_ents.append((gid_k, ent.catalog_id, ent.track.target))
-                        alive_formatted = []
-                        for gid_k, cid, target_pos in alive_ents:
-                            mname = self.names.get("mob", {}).get(cid, f"Mob #{cid}")
-                            dist_c = math.hypot(px_m - target_pos[0], py_m - target_pos[1]) if px_m is not None else 99.0
-                            alive_formatted.append((dist_c, cid, mname, f"⚔ {mname} (#{cid}) {dist_c:.1f}c"))
-                        alive_formatted.sort(key=lambda x: x[0])
-                        sig = [x[1] for x in alive_formatted[:15]]
-                        if sig != getattr(self, "_last_alive_mobs_sig", None):
-                            self._alive_mobs_data = [(x[1], x[2]) for x in alive_formatted[:15]]
-                            self._alive_mobs_listbox.delete(0, tk.END)
-                            for item in alive_formatted[:15]:
-                                self._alive_mobs_listbox.insert(tk.END, item[3])
-                            self._last_alive_mobs_sig = sig
+                                    cid = ent.catalog_id
+                                    mname = self.names.get("mob", {}).get(cid, f"Mob #{cid}")
+                                    alive_mobs.append((cid, mname, "[VIVO]"))
+                            dead_mobs = [
+                                (d.get("catalog_id", 0), self.names.get("mob", {}).get(d.get("catalog_id", 0), f"Mob #{d.get('catalog_id', 0)}"), "[MORTO]")
+                                for d in reversed(w.recent_dead_mobs) if d.get("catalog_id")
+                            ]
+                        combined_mobs = []
+                        seen_mobs = set()
+                        for cid, mname, status in (alive_mobs + dead_mobs):
+                            if cid not in seen_mobs:
+                                seen_mobs.add(cid)
+                                combined_mobs.append((cid, mname, f"{status} {mname} (#{cid})"))
+                        mob_sig = [m[0] for m in combined_mobs[:10]]
+                        if mob_sig != getattr(self, "_last_rendered_mobs_items", None):
+                            self._mobs_list_data = [(m[0], m[1]) for m in combined_mobs[:10]]
+                            self._mobs_listbox.delete(0, tk.END)
+                            for _, _, text in combined_mobs[:10]:
+                                self._mobs_listbox.insert(tk.END, text)
+                            self._last_rendered_mobs_items = mob_sig
 
-                    # 3. Atualização do Histórico de Kills (Aba 4 - via 0x0080 death e abates da sessão)
-                    if hasattr(self.feed, "world") and self.feed.world and hasattr(self, "_kills_listbox") and self._kills_listbox:
+                    # 3. Atualização da mini-lista de Drops (Vistos via 0x0ADD + Coletados via 0x00A0)
+                    if hasattr(self.feed, "world") and hasattr(self, "_drops_listbox") and self._drops_listbox:
                         w = self.feed.world
                         with w.lock:
-                            dead_list = list(w.recent_dead_mobs)
-                        new_kills = False
-                        for d in dead_list:
-                            d_time = d.get("time", 0.0)
-                            if d_time > self._kill_history_last_check:
-                                if d.get("by_me", False):
-                                    cid = d.get("catalog_id", 0)
-                                    mname = self.names.get("mob", {}).get(cid, f"Mob #{cid}")
-                                    k_ts = d.get("kill_ts", time.strftime("%H:%M:%S"))
-                                    self._kill_history.append((k_ts, mname, cid))
-                                    self._session_kill_count += 1
-                                    new_kills = True
-                        self._kill_history_last_check = time.monotonic()
-                        if new_kills:
-                            self._kills_lbl.config(text=f"Kills Recentes (Total Abatidos: {self._session_kill_count}):")
-                            self._kills_listbox.delete(0, tk.END)
-                            for k_ts, mname, cid in reversed(self._kill_history[-50:]):
-                                self._kills_listbox.insert(tk.END, f"[{k_ts}] ⚔ {mname} (#{cid})")
+                            floor_drops = [
+                                (ent.catalog_id, self.names.get("drop", {}).get(ent.catalog_id, f"Item #{ent.catalog_id}"), "[CHÃO]")
+                                for (ekind, _), ent in w.entities.items() if ekind == "drop"
+                            ]
+                            picked_drops = [
+                                (p.get("item_id", 0), self.names.get("drop", {}).get(p.get("item_id", 0), f"Item #{p.get('item_id', 0)}"), "[PEGO]")
+                                for p in reversed(getattr(w, "recent_picked_items", [])) if p.get("item_id")
+                            ]
+                        combined_drops = []
+                        seen_drops = set()
+                        for itm_id, dname, status in (floor_drops + picked_drops):
+                            if itm_id not in seen_drops:
+                                seen_drops.add(itm_id)
+                                combined_drops.append((itm_id, dname, f"{status} {dname} (#{itm_id})"))
+                        drop_sig = [d[0] for d in combined_drops[:10]]
+                        if drop_sig != getattr(self, "_last_rendered_drops_items", None):
+                            self._drops_list_data = [(d[0], d[1]) for d in combined_drops[:10]]
+                            self._drops_listbox.delete(0, tk.END)
+                            for _, _, text in combined_drops[:10]:
+                                self._drops_listbox.insert(tk.END, text)
+                            self._last_rendered_drops_items = drop_sig
 
-                    # 4. Atualização do Histórico de Loot Coletado (Aba 4 - via 0x00A0 + 0x00A1)
+                    # 4. Atualização da lista de Itens Coletados Recentemente (0x00A0)
                     if hasattr(self, "_picked_listbox") and self._picked_listbox:
-                        loot_sig = [(item[0], item[3]) for item in self._loot_history[:15]]
-                        if loot_sig != getattr(self, "_last_rendered_loot_sig", None):
+                        hist = getattr(self, "_picked_items_history", [])
+                        new_picked_data = []
+                        for entry in hist[:20]:
+                            hora_e, iname_e, cnt_e, is_fail = entry
+                            iid_e = 0
+                            for item_id_k, item_name_v in self.names.get("drop", {}).items():
+                                if item_name_v == iname_e:
+                                    iid_e = item_id_k
+                                    break
+                            new_picked_data.append((iid_e, iname_e))
+                        pick_sig = [(d[0], d[1]) for d in new_picked_data[:10]]
+                        if pick_sig != getattr(self, "_last_rendered_picked_items", None):
+                            self._picked_list_data = new_picked_data
                             self._picked_listbox.delete(0, tk.END)
-                            for hora, iname, cnt, iid in self._loot_history[:50]:
-                                self._picked_listbox.insert(tk.END, f"[{hora}] ✓ {iname} ×{cnt} (#{iid})")
-                            self._last_rendered_loot_sig = loot_sig
+                            for entry in hist[:20]:
+                                hora_e, iname_e, cnt_e, is_fail = entry
+                                prefix = "✗" if is_fail else "✓"
+                                self._picked_listbox.insert(tk.END, f"{prefix} [{hora_e}] {iname_e} ×{cnt_e}")
+                            self._last_rendered_picked_items = pick_sig
 
                 except Exception:
                     pass
@@ -2919,8 +2453,13 @@ class Overlay:
             # Oculta todos os itens do pool sem destruí-los (preserva IDs válidos do canvas)
             self.canvas_pool.hide_all()
             self.last = None
+            if self._hud_panel and self._hud_panel.winfo_exists() and self._hud_panel.winfo_viewable():
+                self._hud_panel.withdraw()
             self.window.after(40, self.refresh)
             return
+        else:
+            if self._hud_panel and self._hud_panel.winfo_exists() and self._hud_panel_visible and not self._hud_panel.winfo_viewable():
+                self._hud_panel.deiconify()
 
         # Hotkeys: ← = Auto-Loot toggle, → = Auto-Farm toggle, F6 = Auto-Patrol toggle, F9 = Teste imediato
         left_now   = bool(self.user32.GetAsyncKeyState(0x25) & 0x8000)
@@ -2932,7 +2471,12 @@ class Overlay:
 
         if f8_now and not self._last_f8:
             if self._hud_panel and self._hud_panel.winfo_exists():
-                self._set_hud_visible(not self._hud_panel_visible)
+                if self._hud_panel_visible:
+                    self._hud_panel.withdraw()
+                    self._hud_panel_visible = False
+                else:
+                    self._hud_panel.deiconify()
+                    self._hud_panel_visible = True
 
         if (left_now and not self.last_left) or (insert_now and not self.last_insert):
             self.auto_loot = not self.auto_loot
@@ -3051,15 +2595,11 @@ class Overlay:
                     inp_esc = INPUT(type=INPUT_KEYBOARD)
                     inp_esc.ki.wVk = 0x1B
                     inp_esc.ki.dwFlags = 0
-                    ctypes.set_last_error(0)
                     u32.SendInput(1, ctypes.byref(inp_esc), ctypes.sizeof(INPUT))
-                    ctypes.get_last_error()
                     inp_esc_up = INPUT(type=INPUT_KEYBOARD)
                     inp_esc_up.ki.wVk = 0x1B
                     inp_esc_up.ki.dwFlags = 0x0002  # KEYEVENTF_KEYUP
-                    ctypes.set_last_error(0)
                     u32.SendInput(1, ctypes.byref(inp_esc_up), ctypes.sizeof(INPUT))
-                    ctypes.get_last_error()
                     self.feed.world.npc_dialog["open"] = False
                     if hasattr(self.feed, "_cam") and self.feed._cam:
                         bx = int(round(self.feed._cam[0]))
@@ -3077,193 +2617,6 @@ class Overlay:
         hp = getattr(w, "player_hp", 0) if w else 0
         max_hp = getattr(w, "player_max_hp", 0) if w else 0
         hp_ratio = (hp / max_hp) if max_hp > 0 else 1.0
-
-        c_map = (getattr(w, "map", "") or "").lower().removesuffix(".gat").removesuffix(".rsw").strip()
-        is_city = c_map in KNOWN_CITIES or any(matches_city(c_map, city) for city in ("prontera", "izlude", "geffen", "payon", "morocc", "alberta", "aldebaran", "rachel", "veins", "yuno", "juno", "comodo", "einbroch", "lighthalzen", "hugel"))
-
-        is_dead = (
-            (player.get("is_dead", False) if isinstance(player, dict) else getattr(player, "is_dead", False))
-            or getattr(snapshot, "is_dead", False)
-            or (w and getattr(w, "player_is_dead", False))
-            or (hp <= 1 and max_hp > 1)
-        )
-
-        # 1. Salva spot de farm e modos ativos quando em mapa de caça e vivo
-        if self.auto_farm and not is_dead and not is_city and px is not None and py is not None:
-            self.last_farm_spot = (c_map, int(round(px)), int(round(py)))
-            self.last_farm_modes = {
-                "farm": self.auto_farm,
-                "loot": self.auto_loot,
-                "patrol": self.auto_patrol,
-            }
-
-        # 2. Verificação de Morte e Auto-Ressuscitar
-        if is_dead:
-            self.fleeing_mode = False
-            self.is_sitting = False
-            self._sit_retreat_state = None
-            if getattr(self, "auto_resurrect", None) and self.auto_resurrect.get():
-                # Pause Farm/Loot/Patrol
-                self.auto_farm = False
-                self.auto_loot = False
-                self.auto_patrol = False
-                for btn_key in ("farm", "loot", "patrol"):
-                    if hasattr(self, "_hud_btns") and btn_key in self._hud_btns:
-                        self._hud_btns[btn_key][1]()
-
-                self._respawn_state = "healing"
-
-                # Aguarda 900ms após death_ts
-                p_dts = player.get("death_ts", 0.0) if isinstance(player, dict) else getattr(player, "death_ts", 0.0)
-                death_ts = p_dts or getattr(snapshot, "death_ts", 0.0) or (w and getattr(w, "player_death_ts", 0.0)) or 0.0
-                if death_ts <= 0.0:
-                    if not getattr(self, "_death_start_ts", 0.0):
-                        self._death_start_ts = now
-                    death_elapsed = now - self._death_start_ts
-                else:
-                    death_elapsed = time.time() - death_ts
-
-                if death_elapsed >= 0.9:
-                    if now - getattr(self, "_last_resurrect_press", 0.0) >= 1.8:
-                        self._last_resurrect_press = now
-                        vp_obj = getattr(self.feed, "viewport", None)
-                        hwnd = getattr(vp_obj, "handle", None) if vp_obj else None
-                        game_hwnd = self.get_game_hwnd(hwnd)
-                        if snapshot.viewport:
-                            vx, vy, vw, vh = snapshot.viewport
-                            target_x = vx + int(vw * 0.50)
-                            toggle = getattr(self, "_death_click_toggle", 0)
-                            target_y = vy + int(vh * (0.665 if toggle % 2 == 1 else 0.638))
-                            self._death_click_toggle = toggle + 1
-                            self._click_debug(f"AUTO-RESSUSCITAR: Clicando retorno modal em ({target_x}, {target_y})")
-                            self.touch_postmsg(target_x, target_y, game_hwnd)
-            return
-        else:
-            self._death_start_ts = 0.0
-            self._death_click_toggle = 0
-
-        # 3. Gerenciamento pós-ressurreição na cidade (cura e retorno /navi)
-        if getattr(self, "_respawn_state", None) and not is_dead and px is not None and py is not None:
-            if self._respawn_state == "healing":
-                vp_obj = getattr(self.feed, "viewport", None)
-                hwnd = getattr(vp_obj, "handle", None) if vp_obj else None
-                game_hwnd = self.get_game_hwnd(hwnd)
-
-                if hp_ratio < 0.85:
-                    healer_obj = None
-                    healer_cell = None
-                    min_h_dist = 999.0
-                    for item in snapshot.objects:
-                        if item.kind == "npc":
-                            c_id = item.catalog_id
-                            name = getattr(self.feed.world, "entity_names", {}).get(c_id, "").lower() if hasattr(self.feed, "world") else ""
-                            if any(k in name for k in ("curandeira", "healer", "cura", "recuperadora", "curador", "enfermeira")):
-                                d = self._entity_distance("npc", item.key, px, py)
-                                if d <= 14.0 and d < min_h_dist:
-                                    min_h_dist = d
-                                    healer_obj = item
-                                    healer_cell = self.feed.world.get_entity_cell("npc", item.key) if hasattr(self.feed, "world") else None
-
-                    if healer_obj is not None:
-                        if getattr(self, "is_sitting", False):
-                            self._send_vk_key(0x2D, hwnd)
-                            self.is_sitting = False
-
-                        hx, hy = healer_cell if healer_cell else (px, py)
-                        if min_h_dist <= 2.5:
-                            if now - getattr(self, "_last_healer_click_ts", 0.0) >= 1.5:
-                                self._last_healer_click_ts = now
-                                left, top, width, height = snapshot.viewport
-                                sx = left + int(healer_obj.u * width)
-                                sy = top + int(healer_obj.v * height)
-                                self._click_debug(f"RESPAWN: Interagindo com curandeira em ({sx}, {sy})")
-                                self.touch_postmsg(sx, sy, game_hwnd)
-                        else:
-                            self.nav_goal = (c_map, int(hx), int(hy))
-                            self.patrol_target_route = (c_map, int(hx), int(hy), None)
-                            self.auto_patrol = True
-                            self._try_auto_patrol(snapshot, px, py)
-                        return
-                    else:
-                        if not getattr(self, "is_sitting", False):
-                            self._click_debug("RESPAWN: Sem curandeira <= 14 cels, sentando via VK_INSERT")
-                            self._send_vk_key(0x2D, hwnd)
-                            self.is_sitting = True
-                        return
-                else:
-                    if getattr(self, "is_sitting", False):
-                        self._click_debug("RESPAWN: HP >= 85%, levantando")
-                        self._send_vk_key(0x2D, hwnd)
-                        self.is_sitting = False
-
-                    if getattr(self, "last_farm_spot", None):
-                        tgt_m, tgt_x, tgt_y = self.last_farm_spot
-                        curr = getattr(getattr(self.feed, "world", None), "map", "") or ""
-                        curr = curr.lower().removesuffix(".gat").removesuffix(".rsw").strip()
-                        tgt_clean = str(tgt_m).lower().removesuffix(".gat").removesuffix(".rsw").strip()
-                        plan = get_city_travel_plan(curr, tgt_clean)
-                        if plan.get("mode") == "walk":
-                            self._city_travel_state = {
-                                "mode": "walk",
-                                "target_city": tgt_clean,
-                                "route": plan.get("route", []),
-                                "step_idx": 0,
-                            }
-                        else:
-                            self.patrol_target_route = (tgt_clean, int(tgt_x), int(tgt_y), None)
-                        self.nav_goal = (tgt_clean, int(tgt_x), int(tgt_y))
-                        self.auto_patrol = True
-                        self._respawn_state = "returning"
-                        self._click_debug(f"RESPAWN: Iniciando rota /navi para {tgt_clean} ({tgt_x}, {tgt_y})")
-                        return
-                    else:
-                        self._respawn_state = None
-
-            elif self._respawn_state == "returning":
-                if getattr(self, "last_farm_spot", None):
-                    tgt_m, tgt_x, tgt_y = self.last_farm_spot
-                    curr = getattr(getattr(self.feed, "world", None), "map", "") or ""
-                    curr = curr.lower().removesuffix(".gat").removesuffix(".rsw").strip()
-                    tgt_clean = str(tgt_m).lower().removesuffix(".gat").removesuffix(".rsw").strip()
-                    if curr == tgt_clean and math.hypot(px - tgt_x, py - tgt_y) <= 4.0:
-                        self._click_debug(f"RESPAWN: Chegamos ao spot de farm {tgt_clean} ({tgt_x}, {tgt_y})! Reativando modos.")
-                        self._respawn_state = None
-                        self.nav_goal = None
-                        self.patrol_target_route = None
-                        self._city_travel_state = None
-                        if getattr(self, "last_farm_modes", None):
-                            self.auto_farm = self.last_farm_modes.get("farm", True)
-                            self.auto_loot = self.last_farm_modes.get("loot", False)
-                            self.auto_patrol = self.last_farm_modes.get("patrol", False)
-                            for btn_key in ("farm", "loot", "patrol"):
-                                if hasattr(self, "_hud_btns") and btn_key in self._hud_btns:
-                                    self._hud_btns[btn_key][1]()
-
-        # Ativação/Desativação de Modo Fuga
-        try:
-            flee_pct = float(self.flee_pct_var.get()) / 100.0 if getattr(self, "flee_pct_var", None) else 0.35
-        except (ValueError, TypeError):
-            flee_pct = 0.35
-
-        flee_enabled = getattr(self, "flee_enabled", None) and self.flee_enabled.get()
-        if flee_enabled and 0 < hp_ratio < flee_pct:
-            self.fleeing_mode = True
-        elif hp_ratio >= 0.85:
-            self.fleeing_mode = False
-
-        # Disparo de Poção/Asa opcional se < 20% HP
-        if self.fleeing_mode and hp_ratio < 0.20 and getattr(self, "potion_key_enabled", None) and self.potion_key_enabled.get():
-            key_name = self.potion_key_var.get().upper().strip()
-            if key_name.startswith("F") and key_name[1:].isdigit():
-                f_idx = int(key_name[1:])
-                if 1 <= f_idx <= 9:
-                    vk = 0x70 + (f_idx - 1)  # VK_F1..VK_F9
-                    if now - getattr(self, "_last_potion_press", 0.0) >= 0.4:
-                        self._last_potion_press = now
-                        vp_obj = getattr(self.feed, "viewport", None)
-                        hwnd = getattr(vp_obj, "handle", None) if vp_obj else None
-                        self._send_vk_key(vk, hwnd)
-                        self._click_debug(f"FUGA: HP {hp_ratio:.0%} < 20% – acionando tecla {key_name}")
 
         # ── 1. GERENCIAMENTO DE JOGADOR SENTADO ──
         if getattr(self, "is_sitting", False) and px is not None:
@@ -3292,7 +2645,6 @@ class Overlay:
                 self._click_debug("AUTO-SENTAR: HP >= 85%, levantando")
                 self._send_vk_key(0x2D, hwnd)
                 self.is_sitting = False
-                self.fleeing_mode = False
                 self._last_player_hp = hp
                 if self._sit_retreat_state and self._sit_retreat_state.get("mode") == "city":
                     orig_map = self._sit_retreat_state.get("origin_map")
@@ -3369,14 +2721,13 @@ class Overlay:
                     self._try_auto_patrol(snapshot, px, py)
                     return
 
-        # ── 3. FUGA E AUTO-SENTAR (< flee_pct HP ou <30% HP) ──
-        flee_trigger = self.fleeing_mode or (getattr(self, "auto_sit", False) and hp_ratio < 0.30)
-        if flee_trigger and px is not None and w:
+        # ── 3. AUTO-SENTAR INTELIGENTE (<30% HP) ──
+        if getattr(self, "auto_sit", False) and px is not None and w and hp_ratio < 0.30:
             c_map = (getattr(w, "map", "") or "").lower().removesuffix(".gat")
             gat = self.feed.terrain.for_map(c_map) if getattr(self.feed, "terrain", None) else None
 
-            # Prioridade 1 — Recuo para Cidade Adjacente (Portal <= 32 células)
-            adj_city = get_adjacent_city_portal(c_map, (px, py), max_dist=32.0, gat=gat)
+            # Prioridade 1 — Recuo para Cidade Adjacente (1 Portal de Distância <= 28 células)
+            adj_city = get_adjacent_city_portal(c_map, (px, py), max_dist=28.0, gat=gat)
             if adj_city is not None:
                 city_name, (wx, wy) = adj_city
                 ret_portal = None
@@ -3392,40 +2743,29 @@ class Overlay:
                     "return_portal": ret_portal,
                     "stage": "walking_to_portal",
                 }
-                self._click_debug(f"FUGA: HP {hp_ratio:.0%} < {flee_pct:.0%} – Recuando para cidade adjacente {city_name} via portal ({wx},{wy})")
+                self._click_debug(f"AUTO-SENTAR: HP {hp_ratio:.0%} < 30% – Recuando para cidade adjacente {city_name} via portal ({wx},{wy})")
                 self.patrol_target_route = (c_map, wx, wy, "warp")
                 self.auto_patrol = True
                 self._reset_patrol(px, py)
                 self._try_auto_patrol(snapshot, px, py)
                 return
 
-            # Prioridade 2 — Fuja via find_safe_path contornando monstros vivos até > 9 células de hostis para sentar
-            danger_cells = []
+            # Prioridade 2 — Sentar Seguro no Próprio Mapa
+            # Verifica todos os monstros a <= 9 células (ignora passivos/imóveis)
             hostile_positions = []
             for item in snapshot.objects:
-                if item.kind == "mob":
-                    pos_m = self.feed.world.get_entity_cell("mob", item.key) if hasattr(self.feed, "world") else None
-                    if pos_m:
-                        danger_cells.append(pos_m)
-                        if self._is_mob_hostile(item.key, item.catalog_id):
+                if item.kind == "mob" and self._is_mob_hostile(item.key, item.catalog_id):
+                    d = self._entity_distance("mob", item.key, px, py)
+                    if d <= 9.0:
+                        pos_m = self.feed.world.get_entity_cell("mob", item.key)
+                        if pos_m:
                             hostile_positions.append(pos_m)
 
-            close_hostiles = [h for h in hostile_positions if math.hypot(px - h[0], py - h[1]) <= 9.0]
-            if not close_hostiles:
-                # Já está a > 9 células de todos os hostis: senta via VK_INSERT
-                self._click_debug("FUGA: Seguro (> 9 cels de hostis), sentando via VK_INSERT")
-                vp_obj = getattr(self.feed, "viewport", None)
-                hwnd = getattr(vp_obj, "handle", None) if vp_obj else None
-                self._send_vk_key(0x2D, hwnd)
-                self.is_sitting = True
-                self.patrol_target_route = None
-                self._sit_retreat_state = {"mode": "field", "stage": "sitting"}
-                return
-            else:
+            if hostile_positions:
                 safe_cell = None
                 if gat:
                     best_score = -999.0
-                    for r_dist in (12, 14, 16, 10, 18, 20):
+                    for r_dist in (11, 12, 10):
                         for ang_i in range(16):
                             ang = ang_i * (2 * math.pi / 16)
                             cand_x = int(round(px + r_dist * math.cos(ang)))
@@ -3435,21 +2775,14 @@ class Overlay:
                             if not gat.is_walkable(cand_x, cand_y):
                                 continue
                             min_h = min(math.hypot(cand_x - hx, cand_y - hy) for hx, hy in hostile_positions)
-                            if min_h > 9.0:
-                                path = gat.find_safe_path(
-                                    (int(round(px)), int(round(py))),
-                                    (cand_x, cand_y),
-                                    danger_cells=danger_cells,
-                                    danger_radius=4,
-                                    danger_penalty=85,
-                                    blocked_cells=self.temp_blocked_cells
-                                )
+                            if min_h >= 10.0:
+                                path = gat.find_path((int(round(px)), int(round(py))), (cand_x, cand_y))
                                 if path:
                                     if min_h > best_score:
                                         best_score = min_h
                                         safe_cell = (cand_x, cand_y)
                 if safe_cell:
-                    self._click_debug(f"FUGA: HP {hp_ratio:.0%}, {len(close_hostiles)} hostil(is) <= 9 cels – rota segura via find_safe_path para {safe_cell}")
+                    self._click_debug(f"AUTO-SENTAR: HP {hp_ratio:.0%} < 30%, {len(hostile_positions)} hostil(is) <= 9 cels – rota A* para célula segura {safe_cell}")
                     self.patrol_target_route = (c_map, safe_cell[0], safe_cell[1], None)
                     self.auto_patrol = True
                     self._reset_patrol(px, py)
@@ -3458,9 +2791,16 @@ class Overlay:
                 else:
                     self._try_auto_patrol(snapshot, px, py)
                     return
-
-        if self.fleeing_mode:
-            return
+            else:
+                # Nenhum hostil a <= 8 células: senta via VK_INSERT
+                self._click_debug("AUTO-SENTAR: Local seguro (nenhum hostil <= 8 cels), sentando via VK_INSERT")
+                vp_obj = getattr(self.feed, "viewport", None)
+                hwnd = getattr(vp_obj, "handle", None) if vp_obj else None
+                self._send_vk_key(0x2D, hwnd)
+                self.is_sitting = True
+                self.patrol_target_route = None
+                self._sit_retreat_state = {"mode": "field", "stage": "sitting"}
+                return
 
         farm_busy = False
         loot_busy = False
@@ -3583,7 +2923,7 @@ class Overlay:
             return
 
         # Pausa se qualquer botão físico do mouse estiver pressionado
-        if any((self.user32.GetAsyncKeyState(k) & 0x8000) != 0 for k in (2, 4)) or self._is_physical_mouse_down():
+        if any((self.user32.GetAsyncKeyState(k) & 0x8000) != 0 for k in (1, 2, 4)):
             self._click_debug("PATROL PAUSADO: botão físico do mouse pressionado")
             return
 
@@ -3626,7 +2966,7 @@ class Overlay:
                 u_ng, v_ng = project_flat(ng_x, ng_y, 0.0)
                 sx_ng = left + int(u_ng * width)
                 sy_ng = top + int(v_ng * height)
-                if not self._is_point_in_game_ui(sx_ng, sy_ng):
+                if not self._is_point_in_hud(sx_ng, sy_ng, margin=10):
                     self._send_click(target_hwnd, sx_ng, sy_ng)
             return
 
@@ -3680,140 +3020,46 @@ class Overlay:
                     self.nav_goal = None
                     return
 
-        # ── Suporte a Rotas de Destino / Interação com NPC e Portal ──
-        dialog = getattr(getattr(self.feed, "world", None), "npc_dialog", {})
-        if dialog.get("open"):
-            if getattr(self, "patrol_target_route", None) or getattr(self, "nav_goal", None) or getattr(self, "_npc_interact_state", None):
-                self.patrol_target_route = None
-                self.nav_goal = None
-                self._npc_interact_state = None
-                self._click_debug("NPC DIALOG ABERTO: Rota/navegação de interação concluída.")
-
+        # ── Suporte a Rotas de Destino: (map_name, x, y, target_npc_or_warp) ──
         if self.patrol_target_route:
             r_map, r_x, r_y, r_target = self.patrol_target_route
             norm_r_map = r_map.lower().removesuffix(".gat").removesuffix(".rsw")
             if curr_map == norm_r_map:
                 dist_to_route = math.hypot(px - r_x, py - r_y)
-                # Nunca clica a > 3.8 células: aproxima até ficar a <= 3.5 células
-                if r_target:
-                    if dist_to_route <= 3.5:
+                interact_dist = 3.8 if r_target else 2.5
+                if dist_to_route <= interact_dist:
+                    if r_target:
                         left, top, width, height = snapshot.viewport
-                        st_interact = getattr(self, "_npc_interact_state", None) or {"clicks": 0, "last_click": 0.0}
-                        # Máximo de 2 tentativas
-                        if st_interact["clicks"] >= 2:
-                            self._click_debug(f"INTERAGIR: 2 tentativas sem abrir diálogo para alvo {r_target}. Encerrando navegação.")
-                            self.patrol_target_route = None
-                            self.nav_goal = None
-                            self._npc_interact_state = None
-                            self._reset_patrol(px, py)
-                            return
-                        # Intervalo mínimo de 950ms
-                        if now - st_interact["last_click"] >= 0.950:
-                            for item in snapshot.objects:
-                                if item.kind in ("npc", "warp"):
-                                    if str(r_target) in item.key or item.catalog_id == r_target:
-                                        sprite_z = 5.5 if item.kind == "npc" else 1.2
-                                        u_tgt, v_tgt = project(r_x, r_y, sprite_z)
-                                        sx = left + int(u_tgt * width)
-                                        sy = top + int(v_tgt * height)
-                                        if self._is_point_in_game_ui(sx, sy):
-                                            self._side_step_to_reveal((r_x, r_y), px, py)
-                                            return
-                                        st_interact["clicks"] += 1
-                                        st_interact["last_click"] = now
-                                        self._npc_interact_state = st_interact
-                                        self._click_debug(f"INTERAGIR: clique {st_interact['clicks']}/2 no alvo {item.key} em ({sx},{sy})")
-                                        self._send_click(target_hwnd, sx, sy)
-                                        if st_interact["clicks"] >= 2:
-                                            self.patrol_target_route = None
-                                            self.nav_goal = None
-                                            self._npc_interact_state = None
-                                            self._reset_patrol(px, py)
+                        for item in snapshot.objects:
+                            if item.kind in ("npc", "warp"):
+                                if str(r_target) in item.key or item.catalog_id == r_target:
+                                    sprite_z = 5.5 if item.kind == "npc" else 1.2
+                                    u_tgt, v_tgt = project(r_x, r_y, sprite_z)
+                                    sx = left + int(u_tgt * width)
+                                    sy = top + int(v_tgt * height)
+                                    if self._is_point_in_hud(sx, sy):
+                                        self._side_step_to_reveal((r_x, r_y), px, py)
                                         return
-                else:
-                    if dist_to_route <= 2.5:
-                        self._click_debug(f"PATROL: Destino da rota alcançado ({r_x}, {r_y})")
-                        self.patrol_target_route = None
-                        self.nav_goal = None
-                        self._reset_patrol(px, py)
-
-        # ── Detecção de Falha de Movimento (>= 950ms sem mover e < 0.5 células) ──
-        if getattr(self, "last_patrol_click", None):
-            lp_time, lp_px, lp_py, lp_gx, lp_gy = self.last_patrol_click
-            p_obj = getattr(getattr(self.feed, "world", None), "player", None)
-            p_moving = getattr(p_obj, "is_moving", False) or getattr(self.feed.world, "_is_player_walking", lambda: False)()
-            dist_moved = math.hypot(px - lp_px, py - lp_py) if px is not None else 0.0
-            if p_moving or dist_moved >= 0.8:
-                self.last_patrol_click = None
-            elif (now - lp_time >= 0.950) and dist_moved < 0.5 and not p_moving:
-                self._click_debug(f"PATROL PRESO: não moveu após >=950ms em ({lp_gx},{lp_gy}). Bloqueando raio=2 por 25s e fazendo varredura radial.")
-                # 1. Bloqueia (lp_gx, lp_gy) e raio de 2 células por 25s
-                for ddx in range(-2, 3):
-                    for ddy in range(-2, 3):
-                        if math.hypot(ddx, ddy) <= 2.2:
-                            self.temp_blocked_cells[(lp_gx + ddx, lp_gy + ddy)] = now + 25.0
-
-                # 2. Varredura radial imediata ao redor do jogador (raio = 3, 4, 5, 6, 16 ângulos)
-                blocked_angle = math.atan2(lp_gy - py, lp_gx - px) if (px is not None and py is not None) else 0.0
-                escape_found = False
-                if gat and px is not None and py is not None:
-                    for r_esc in (3, 4, 5, 6):
-                        if escape_found:
-                            break
-                        for k in range(16):
-                            ang = k * (2.0 * math.pi / 16.0)
-                            diff_ang = abs((ang - blocked_angle + math.pi) % (2.0 * math.pi) - math.pi)
-                            if diff_ang < math.pi / 3.0:  # menos de 60 graus da direção bloqueada
-                                continue
-                            cx = int(round(px + r_esc * math.cos(ang)))
-                            cy = int(round(py + r_esc * math.sin(ang)))
-                            if (cx, cy) in self.temp_blocked_cells:
-                                continue
-                            if not (0 <= cx < gat.width and 0 <= cy < gat.height):
-                                continue
-                            if not gat.is_walkable(cx, cy):
-                                continue
-                            w_nb = sum(1 for ddx2 in (-1, 0, 1) for ddy2 in (-1, 0, 1)
-                                       if (ddx2 != 0 or ddy2 != 0) and gat.is_walkable(cx + ddx2, cy + ddy2))
-                            if w_nb < 6:
-                                continue
-                            u_esc, v_esc = project(cx, cy)
-                            if 0.15 <= u_esc <= 0.85 and 0.15 <= v_esc <= 0.85:
-                                esc_sx = left + int(u_esc * width)
-                                esc_sy = top + int(v_esc * height)
-                                if not self._is_point_in_game_ui(esc_sx, esc_sy):
-                                    self._click_debug(f"PATROL DESTRAVE: Varredura radial encontrou ({cx},{cy}) -> tela ({esc_sx},{esc_sy})")
-                                    self._send_click(target_hwnd, esc_sx, esc_sy)
-                                    self.last_patrol_click = (now, px, py, cx, cy)
-                                    self.last_patrol_click_time = now
-                                    self.last_patrol_click_player_pos = (px, py)
-                                    self.current_patrol_path = []
-                                    self.current_waypoint = None
-                                    escape_found = True
+                                    self._click_debug(f"PATROL: Interagindo com alvo na rota {item.key} em ({sx},{sy})")
+                                    self._send_click(target_hwnd, sx, sy)
+                                    self.patrol_target_route = None
+                                    self._reset_patrol(px, py)
                                     return
-                self.current_patrol_path = []
-                self.current_waypoint = None
-                self.last_patrol_click = None
-                return
+                    self._click_debug(f"PATROL: Destino da rota alcançado ({r_x}, {r_y})")
+                    self.patrol_target_route = None
+                    self._reset_patrol(px, py)
 
-        # ── Watchdog de Destravamento (>= 900ms sem mover e < 0.5 células) ──
+        # ── Watchdog de Destravamento (450ms sem pacote 0x0087) ──
         if getattr(self, "_walk_watchdog", None):
-            p_obj = getattr(getattr(self.feed, "world", None), "player", None)
-            p_moving = getattr(p_obj, "is_moving", False) or getattr(self.feed.world, "_is_player_walking", lambda: False)()
-            w_px = self._walk_watchdog.get("px", px)
-            w_py = self._walk_watchdog.get("py", py)
-            dist_from_start = math.hypot(px - w_px, py - w_py) if (px is not None and w_px is not None) else 0.0
             last_pkt = getattr(getattr(self.feed, "world", None), "last_player_move_pkt_time", 0.0)
-
-            # Nunca considera travamento se estiver em movimento ou já andou >= 0.8 células
-            if p_moving or dist_from_start >= 0.8 or last_pkt > self._walk_watchdog["time"]:
+            if last_pkt > self._walk_watchdog["time"]:
                 self._walk_watchdog = None
-            elif (now - self._walk_watchdog["time"] >= 0.900) and dist_from_start < 0.5 and not p_moving:
+            elif now - self._walk_watchdog["time"] >= 0.450:
                 w_sx = self._walk_watchdog["sx"]
                 w_sy = self._walk_watchdog["sy"]
                 stuck_cell = self._walk_watchdog["cell"]
                 self._walk_watchdog = None
-                self._click_debug(f"WATCHDOG: Travamento em {stuck_cell} (>=900ms sem mover). Desvio suave do cursor e bloqueio por 15s.")
+                self._click_debug(f"WATCHDOG: Travamento em {stuck_cell} (>450ms sem 0x0087). Desvio suave do cursor e bloqueio por 15s.")
                 self._natural_dodge_cursor(w_sx, w_sy)
                 self.temp_blocked_cells[stuck_cell] = now + 15.0
                 alt_cell = gat.find_safe_alternative_step(stuck_cell, (px, py), blocked_cells=self.temp_blocked_cells, min_neighbors=7)
@@ -3828,29 +3074,18 @@ class Overlay:
                             self._walk_watchdog = {"time": now, "cell": alt_cell, "sx": alt_sx, "sy": alt_sy, "px": px, "py": py}
                             return
                 self.current_patrol_path = []
-                self.patrol_path = []
                 self.current_waypoint = None
-                return
-
-        # Enquanto estiver em deslocamento ativo, aguarda sem disparar cliques no meio do trajeto
-        p_obj = getattr(getattr(self.feed, "world", None), "player", None)
-        p_moving = getattr(p_obj, "is_moving", False) or getattr(self.feed.world, "_is_player_walking", lambda: False)()
-        if p_moving and getattr(self, "last_patrol_click", None) and (px is not None and py is not None):
-            lp_time, _, _, lp_gx, lp_gy = self.last_patrol_click
-            last_ts = getattr(self, "last_patrol_click_time", lp_time)
-            if math.hypot(px - lp_gx, py - lp_gy) > 2.5 and (now - last_ts < 1.6):
                 return
 
         # ── Detecção de Travamento (> 1.8s parado mesmo após clicar) ──
         if self.last_patrol_click_time > 0 and (now - self.last_patrol_click_time > 1.8):
             if self.last_patrol_click_player_pos:
                 dist_moved = math.hypot(px - self.last_patrol_click_player_pos[0], py - self.last_patrol_click_player_pos[1])
-                if not p_moving and dist_moved < 0.5:
+                if dist_moved < 0.6:
                     stuck_cell = self.current_patrol_path[0] if self.current_patrol_path else cur_cell
                     self.temp_blocked_cells[stuck_cell] = now + 12.0
                     self._click_debug(f"PATROL: Travamento detectado (>1.8s sem mover)! Bloqueando {stuck_cell} e recalculando rota.")
                     self.current_patrol_path = []
-                    self.patrol_path = []
                     self.stuck_count += 1
                     if self.stuck_count >= 2:
                         self.current_waypoint = None
@@ -3886,7 +3121,6 @@ class Overlay:
                 self.current_patrol_path = gat.find_path(
                     (px, py), next_wp, blocked_cells=self.temp_blocked_cells
                 )
-                self.patrol_path = self.current_patrol_path
                 self.active_nav_path = list(self.current_patrol_path)
                 # Preserva a cor já definida por nav_goal se aplicável
                 if not hasattr(self, "active_nav_color") or self.active_nav_color != "#A78BFA":
@@ -3901,7 +3135,6 @@ class Overlay:
                 self.current_patrol_path = gat.find_path(
                     (px, py), self.current_waypoint, blocked_cells=self.temp_blocked_cells
                 )
-                self.patrol_path = self.current_patrol_path
                 if self.current_patrol_path:
                     self.active_nav_path = list(self.current_patrol_path)
                     self.active_nav_color = "#38BDF8"
@@ -3909,81 +3142,65 @@ class Overlay:
                 self.current_waypoint = None
                 return
 
-        # Descarta células da rota já ultrapassadas (<= 1.5 células ou direção oposta ao patrol_goal)
-        patrol_goal = self.current_waypoint
-        while len(self.current_patrol_path) > 1:
-            node = self.current_patrol_path[0]
-            d_node = math.hypot(px - node[0], py - node[1])
-            if d_node <= 1.5:
-                self.current_patrol_path.pop(0)
-            elif patrol_goal is not None and d_node <= 3.5:
-                vgx = patrol_goal[0] - px
-                vgy = patrol_goal[1] - py
-                vnx = node[0] - px
-                vny = node[1] - py
-                if (vnx * vgx + vny * vgy) < 0:
-                    self.current_patrol_path.pop(0)
-                else:
-                    break
-            else:
-                break
-        self.patrol_path = self.current_patrol_path
+        # Descarta células da rota já ultrapassadas
+        while self.current_patrol_path and math.hypot(px - self.current_patrol_path[0][0], py - self.current_patrol_path[0][1]) <= 1.2:
+            self.current_patrol_path.pop(0)
 
         if not self.current_patrol_path:
             self.current_waypoint = None
             return
 
-        # ── Projeta sub-passo a 6–9 células à frente na área segura da tela ──
+        # ── Projeta sub-passo a 8–11 células à frente na área segura da tela ──
         sub_step_cell = None
         sub_step_u = None
         sub_step_v = None
 
-        cand_list = []
-        for cand in self.current_patrol_path:
-            d_cand = math.hypot(cand[0] - px, cand[1] - py)
-            if 6.0 <= d_cand <= 9.0:
-                cand_list.append((d_cand, cand))
-
-        cand_list.sort(key=lambda x: x[0], reverse=True)
-        for _, cand in cand_list:
+        # Busca ponto a 11 até 4 células à frente dentro da área segura
+        max_idx = min(len(self.current_patrol_path) - 1, 11)
+        for idx in range(max_idx, 2, -1):
+            cand = self.current_patrol_path[idx]
+            # Zona de exclusão nos pés do jogador: nunca clica a < 2.2 células
+            if math.hypot(cand[0] - px, cand[1] - py) < 2.2:
+                continue
             u, v = project(*cand)
-            if 0.15 <= u <= 0.85 and 0.15 <= v <= 0.85:
+            if 0.22 <= u <= 0.78 and 0.24 <= v <= 0.76:
+                # Exige célula caminhável com pelo menos 7 das 8 vizinhas caminháveis (evita quinas e árvores)
                 gx_c, gy_c = cand
                 walkable_neighbors = (
                     gat.count_walkable_neighbors(gx_c, gy_c)
                     if hasattr(gat, "count_walkable_neighbors")
                     else sum(1 for ddx in (-1, 0, 1) for ddy in (-1, 0, 1) if (ddx != 0 or ddy != 0) and gat.is_walkable(gx_c + ddx, gy_c + ddy))
                 )
-                if walkable_neighbors >= 6:
-                    sub_step_cell = cand
-                    sub_step_u = u
-                    sub_step_v = v
-                    break
+                if walkable_neighbors < 7:
+                    continue
+                sub_step_cell = cand
+                sub_step_u = u
+                sub_step_v = v
+                break
 
-        # Fallback para ponto visível mais distante na área segura (mínimo 2.2 células)
+        # Fallback para ponto visível mais distante
         if sub_step_cell is None:
-            max_idx = min(len(self.current_patrol_path) - 1, 11)
-            for idx in range(max_idx, -1, -1):
-                cand = self.current_patrol_path[idx]
+            for cand in reversed(self.current_patrol_path[:max_idx + 1]):
                 if math.hypot(cand[0] - px, cand[1] - py) < 2.2:
                     continue
                 u, v = project(*cand)
-                if 0.15 <= u <= 0.85 and 0.15 <= v <= 0.85:
+                if 0.22 <= u <= 0.78 and 0.24 <= v <= 0.76:
                     gx_c, gy_c = cand
                     walkable_neighbors = (
                         gat.count_walkable_neighbors(gx_c, gy_c)
                         if hasattr(gat, "count_walkable_neighbors")
                         else sum(1 for ddx in (-1, 0, 1) for ddy in (-1, 0, 1) if (ddx != 0 or ddy != 0) and gat.is_walkable(gx_c + ddx, gy_c + ddy))
                     )
-                    if walkable_neighbors >= 5:
-                        sub_step_cell = cand
-                        sub_step_u = u
-                        sub_step_v = v
-                        break
+                    if walkable_neighbors < 7:
+                        continue
+                    sub_step_cell = cand
+                    sub_step_u = u
+                    sub_step_v = v
+                    break
 
         if sub_step_cell is None:
-            for cand in reversed(self.current_patrol_path):
-                if math.hypot(cand[0] - px, cand[1] - py) < 2.0:
+            for cand in self.current_patrol_path[min(len(self.current_patrol_path) - 1, 4):]:
+                if math.hypot(cand[0] - px, cand[1] - py) < 2.2:
                     continue
                 u, v = project(*cand)
                 if 0.05 <= u <= 0.95 and 0.05 <= v <= 0.95:
@@ -4035,15 +3252,9 @@ class Overlay:
                     self._click_debug(f"PATROL: célula {sub_step_cell} a < 55px de entidade na tela")
                     return
 
-        # Cadência de cliques: não clica no meio do caminho enquanto o jogador estiver andando
-        p_obj = getattr(getattr(self.feed, "world", None), "player", None)
-        p_moving = getattr(p_obj, "is_moving", False) or getattr(self.feed.world, "_is_player_walking", lambda: False)()
-        if p_moving and getattr(self, "last_patrol_click", None):
-            lp_time, _, _, lp_gx, lp_gy = self.last_patrol_click
-            last_ts = getattr(self, "last_patrol_click_time", lp_time)
-            if math.hypot(px - lp_gx, py - lp_gy) > 2.5 and (now - last_ts < 1.6):
-                return
-        if p_moving and (now - self.last_patrol_click_time < 0.85):
+        # Cadência de cliques: não clica em excesso se o jogador já estiver andando
+        is_walking = getattr(self.feed.world, "_is_player_walking", lambda: False)()
+        if is_walking and (now - self.last_patrol_click_time < 0.85):
             return
 
         dist_player = math.hypot(sub_step_cell[0] - px, sub_step_cell[1] - py)
@@ -4054,15 +3265,10 @@ class Overlay:
         sx = left + int(sub_step_u * width)
         sy = top + int(sub_step_v * height)
 
-        if self._is_point_in_game_ui(sx, sy):
-            self._click_debug(f"PATROL: clique descartado por cair dentro da UI do jogo ({sx},{sy})")
-            return
-
         self._click_debug(f"PATROL: Passo em ({sub_step_cell[0]}, {sub_step_cell[1]}) -> tela ({sx}, {sy})")
         self._send_click(target_hwnd, sx, sy)
         self.last_patrol_click_time = now
         self.last_patrol_click_player_pos = (px, py)
-        self.last_patrol_click = (now, px, py, sub_step_cell[0], sub_step_cell[1])
         self._walk_watchdog = {
             "time": now,
             "cell": sub_step_cell,
@@ -4128,37 +3334,8 @@ class Overlay:
                 pass
         return False
 
-    def _is_point_in_game_ui(self, sx: int, sy: int) -> bool:
-        """Verifica se (sx, sy) cai dentro das zonas nativas de UI do Ragnarok Online ou HUD."""
-        # Janela do Ragnalok HUD com margem de 12px
-        if self._is_point_in_hud(sx, sy, margin=12):
-            return True
-
-        # Obtém área cliente atual do jogo (vx, vy, vw, vh)
-        snap = self.feed.current() if hasattr(self, "feed") else None
-        if snap and hasattr(snap, "viewport") and snap.viewport:
-            vx, vy, vw, vh = snap.viewport
-        else:
-            vp = getattr(self, "current_viewport", None)
-            if vp and len(vp) == 4 and vp[2] > 0 and vp[3] > 0:
-                vx, vy, vw, vh = vp
-            else:
-                return False
-
-        # Caixa de Chat (canto inferior esquerdo)
-        if sx <= vx + 470 and sy >= vy + vh - 235:
-            return True
-        # Janela de Status/Skills (canto superior esquerdo)
-        if sx <= vx + 435 and sy <= vy + 165:
-            return True
-        # Minimapa e Lista de Quests (canto superior direito)
-        if sx >= vx + vw - 265 and sy <= vy + 340:
-            return True
-
-        return False
-
     def _side_step_to_reveal(self, target_cell, px, py):
-        """Desloca o personagem para uma célula segura na direção do alvo ou lateralmente para tirar o alvo de trás da UI/HUD."""
+        """Dá um passo lateral seguro de 2.2-3.2 células para deslocar a câmera quando o alvo está atrás do HUD."""
         if px is None or py is None or target_cell is None:
             return False
         curr_map = getattr(getattr(self.feed, "world", None), "map", None)
@@ -4187,56 +3364,34 @@ class Overlay:
         dy = ty - py
         dist = math.hypot(dx, dy)
         if dist < 0.1:
-            dir_x, dir_y = 1.0, 0.0
-            perp_dx, perp_dy = 0.0, 1.0
+            perp_dx, perp_dy = 1.0, 0.0
         else:
-            dir_x, dir_y = dx / dist, dy / dist
             perp_dx, perp_dy = -dy / dist, dx / dist
 
         candidates = []
-        # 1. Tenta passos na direção do alvo (mais próximos do centro da tela) para deslocar a câmera
-        for step_r in (2.0, 2.5, 3.0, 3.5):
-            sx_cell = int(round(px + dir_x * step_r))
-            sy_cell = int(round(py + dir_y * step_r))
-            if not (0 <= sx_cell < gat.width and 0 <= sy_cell < gat.height):
-                continue
-            if not gat.is_walkable(sx_cell, sy_cell):
-                continue
-            if (sx_cell, sy_cell) in getattr(self, "temp_blocked_cells", {}):
-                continue
-            u_cand, v_cand = project(sx_cell, sy_cell)
-            if 0.18 <= u_cand <= 0.82 and 0.18 <= v_cand <= 0.82:
-                screen_x = left + int(u_cand * width)
-                screen_y = top + int(v_cand * height)
-                if not self._is_point_in_game_ui(screen_x, screen_y):
-                    candidates.append((sx_cell, sy_cell, screen_x, screen_y))
-                    break
-
-        # 2. Tenta passos laterais perpendiculares
-        if not candidates:
-            for sign in (1, -1):
-                for step_r in (2.3, 2.8, 3.2):
-                    sx_cell = int(round(px + perp_dx * step_r * sign))
-                    sy_cell = int(round(py + perp_dy * step_r * sign))
-                    if not (0 <= sx_cell < gat.width and 0 <= sy_cell < gat.height):
-                        continue
-                    if not gat.is_walkable(sx_cell, sy_cell):
-                        continue
-                    if (sx_cell, sy_cell) in getattr(self, "temp_blocked_cells", {}):
-                        continue
-                    u_cand, v_cand = project(sx_cell, sy_cell)
-                    if 0.15 <= u_cand <= 0.85 and 0.15 <= v_cand <= 0.85:
-                        screen_x = left + int(u_cand * width)
-                        screen_y = top + int(v_cand * height)
-                        if not self._is_point_in_game_ui(screen_x, screen_y):
-                            candidates.append((sx_cell, sy_cell, screen_x, screen_y))
-                            break
-                if candidates:
-                    break
+        for sign in (1, -1):
+            for step_r in (2.3, 2.8, 3.2):
+                sx_cell = int(round(px + perp_dx * step_r * sign))
+                sy_cell = int(round(py + perp_dy * step_r * sign))
+                if not (0 <= sx_cell < gat.width and 0 <= sy_cell < gat.height):
+                    continue
+                if not gat.is_walkable(sx_cell, sy_cell):
+                    continue
+                if (sx_cell, sy_cell) in getattr(self, "temp_blocked_cells", {}):
+                    continue
+                u_cand, v_cand = project(sx_cell, sy_cell)
+                if 0.15 <= u_cand <= 0.85 and 0.15 <= v_cand <= 0.85:
+                    screen_x = left + int(u_cand * width)
+                    screen_y = top + int(v_cand * height)
+                    if not self._is_point_in_hud(screen_x, screen_y, margin=10):
+                        candidates.append((sx_cell, sy_cell, screen_x, screen_y))
+                        break
+            if candidates:
+                break
 
         if candidates:
             sx_c, sy_c, sc_x, sc_y = candidates[0]
-            self._click_debug(f"PASSO SEGURO: desviando char para ({sx_c},{sy_c}) para tirar alvo de trás da UI/Chat")
+            self._click_debug(f"PASSO LATERAL: desviando char para ({sx_c},{sy_c}) para tirar alvo de trás do HUD")
             self._send_click(target_hwnd, sc_x, sc_y)
             return True
         return False
@@ -4290,9 +3445,6 @@ class Overlay:
         if not is_fail:
             # Coleta bem-sucedida: zera contador de tentativas (item em pilha não bloqueia)
             self.locked_drop_clicks = 0
-            self._loot_history.insert(0, (hora, item_name, max(1, cnt), item_id))
-            if len(self._loot_history) > 50:
-                self._loot_history.pop()
         if is_fail:
             target_gid = self.locked_drop_gid
             self._click_debug(f"LOOT FALHOU (0x00A0 fail={fail}): item #{item_id} (gid={target_gid}) bloqueado por 8s")
@@ -4321,7 +3473,7 @@ class Overlay:
             return
 
         # Pausa se qualquer botão físico do mouse estiver pressionado (1=L, 2=R, 4=M)
-        if any((self.user32.GetAsyncKeyState(k) & 0x8000) != 0 for k in (2, 4)) or self._is_physical_mouse_down():
+        if any((self.user32.GetAsyncKeyState(k) & 0x8000) != 0 for k in (1, 2, 4)):
             self._click_debug("LOOT BLOQUEADO: botão físico do mouse pressionado")
             return
 
@@ -4440,109 +3592,132 @@ class Overlay:
                 self._loot_retry_state[best_gid] = {"attempt": 0, "last_time": 0.0}
                 target_item = best_item
 
-        # 3. Executa aproximação A* ou coleta no drop travado
+        # 3. Executa aproximação A* ou coleta em 3 etapas no drop travado
         if target_item is not None and self.locked_drop_gid is not None:
             drop_cell = self.feed.world.get_entity_cell("drop", target_item.key)
             dist_drop = self._entity_distance("drop", target_item.key, px, py) if (px is not None and py is not None) else 0.0
 
-            # Projeta sprite do drop com sprite_z = 0.5
-            if drop_cell:
-                u_drop, v_drop, sx_drop, sy_drop = self._project_ground_cell(snapshot, drop_cell[0], drop_cell[1], sprite_z=0.5)
-            else:
-                u_drop, v_drop = target_item.u, target_item.v
-                sx_drop = left + int(u_drop * width)
-                sy_drop = top  + int(v_drop * height)
-
-            is_in_hud = self._is_point_in_game_ui(sx_drop, sy_drop)
-            is_safe_screen = (0.05 <= u_drop <= 0.95 and 0.05 <= v_drop <= 0.95) and not is_in_hud
-
-            p_obj = getattr(getattr(self.feed, "world", None), "player", None)
-            p_moving = getattr(p_obj, "is_moving", False) or getattr(self.feed.world, "_is_player_walking", lambda: False)()
-            if player and player.duration and now < player.started + min(player.duration, 2.5):
-                p_moving = True
-
-            # Se já clicou no drop e o personagem está andando até ele, aguarda sem repetir cliques
-            if getattr(self, "locked_drop_clicks", 0) >= 1 and p_moving:
-                self._click_debug(f"LOOT pausado: personagem andando até drop:{self.locked_drop_gid}")
-                return
-
-            # Se drop a <= 11.5 e na área segura da tela: clica diretamente no item (sprite_z = 0.5, intervalo de 850ms)
-            if dist_drop <= 11.5 and is_safe_screen:
-                retry = self._loot_retry_state.get(self.locked_drop_gid, {"attempt": 0, "last_time": 0.0})
-                attempt = retry["attempt"]
-
-                if attempt >= 4:
-                    self._click_debug(f"LOOT: falha após {attempt} tentativas em drop #{self.locked_drop_gid}, bloqueando por 10s")
-                    self._drop_blacklist[self.locked_drop_gid] = now + 10.0
-                    if hasattr(self.feed.world, "mark_drop_locked"):
-                        self.feed.world.mark_drop_locked(self.locked_drop_gid)
-                    self._loot_retry_state.pop(self.locked_drop_gid, None)
-                    self._reset_patrol(px, py)
-                    self.locked_drop_gid = None
-                    self.locked_drop_clicks = 0
-                    self.locked_drop_first_time = 0.0
-                    return
-
-                # Intervalo de 850ms entre tentativas
-                if now - getattr(self, "last_loot_click", 0.0) < 0.850:
-                    return
-
-                self._click_debug(f"LOOT clique direto (z=0.5) tentativa {attempt+1} em ({sx_drop},{sy_drop}) drop:{self.locked_drop_gid}")
-                self._send_click(target_hwnd, sx_drop, sy_drop)
-                self.last_loot_click = now
-                self.locked_drop_clicks += 1
-                self._loot_retry_state[self.locked_drop_gid] = {"attempt": attempt + 1, "last_time": now}
-                return
+            sx = left + int(target_item.u * width)
+            sy = top  + int(target_item.v * height)
+            is_near_edge = (target_item.u < 0.15 or target_item.u > 0.85 or target_item.v < 0.15 or target_item.v > 0.85)
+            is_in_hud = self._is_point_in_hud(sx, sy, margin=10)
 
             # Pausa se o personagem estiver andando em deslocamento ativo
-            if p_moving:
+            if player and player.duration and now < player.started + min(player.duration, 2.5):
                 self._click_debug(f"LOOT pausado: personagem andando (drop:{self.locked_drop_gid})")
                 return
 
-            # A* para aproximação: se estiver a > 11.5 células, ou na borda, ou atrás do HUD/UI
-            if dist_drop <= 3.5 and is_in_hud and drop_cell:
-                if self._side_step_to_reveal(drop_cell, px, py):
-                    return
+            # A* para aproximação: se estiver a > 3.5 células, ou na borda, ou atrás do HUD
+            if dist_drop > 3.5 or is_near_edge or is_in_hud:
+                # Se estiver a <= 3.5 células e apenas atrás do HUD, tenta dar passo lateral para desobstruir visão
+                if dist_drop <= 3.5 and is_in_hud and drop_cell:
+                    if self._side_step_to_reveal(drop_cell, px, py):
+                        return
 
-            # Caminhada via A* em direção ao drop
-            if gat and px is not None and drop_cell:
-                start_cell = (int(round(px)), int(round(py)))
-                path = gat.find_path(start_cell, (int(round(drop_cell[0])), int(round(drop_cell[1]))), blocked_cells=self.temp_blocked_cells)
-                if not path:
-                    self._drop_blacklist[self.locked_drop_gid] = now + 8.0
-                    self._loot_retry_state.pop(self.locked_drop_gid, None)
-                    self._reset_patrol(px, py)
-                    self.locked_drop_gid = None
-                    return
+                    # Caminhada via A* em direção ao drop
+                if gat and px is not None and drop_cell:
+                    start_cell = (int(round(px)), int(round(py)))
+                    path = gat.find_path(start_cell, (int(round(drop_cell[0])), int(round(drop_cell[1]))), blocked_cells=self.temp_blocked_cells)
+                    if not path:
+                        self._drop_blacklist[self.locked_drop_gid] = now + 8.0
+                        self._loot_retry_state.pop(self.locked_drop_gid, None)
+                        self._reset_patrol(px, py)
+                        self.locked_drop_gid = None
+                        return
 
-                self.active_nav_path = list(path)
-                self.active_nav_color = "#FBBF24"  # Dourado = Auto-Loot
+                    self.active_nav_path = list(path)
+                    self.active_nav_color = "#FBBF24"  # Dourado = Auto-Loot
 
-                # Seleciona sub-passo a 8–10 células de distância
-                cam_pos = getattr(self.feed, "_cam", None) or (px, py)
-                height_fn = getattr(gat, "get_elevation", gat.height_at)
-                project = self.feed.camera.projector(snapshot.viewport, cam_pos, height_fn)
+                    # Seleciona sub-passo a 8–10 células de distância
+                    cam_pos = getattr(self.feed, "_cam", None) or (px, py)
+                    height_fn = getattr(gat, "get_elevation", gat.height_at)
+                    project = self.feed.camera.projector(snapshot.viewport, cam_pos, height_fn)
 
-                step_cand = None
-                max_idx = min(len(path) - 1, 10)
-                for idx in range(max_idx, 1, -1):
-                    cand = path[idx]
-                    if math.hypot(cand[0] - px, cand[1] - py) < 2.2:
-                        continue
-                    u_c, v_c = project(*cand)
-                    if 0.15 <= u_c <= 0.85 and 0.15 <= v_c <= 0.85:
-                        cand_sx = left + int(u_c * width)
-                        cand_sy = top + int(v_c * height)
-                        if not self._is_point_in_game_ui(cand_sx, cand_sy):
-                            step_cand = (cand, cand_sx, cand_sy)
-                            break
+                    step_cand = None
+                    max_idx = min(len(path) - 1, 10)
+                    for idx in range(max_idx, 1, -1):
+                        cand = path[idx]
+                        if math.hypot(cand[0] - px, cand[1] - py) < 2.2:
+                            continue
+                        u_c, v_c = project(*cand)
+                        if 0.15 <= u_c <= 0.85 and 0.15 <= v_c <= 0.85:
+                            cand_sx = left + int(u_c * width)
+                            cand_sy = top + int(v_c * height)
+                            if not self._is_point_in_hud(cand_sx, cand_sy, margin=10):
+                                step_cand = (cand, cand_sx, cand_sy)
+                                break
 
-                if step_cand:
-                    c_cell, c_sx, c_sy = step_cand
-                    self._click_debug(f"LOOT A*: andando para drop #{self.locked_drop_gid} via ({c_cell[0]},{c_cell[1]})")
-                    self._send_click(target_hwnd, c_sx, c_sy)
-                    self.last_loot_click = now
-                    return
+                    if step_cand:
+                        c_cell, c_sx, c_sy = step_cand
+                        self._click_debug(f"LOOT A*: andando para drop #{self.locked_drop_gid} via ({c_cell[0]},{c_cell[1]})")
+                        self._send_click(target_hwnd, c_sx, c_sy)
+                        self.last_loot_click = now
+                        return
+
+            # Alvo está a <= 3.5 células, fora do HUD e em área segura: Executa Sequência de 3 Etapas
+            retry = self._loot_retry_state.get(self.locked_drop_gid, {"attempt": 0, "last_time": 0.0})
+            attempt = retry["attempt"]
+            last_t = retry["last_time"]
+
+            if attempt >= 3:
+                # 3 tentativas falhas: bloqueia por 12s
+                self._click_debug(f"LOOT: falha após 3 tentativas em drop #{self.locked_drop_gid}, bloqueando por 12s")
+                self._drop_blacklist[self.locked_drop_gid] = now + 12.0
+                if hasattr(self.feed.world, "mark_drop_locked"):
+                    self.feed.world.mark_drop_locked(self.locked_drop_gid)
+                self._loot_retry_state.pop(self.locked_drop_gid, None)
+                self._reset_patrol(px, py)
+                self.locked_drop_gid = None
+                self.locked_drop_clicks = 0
+                self.locked_drop_first_time = 0.0
+                return
+
+            wait_ms = 0.10 if attempt == 0 else 0.55
+            if now - last_t < wait_ms:
+                return
+
+            if attempt == 0:
+                # Tentativa 1: clique direto no drop
+                self._click_debug(f"LOOT tentativa 1 (direto) em ({sx},{sy}) drop:{self.locked_drop_gid}")
+                self._send_click(target_hwnd, sx, sy)
+            elif attempt == 1:
+                # Tentativa 2: micro-movimento suave (±14px) e clique
+                import random as _rand
+                off_x = _rand.choice([-14, 14])
+                off_y = _rand.choice([-14, 14])
+                sx_try2 = sx + off_x
+                sy_try2 = sy + off_y
+                if not self._is_point_in_hud(sx_try2, sy_try2, margin=10):
+                    self._click_debug(f"LOOT tentativa 2 (micro-move {off_x:+d},{off_y:+d}) em ({sx_try2},{sy_try2}) drop:{self.locked_drop_gid}")
+                    self._send_click(target_hwnd, sx_try2, sy_try2)
+                else:
+                    self._send_click(target_hwnd, sx, sy)
+            else:
+                # Tentativa 3: clica em célula adjacente caminhável (1-2 células) para contornar e clica no drop
+                adj_step_clicked = False
+                if gat and px is not None and drop_cell:
+                    cam_pos = getattr(self.feed, "_cam", None) or (px, py)
+                    height_fn = getattr(gat, "get_elevation", gat.height_at)
+                    project = self.feed.camera.projector(snapshot.viewport, cam_pos, height_fn)
+                    for adx, ady in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)):
+                        adj_c = (int(round(drop_cell[0] + adx)), int(round(drop_cell[1] + ady)))
+                        if 0 <= adj_c[0] < gat.width and 0 <= adj_c[1] < gat.height and gat.is_walkable(*adj_c):
+                            if math.hypot(adj_c[0] - px, adj_c[1] - py) >= 2.2:
+                                u_adj, v_adj = project(*adj_c)
+                                if 0.15 <= u_adj <= 0.85 and 0.15 <= v_adj <= 0.85:
+                                    adj_sx = left + int(u_adj * width)
+                                    adj_sy = top + int(v_adj * height)
+                                    if not self._is_point_in_hud(adj_sx, adj_sy, margin=10):
+                                        self._send_click(target_hwnd, adj_sx, adj_sy)
+                                        adj_step_clicked = True
+                                        time.sleep(0.040)
+                                        break
+                self._click_debug(f"LOOT tentativa 3 (contorno adj={adj_step_clicked}) em ({sx},{sy}) drop:{self.locked_drop_gid}")
+                self._send_click(target_hwnd, sx, sy)
+
+            self._loot_retry_state[self.locked_drop_gid] = {"attempt": attempt + 1, "last_time": now}
+            self.last_loot_click = now
+            self.locked_drop_clicks += 1
 
     def get_game_hwnd(self, hwnd=None):
         """Retorna o handle válido do jogo ou redetecta automaticamente se IsWindow retornar 0."""
@@ -4561,45 +3736,6 @@ class Overlay:
             print(f"[Janela] Ragnarok redetectado em tempo real: hwnd=0x{new_hwnd:X} (PID={new_pid}, título='{new_title}')", flush=True)
             return new_hwnd
         return None
-
-    def _get_or_find_ragexe_pid(self):
-        """Obtém ou descobre o PID real do processo Ragexe.exe via psutil."""
-        pid = getattr(self, "_ragexe_pid", None)
-        if pid:
-            try:
-                p = psutil.Process(pid)
-                if p.is_running() and p.name().casefold() == "ragexe.exe":
-                    return pid
-            except Exception:
-                pass
-            self._ragexe_pid = None
-        for p in psutil.process_iter(["pid", "name"]):
-            try:
-                if p.info["name"] and p.info["name"].casefold() == "ragexe.exe":
-                    self._ragexe_pid = p.info["pid"]
-                    return self._ragexe_pid
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return None
-
-    def is_valid_ragexe_hwnd(self, h) -> bool:
-        """Valida se o HWND pertence ao Ragexe.exe e NUNCA ao overlay/HUD do próprio processo."""
-        if not h or not self.user32.IsWindow(h):
-            return False
-        w_pid = wintypes.DWORD()
-        self.user32.GetWindowThreadProcessId(h, ctypes.byref(w_pid))
-        if not w_pid.value or w_pid.value == getattr(self, "_own_pid", None):
-            return False
-        target_pid = self._get_or_find_ragexe_pid()
-        if target_pid and w_pid.value == target_pid:
-            return True
-        try:
-            if psutil.Process(w_pid.value).name().casefold() == "ragexe.exe":
-                self._ragexe_pid = w_pid.value
-                return True
-        except Exception:
-            pass
-        return False
 
     def test_click_f9(self):
         """Dispara 1 clique de teste imediato no centro da janela do Ragnarok e imprime diagnóstico completo."""
@@ -4676,277 +3812,75 @@ class Overlay:
         err_up = ctypes.get_last_error()
         return ok_init, err_init, r_down, err_down, r_up, err_up
 
-    def _is_physical_mouse_down(self) -> bool:
-        """Retorna True somente se o botão esquerdo FÍSICO estiver pressionado.
-        Ignora VK_LBUTTON por 0.55s após o último clique sintético do bot."""
-        if getattr(self, "_click_in_progress", False) or getattr(self, "_click_busy", False):
-            return False
-        if (time.perf_counter() - getattr(self, "last_bot_click_ts", 0.0)) < 0.55:
-            return False
-        return bool((self.user32.GetAsyncKeyState(0x01) & 0x8000) != 0)
+    def touch_postmsg(self, sx, sy, game_hwnd, *, test_mode=False):
+        if not game_hwnd or not u32.IsWindow(game_hwnd):
+            self._click_debug("touch_postmsg: janela do jogo indisponível")
+            return
 
-    def _smooth_move_to(self, sx: int, sy: int, game_hwnd: int = None) -> tuple[int | None, int | None]:
-        """Deslizamento ease-out com SetCursorPos (6ms) + PostMessageW + InjectTouchInput opcional para hover no DirectX."""
-        ensure_touch_injection()
-        pt = wintypes.POINT()
-        u32.GetCursorPos(ctypes.byref(pt))
-        x0, y0 = pt.x, pt.y
-        dist = math.hypot(sx - x0, sy - y0)
-        if game_hwnd is None or not u32.IsWindow(game_hwnd):
-            game_hwnd = self.get_game_hwnd(None)
+        # 1. Posiciona o ponteiro real em (sx, sy) via InjectTouchInput
+        ok_init, err_init, r_down, err_down, r_up, err_up = self._move_pointer_with_touch(sx, sy)
+        pt_cur = wintypes.POINT()
+        u32.GetCursorPos(ctypes.byref(pt_cur))
+        if abs(pt_cur.x - sx) > 4 or abs(pt_cur.y - sy) > 4:
+            self._move_pointer_with_touch(sx, sy)
+            u32.GetCursorPos(ctypes.byref(pt_cur))
 
-        def _post_wm_move(x, y):
-            if not game_hwnd or not u32.IsWindow(game_hwnd):
-                return None, None
-            pt_cl = wintypes.POINT(x, y)
-            if not u32.ScreenToClient(game_hwnd, ctypes.byref(pt_cl)):
-                return None, None
-            lp = ((pt_cl.y & 0xFFFF) << 16) | (pt_cl.x & 0xFFFF)
-            ctypes.set_last_error(0)
-            r = int(u32.PostMessageW(game_hwnd, 0x0200, 0, lp))
-            e = ctypes.get_last_error()
-            return r, e
+        # 2. Aguarda 45ms para o Ragexe.exe registrar o hover sobre o sprite
+        time.sleep(0.045)
 
-        _FLAG_HOVER = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_CONFIDENCE | POINTER_FLAG_PRIMARY
-
-        def _make_contact(x: int, y: int, flags: int) -> POINTER_TOUCH_INFO:
-            c = POINTER_TOUCH_INFO()
-            c.pointerInfo.pointerType = PT_TOUCH
-            c.pointerInfo.pointerId = 0
-            c.pointerInfo.hwndTarget = 0
-            c.pointerInfo.ptPixelLocation.x = int(x)
-            c.pointerInfo.ptPixelLocation.y = int(y)
-            c.pointerInfo.pointerFlags = flags
-            c.touchFlags = TOUCH_FLAG_NONE
-            c.touchMask = 0x0003
-            c.rcContact.left   = int(x) - 2
-            c.rcContact.top    = int(y) - 2
-            c.rcContact.right  = int(x) + 2
-            c.rcContact.bottom = int(y) + 2
-            c.pressure = 512
-            c.orientation = 0
-            return c
-
-        if dist > 8.0:
-            steps = max(5, min(12, int(dist / 55)))
-            for i in range(1, steps + 1):
-                t = i / steps
-                eased = 1.0 - (1.0 - t) ** 2
-                if i == steps:
-                    ix, iy = int(sx), int(sy)
-                else:
-                    ix = int(round(x0 + (sx - x0) * eased)) + random.choice([-2, -1, 1, 2])
-                    iy = int(round(y0 + (sy - y0) * eased)) + random.choice([-2, -1, 1, 2])
-
-                # Restaura movimentação física do cursor para o jogo e DirectX
-                u32.SetCursorPos(ix, iy)
-                try:
-                    c = _make_contact(ix, iy, _FLAG_HOVER)
-                    u32.InjectTouchInput(1, ctypes.byref(c))
-                except Exception:
-                    pass
-                _post_wm_move(ix, iy)
-                time.sleep(0.006)
-
-        # Pouso exato em (sx, sy) antes dos 45ms de hover
-        u32.SetCursorPos(int(sx), int(sy))
+        # 3. Micro-deslocamento relativo ((1,0) -> (-1,0)) para sincronizar o ponteiro dentro do DirectX
         try:
-            c_land = _make_contact(int(sx), int(sy), _FLAG_HOVER)
-            u32.InjectTouchInput(1, ctypes.byref(c_land))
+            self.user32.mouse_event(0x0001, 1, 0, 0, 0)
+            self.user32.mouse_event(0x0001, -1, 0, 0, 0)
         except Exception:
             pass
-        return _post_wm_move(int(sx), int(sy))
 
-    def touch_postmsg(self, sx, sy, game_hwnd=None, *, test_mode=False):
-        """Movimentação suave + clique confiável via mouse_event (LEFTDOWN/UP 50ms) + PostMessage + Touch opcional."""
-        now = time.perf_counter()
-        if getattr(self, "_click_in_progress", False):
-            return False
-        last_ts = getattr(self, "_last_click_ts", 0.0)
-        if getattr(self, "_click_busy", False) and (now - getattr(self, "_click_start_ts", 0.0) < 0.25):
-            return False
-        if now - last_ts < 0.35:
-            return False
+        # 4. Converte (sx, sy) via ScreenToClient e envia WM_MOUSEMOVE -> 15ms -> WM_LBUTTONDOWN -> 50ms -> WM_LBUTTONUP
+        targets = [game_hwnd]
+        game_pid = wintypes.DWORD()
+        u32.GetWindowThreadProcessId(game_hwnd, ctypes.byref(game_pid))
+        if game_pid.value:
+            @WNDENUMPROC
+            def collect_child(child_hwnd, _lparam):
+                child_pid = wintypes.DWORD()
+                u32.GetWindowThreadProcessId(child_hwnd, ctypes.byref(child_pid))
+                if game_pid.value and child_pid.value == game_pid.value and child_hwnd != game_hwnd:
+                    targets.append(child_hwnd)
+                return True
 
-        # Valida hwnd: nunca aceitar a janela do overlay/HUD (somente Ragexe.exe)
-        hwnd = self.get_game_hwnd(game_hwnd or getattr(self, "game_hwnd", None))
-        if not hwnd or not self.is_valid_ragexe_hwnd(hwnd):
-            self._click_debug("touch_postmsg: janela do Ragexe indisponível")
-            return False
-        self.game_hwnd = hwnd
+            u32.EnumChildWindows(game_hwnd, collect_child, 0)
 
-        self._click_in_progress = True
-        self._click_busy = True
-        self._click_start_ts = now
-        self._last_click_ts = self.last_bot_click_ts = now
+        for target in targets:
+            pt = wintypes.POINT(sx, sy)
+            if not u32.ScreenToClient(target, ctypes.byref(pt)):
+                continue
+            lparam = ((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)
 
-        def _do_smooth_click():
-            d = ed = 0
-            d_hold = ed_hold = 0
-            d_up = ed_up = 0
-            d_exit = ed_exit = 0
-            lbtn = 0
-            post_move = post_move_err = None
-            mouse_down = mouse_up = 0
-            fb_pa_d = fb_pa_d_e = fb_pa_u = fb_pa_u_e = 0
-            fb_snm_d = fb_snm_d_e = fb_snm_u = fb_snm_u_e = 0
-            fb_pw_d = fb_pw_d_e = fb_pw_u = fb_pw_u_e = 0
-            try:
-                ensure_input_desktop()
-                ensure_touch_injection()
+            ctypes.set_last_error(0)
+            r_move = int(u32.PostMessageW(target, 0x0200, 0, lparam))
+            err_move = ctypes.get_last_error()
+            time.sleep(0.015)
 
-                # Foca janela do jogo se necessário
-                try:
-                    fg = u32.GetForegroundWindow()
-                    if not fg or int(fg) != int(hwnd):
-                        u32.BringWindowToTop(hwnd)
-                        u32.SetForegroundWindow(hwnd)
-                except Exception:
-                    pass
+            ctypes.set_last_error(0)
+            r_down = int(u32.PostMessageW(target, 0x0201, 1, lparam))
+            err_down = ctypes.get_last_error()
+            time.sleep(0.050)
 
-                # ── 1. Deslizamento suave ease-out até (sx, sy) ────────────────
-                post_move, post_move_err = self._smooth_move_to(sx, sy, hwnd)
+            ctypes.set_last_error(0)
+            r_up = int(u32.PostMessageW(target, 0x0202, 0, lparam))
+            err_up = ctypes.get_last_error()
 
-                # ── 2. Espera de Hover: 45ms em (sx, sy) ───────────────────────
-                time.sleep(0.045)
-                if u32.GetForegroundWindow() != hwnd:
-                    self._click_debug("touch_postmsg: jogo perdeu o foco antes do clique")
-                    return
-
-                # Garante que o cursor físico está exatamente no alvo
-                u32.SetCursorPos(int(sx), int(sy))
-
-                # Coordenadas de cliente para mensagens Win32
-                pt_cl = wintypes.POINT(int(sx), int(sy))
-                has_cc = bool(u32.ScreenToClient(hwnd, ctypes.byref(pt_cl)))
-                lparam = (((pt_cl.y & 0xFFFF) << 16) | (pt_cl.x & 0xFFFF)) if has_cc else 0
-
-                # ── 3. Clique Down via u32.mouse_event (LEFTDOWN) ──────────────
-                try:
-                    u32.mouse_event(0x0002, 0, 0, 0, 0)
-                    mouse_down = 1
-                except Exception:
-                    mouse_down = 0
-
-                # Envio simultâneo de mensagens para a janela do Ragexe
-                if has_cc and hwnd and u32.IsWindow(hwnd):
-                    ctypes.set_last_error(0)
-                    fb_pa_d = int(u32.PostMessageA(hwnd, 0x0201, 0x0001, lparam))
-                    fb_pa_d_e = ctypes.get_last_error()
-                    ctypes.set_last_error(0)
-                    fb_snm_d = int(u32.SendNotifyMessageW(hwnd, 0x0201, 0x0001, lparam))
-                    fb_snm_d_e = ctypes.get_last_error()
-                    ctypes.set_last_error(0)
-                    fb_pw_d = int(u32.PostMessageW(hwnd, 0x0201, 0x0001, lparam))
-                    fb_pw_d_e = ctypes.get_last_error()
-
-                # InjectTouchInput opcional (não aborta se falhar com e=87)
-                try:
-                    _FLAG_DOWN = (
-                        POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT |
-                        POINTER_FLAG_CONFIDENCE | POINTER_FLAG_PRIMARY
-                    )
-                    c_down = POINTER_TOUCH_INFO()
-                    c_down.pointerInfo.pointerType = PT_TOUCH
-                    c_down.pointerInfo.ptPixelLocation.x = int(sx)
-                    c_down.pointerInfo.ptPixelLocation.y = int(sy)
-                    c_down.pointerInfo.pointerFlags = _FLAG_DOWN
-                    c_down.touchMask = 0x0003
-                    c_down.rcContact.left = int(sx) - 2
-                    c_down.rcContact.top = int(sy) - 2
-                    c_down.rcContact.right = int(sx) + 2
-                    c_down.rcContact.bottom = int(sy) + 2
-                    c_down.pressure = 512
-                    ctypes.set_last_error(0)
-                    d = int(u32.InjectTouchInput(1, ctypes.byref(c_down)))
-                    ed = ctypes.get_last_error()
-                except Exception:
-                    pass
-
-                # ── 4. Retenção ativa (50ms) ───────────────────────────────────
-                time.sleep(0.025)
-                # Lê o estado real de VK_LBUTTON durante a retenção
-                lbtn = int(bool(u32.GetAsyncKeyState(0x01) & 0x8000))
-
-                try:
-                    _FLAG_HOLD = (
-                        POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT |
-                        POINTER_FLAG_CONFIDENCE | POINTER_FLAG_PRIMARY
-                    )
-                    c_down.pointerInfo.pointerFlags = _FLAG_HOLD
-                    ctypes.set_last_error(0)
-                    d_hold = int(u32.InjectTouchInput(1, ctypes.byref(c_down)))
-                    ed_hold = ctypes.get_last_error()
-                except Exception:
-                    pass
-
-                time.sleep(0.025)
-                if not lbtn:
-                    lbtn = int(bool(u32.GetAsyncKeyState(0x01) & 0x8000))
-
-                # ── 5. Clique Up via u32.mouse_event (LEFTUP) ──────────────────
-                try:
-                    u32.mouse_event(0x0004, 0, 0, 0, 0)
-                    mouse_up = 1
-                except Exception:
-                    mouse_up = 0
-
-                if has_cc and hwnd and u32.IsWindow(hwnd):
-                    ctypes.set_last_error(0)
-                    fb_pa_u = int(u32.PostMessageA(hwnd, 0x0202, 0x0000, lparam))
-                    fb_pa_u_e = ctypes.get_last_error()
-                    ctypes.set_last_error(0)
-                    fb_snm_u = int(u32.SendNotifyMessageW(hwnd, 0x0202, 0x0000, lparam))
-                    fb_snm_u_e = ctypes.get_last_error()
-                    ctypes.set_last_error(0)
-                    fb_pw_u = int(u32.PostMessageW(hwnd, 0x0202, 0x0000, lparam))
-                    fb_pw_u_e = ctypes.get_last_error()
-
-                # InjectTouchInput opcional Up
-                try:
-                    _FLAG_UP = POINTER_FLAG_UP | POINTER_FLAG_INRANGE | POINTER_FLAG_CONFIDENCE | POINTER_FLAG_PRIMARY
-                    c_down.pointerInfo.pointerFlags = _FLAG_UP
-                    ctypes.set_last_error(0)
-                    d_up = int(u32.InjectTouchInput(1, ctypes.byref(c_down)))
-                    ed_up = ctypes.get_last_error()
-
-                    c_down.pointerInfo.pointerFlags = POINTER_FLAG_UPDATE | POINTER_FLAG_PRIMARY
-                    ctypes.set_last_error(0)
-                    d_exit = int(u32.InjectTouchInput(1, ctypes.byref(c_down)))
-                    ed_exit = ctypes.get_last_error()
-                except Exception:
-                    pass
-
-                now_end = time.perf_counter()
-                self._last_click_ts = self.last_bot_click_ts = self._last_click_end_ts = now_end
-
-                is_admin = getattr(self, "is_admin", False)
-                fb_info = (
-                    f" MOUSE=({mouse_down},{mouse_up})"
-                    f" PostA=({fb_pa_d}:{fb_pa_d_e}/{fb_pa_u}:{fb_pa_u_e})"
-                    f" SNM=({fb_snm_d}:{fb_snm_d_e}/{fb_snm_u}:{fb_snm_u_e})"
-                    f" PostW=({fb_pw_d}:{fb_pw_d_e}/{fb_pw_u}:{fb_pw_u_e})"
-                )
-                msg = (
-                    f"[ClickDebug] touch_postmsg ({sx},{sy}) hwnd={hex(hwnd)} LBTN_STATE={lbtn}: "
-                    f"is_admin={is_admin} "
-                    f"INJ_D={d}(e={ed}) INJ_HOLD={d_hold}(e={ed_hold}) "
-                    f"INJ_UP={d_up}(e={ed_up}) INJ_EXIT={d_exit}(e={ed_exit}) "
-                    f"POST_MOVE={post_move}(e={post_move_err}){fb_info}"
-                )
-                if 5 in (ed, ed_hold, ed_up, ed_exit, fb_pa_d_e, fb_pa_u_e, fb_snm_d_e, fb_snm_u_e, fb_pw_d_e, fb_pw_u_e):
-                    msg += " | UIPI bloqueou."
-                log_click_file(msg)
-
-            except Exception as exc:
-                self._last_click_ts = self.last_bot_click_ts = self._last_click_end_ts = time.perf_counter()
-                print(f"[ClickDebug] touch_postmsg erro: {exc}", flush=True)
-            finally:
-                self._click_in_progress = False
-                self._click_busy = False
-
-        threading.Thread(target=_do_smooth_click, daemon=True).start()
-        return True
+            msg = (
+                f"touch_postmsg ({sx},{sy}) hwnd=0x{target:X}: "
+                f"is_admin={self.is_admin} "
+                f"cur=({pt_cur.x},{pt_cur.y}) "
+                f"MOVE={r_move}(err={err_move}) DOWN={r_down}(err={err_down}) UP={r_up}(err={err_up})"
+            )
+            if 5 in (err_move, err_down, err_up):
+                msg += " | Acesso negado (UIPI). Execute o overlay com o mesmo nível de integridade do jogo."
+            log_click_file(msg)
+            if test_mode:
+                print(f"    [Passo] {msg}", flush=True)
 
     def _natural_dodge_cursor(self, sx, sy):
         """Executa movimento natural de desvio no cursor (arco suave de 20..35px para o lado via InjectTouchInput + micro-move)."""
@@ -4970,6 +3904,63 @@ class Overlay:
         except Exception as exc:
             self._click_debug(f"Erro no desvio suave do cursor: {exc}")
 
+    def _smooth_move_to(self, sx: int, sy: int) -> None:
+        """Deslizamento interpolado ease-out do cursor até (sx, sy) para o DirectX reconhecer hover."""
+        if getattr(self, "_click_in_progress", False):
+            return
+        self._click_in_progress = True
+        try:
+            pt = wintypes.POINT()
+            u32.GetCursorPos(ctypes.byref(pt))
+            x0, y0 = pt.x, pt.y
+            dist = math.hypot(sx - x0, sy - y0)
+            if dist > 8:
+                steps = max(5, min(12, int(dist / 55)))
+                for i in range(1, steps + 1):
+                    t = i / steps
+                    eased = 1.0 - (1.0 - t) ** 2
+                    ix = int(x0 + (sx - x0) * eased)
+                    iy = int(y0 + (sy - y0) * eased)
+                    if 1 <= i < steps:
+                        ix += random.randint(-2, 2)
+                        iy += random.randint(-1, 1)
+                    contact = POINTER_TOUCH_INFO()
+                    contact.pointerInfo.pointerType = 0x00000002
+                    contact.pointerInfo.pointerId = 0
+                    contact.pointerInfo.ptPixelLocation.x = ix
+                    contact.pointerInfo.ptPixelLocation.y = iy
+                    contact.pointerInfo.pointerFlags = 0x0001 | 0x4000
+                    contact.touchFlags = 0
+                    contact.touchMask = 0
+                    contact.rcContact.left = ix - 2
+                    contact.rcContact.top = iy - 2
+                    contact.rcContact.right = ix + 2
+                    contact.rcContact.bottom = iy + 2
+                    u32.InjectTouchInput(1, ctypes.byref(contact))
+                    game_hwnd_sm = self.get_game_hwnd(None)
+                    if game_hwnd_sm:
+                        pt_cl = wintypes.POINT(ix, iy)
+                        if u32.ScreenToClient(game_hwnd_sm, ctypes.byref(pt_cl)):
+                            lparam_m = ((pt_cl.y & 0xFFFF) << 16) | (pt_cl.x & 0xFFFF)
+                            u32.PostMessageW(game_hwnd_sm, 0x0200, 0, lparam_m)
+                    time.sleep(0.006)
+            # Pouso exato
+            contact_final = POINTER_TOUCH_INFO()
+            contact_final.pointerInfo.pointerType = 0x00000002
+            contact_final.pointerInfo.pointerId = 0
+            contact_final.pointerInfo.ptPixelLocation.x = sx
+            contact_final.pointerInfo.ptPixelLocation.y = sy
+            contact_final.pointerInfo.pointerFlags = 0x0001 | 0x4000
+            contact_final.touchFlags = 0
+            contact_final.touchMask = 0
+            contact_final.rcContact.left = sx - 2
+            contact_final.rcContact.top = sy - 2
+            contact_final.rcContact.right = sx + 2
+            contact_final.rcContact.bottom = sy + 2
+            u32.InjectTouchInput(1, ctypes.byref(contact_final))
+        finally:
+            self._click_in_progress = False
+
     def _send_game_key(self, vk_code: int, hold_ms: int = 35):
         """Envia tecla de jogo usando Win32 SendInput com Hardware ScanCode."""
         scan = u32.MapVirtualKeyW(vk_code, 0)
@@ -4982,10 +3973,8 @@ class Overlay:
         inp_down.ki.wScan = scan
         inp_down.ki.dwFlags = flags
         inp_down.ki.time = 0
-        inp_down.ki.dwExtraInfo = None
-        ctypes.set_last_error(0)
+        inp_down.ki.dwExtraInfo = 0
         u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT))
-        ctypes.get_last_error()
 
         time.sleep(max(0.005, hold_ms / 1000.0))
 
@@ -4994,10 +3983,8 @@ class Overlay:
         inp_up.ki.wScan = scan
         inp_up.ki.dwFlags = flags | 0x0002  # KEYEVENTF_KEYUP
         inp_up.ki.time = 0
-        inp_up.ki.dwExtraInfo = None
-        ctypes.set_last_error(0)
+        inp_up.ki.dwExtraInfo = 0
         u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT))
-        ctypes.get_last_error()
 
         # Fallback PostMessageW para o Ragexe
         target_hwnd = getattr(getattr(self.feed, "viewport", None), "handle", None)
@@ -5049,9 +4036,9 @@ class Overlay:
         sx = int(screen_x)
         sy = int(screen_y)
 
-        # Zona Proibida do Retângulo do HUD (com margem de 12px) e da UI do jogo (chat, status, minimapa)
-        if not test_mode and self._is_point_in_game_ui(sx, sy):
-            self._click_debug(f"CLIQUE BLOQUEADO: ({sx},{sy}) está dentro da interface do jogo/HUD (zona proibida)")
+        # Zona Proibida do Retângulo do HUD (com margem de 10px): nunca clique ali
+        if not test_mode and self._is_point_in_hud(sx, sy, margin=10):
+            self._click_debug(f"CLIQUE BLOQUEADO: ({sx},{sy}) está dentro do HUD (zona proibida)")
             return
 
         # Registra clique no CameraTracker para auto-calibração PnP
@@ -5060,29 +4047,26 @@ class Overlay:
             if vp and hasattr(self.feed.camera, "record_click"):
                 self.feed.camera.record_click(sx, sy, vp)
 
+        method = self._click_method
+
+        if method == "touch_postmsg":
+            ensure_input_desktop()
+            self.touch_postmsg(sx, sy, self.get_game_hwnd(hwnd), test_mode=test_mode)
+            return
+
         # ── 0. Hardware USB HID (Serial) Bypass se conectado ────────────────
-        if hasattr(self, "serial_hid") and self.serial_hid and getattr(self.serial_hid, "is_connected", False):
+        if not test_mode and hasattr(self, "serial_hid") and self.serial_hid and self.serial_hid.is_connected:
             ok_serial = self.serial_hid.send_click(sx, sy)
             if ok_serial:
                 self._click_debug(f"CLIQUE em ({sx},{sy}) via Serial HID ({self.serial_hid.port}): Sucesso")
                 return
 
         # ── 0.1 Driver Kernel HID (interception.dll) ─────────────────────
-        if hasattr(self, "interception") and self.interception and getattr(self.interception, "is_available", False):
+        if not test_mode and hasattr(self, "interception") and self.interception and self.interception.is_available:
             ok_inter = self.interception.send_click(sx, sy, self._screen_w, self._screen_h)
             if ok_inter:
                 self._click_debug(f"CLIQUE em ({sx},{sy}) via Interception Driver: Sucesso [Kernel Filter Bypass]")
                 return
-
-        method = self._click_method
-
-        if method == "touch_postmsg":
-            ensure_input_desktop()
-            now = time.perf_counter()
-            if getattr(self, "_click_in_progress", False) or getattr(self, "_click_busy", False) or (now - getattr(self, "last_bot_click_ts", 0.0)) < 0.28:
-                return
-            self.touch_postmsg(sx, sy, self.get_game_hwnd(hwnd), test_mode=test_mode)
-            return
 
         # Revalida/redetecta a janela do jogo
         hwnd = self.get_game_hwnd(hwnd)
@@ -5121,7 +4105,7 @@ class Overlay:
             inp_down.mi.dx = norm_x
             inp_down.mi.dy = norm_y
             inp_down.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | abs_flags
-            ctypes.set_last_error(0)
+            ctypes.windll.kernel32.SetLastError(0)
             r_si_down = int(u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT)))
             err_si_down = ctypes.get_last_error()
 
@@ -5132,7 +4116,7 @@ class Overlay:
             inp_up.mi.dx = norm_x
             inp_up.mi.dy = norm_y
             inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
-            ctypes.set_last_error(0)
+            ctypes.windll.kernel32.SetLastError(0)
             r_si_up = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
             err_si_up = ctypes.get_last_error()
 
@@ -5166,7 +4150,7 @@ class Overlay:
                     u32.BringWindowToTop(hwnd)
 
             # Posiciona cursor
-            ctypes.set_last_error(0)
+            ctypes.windll.kernel32.SetLastError(0)
             ok_pos = bool(u32.SetCursorPos(sx, sy))
             err_pos = ctypes.get_last_error()
 
@@ -5175,17 +4159,13 @@ class Overlay:
             inp_rel1.mi.dx = 1
             inp_rel1.mi.dy = 0
             inp_rel1.mi.dwFlags = MOUSEEVENTF_MOVE  # relativo (sem ABSOLUTE)
-            ctypes.set_last_error(0)
             u32.SendInput(1, ctypes.byref(inp_rel1), ctypes.sizeof(INPUT))
-            ctypes.get_last_error()
 
             inp_rel2 = INPUT(type=INPUT_MOUSE)
             inp_rel2.mi.dx = -1
             inp_rel2.mi.dy = 0
             inp_rel2.mi.dwFlags = MOUSEEVENTF_MOVE
-            ctypes.set_last_error(0)
             u32.SendInput(1, ctypes.byref(inp_rel2), ctypes.sizeof(INPUT))
-            ctypes.get_last_error()
 
             pt_before = wintypes.POINT()
             u32.GetCursorPos(ctypes.byref(pt_before))
@@ -5197,7 +4177,7 @@ class Overlay:
             inp_down.mi.dx = norm_x
             inp_down.mi.dy = norm_y
             inp_down.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | abs_flags
-            ctypes.set_last_error(0)
+            ctypes.windll.kernel32.SetLastError(0)
             r_si_down = int(u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT)))
             err_si_down = ctypes.get_last_error()
 
@@ -5208,7 +4188,7 @@ class Overlay:
             inp_up.mi.dx = norm_x
             inp_up.mi.dy = norm_y
             inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
-            ctypes.set_last_error(0)
+            ctypes.windll.kernel32.SetLastError(0)
             r_si_up = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
             err_si_up = ctypes.get_last_error()
 
@@ -5279,9 +4259,7 @@ class Overlay:
             inp_move.mi.dx = norm_x
             inp_move.mi.dy = norm_y
             inp_move.mi.dwFlags = MOUSEEVENTF_MOVE | abs_flags
-            ctypes.set_last_error(0)
             u32.SendInput(1, ctypes.byref(inp_move), ctypes.sizeof(INPUT))
-            ctypes.get_last_error()
 
             time.sleep(0.025)
 
@@ -5289,9 +4267,9 @@ class Overlay:
             err_pm_down = 0
             if hwnd and u32.IsWindow(hwnd):
                 lparam_click = ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
-                ctypes.set_last_error(0)
+                k32.SetLastError(0)
                 u32.PostMessageW(hwnd, 0x0200, 0, lparam_click)
-                ctypes.set_last_error(0)
+                k32.SetLastError(0)
                 r_down_pm = int(u32.PostMessageW(hwnd, 0x0201, 0x0001, lparam_click))
                 err_pm_down = ctypes.get_last_error()
 
@@ -5299,7 +4277,7 @@ class Overlay:
             inp_down.mi.dx = norm_x
             inp_down.mi.dy = norm_y
             inp_down.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | abs_flags
-            ctypes.set_last_error(0)
+            k32.SetLastError(0)
             r_down_si = int(u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT)))
             err_si_down = ctypes.get_last_error()
 
@@ -5309,7 +4287,7 @@ class Overlay:
             inp_up.mi.dx = norm_x
             inp_up.mi.dy = norm_y
             inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
-            ctypes.set_last_error(0)
+            k32.SetLastError(0)
             r_up_si = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
             err_si_up = ctypes.get_last_error()
 
@@ -5317,7 +4295,7 @@ class Overlay:
             err_pm_up = 0
             if hwnd and u32.IsWindow(hwnd):
                 lparam_click = ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
-                ctypes.set_last_error(0)
+                k32.SetLastError(0)
                 r_up_pm = int(u32.PostMessageW(hwnd, 0x0202, 0, lparam_click))
                 err_pm_up = ctypes.get_last_error()
 
@@ -5369,7 +4347,7 @@ class Overlay:
             return
 
         # Pausa se qualquer botão físico do mouse estiver pressionado (1=L, 2=R, 4=M)
-        if any((self.user32.GetAsyncKeyState(k) & 0x8000) != 0 for k in (2, 4)) or self._is_physical_mouse_down():
+        if any((self.user32.GetAsyncKeyState(k) & 0x8000) != 0 for k in (1, 2, 4)):
             self._click_debug("FARM BLOQUEADO: botão físico do mouse pressionado")
             return
 
@@ -5456,44 +4434,6 @@ class Overlay:
                     mob_name = self.names.get("mob", {}).get(item.catalog_id, "")
                     if mf.lower() not in mob_name.lower():
                         continue
-
-                # ── Filtro Anti-KS 1: Monstro já engajado em combate com outro jogador ──
-                engaged_until = 0.0
-                if hasattr(self.feed, "world"):
-                    w = self.feed.world
-                    with w.lock:
-                        mob_ent = w.entities.get(("mob", gid))
-                        if mob_ent:
-                            engaged_until = getattr(mob_ent, "engaged_other_until", 0.0)
-                        if not engaged_until and hasattr(w, "mobs_engaged_other"):
-                            engaged_until = w.mobs_engaged_other.get(gid, 0.0)
-                if engaged_until > now:
-                    continue
-
-                # ── Filtro Anti-KS 2: Proteção contra Mob Train por proximidade ──
-                # Ignora monstros a <= 4.5 células de outro jogador e mais perto dele do que de você
-                # (exceto se você já estiver batendo naquele monstro antes)
-                already_hit_by_me = False
-                if hasattr(self.feed, "world") and hasattr(self.feed.world, "mobs_damaged_by_me"):
-                    already_hit_by_me = (now - self.feed.world.mobs_damaged_by_me.get(gid, 0.0)) < 15.0
-
-                if not already_hit_by_me and hasattr(self.feed, "world"):
-                    mob_c = self.feed.world.get_entity_cell("mob", item.key)
-                    if mob_c:
-                        is_mob_train = False
-                        with self.feed.world.lock:
-                            for p_gid, (p_c, _) in self.feed.world.other_players.items():
-                                if self.feed.world.player_id and p_gid == self.feed.world.player_id:
-                                    continue
-                                d_other = math.hypot(mob_c[0] - p_c[0], mob_c[1] - p_c[1])
-                                if d_other <= 4.5:
-                                    d_me = math.hypot(mob_c[0] - px, mob_c[1] - py) if (px is not None and py is not None) else 999.0
-                                    if d_other < d_me:
-                                        is_mob_train = True
-                                        break
-                        if is_mob_train:
-                            continue
-
                 dist = self._entity_distance("mob", item.key, px, py)
                 if px is None or dist <= search_limit:
                     candidates.append((dist, gid, item))
@@ -5527,17 +4467,8 @@ class Overlay:
             if hasattr(self.feed.world, "mobs_damaged_by_me"):
                 last_damaged = self.feed.world.mobs_damaged_by_me.get(self.locked_mob_gid, 0.0)
 
-            p_obj = getattr(getattr(self.feed, "world", None), "player", None)
-            p_moving = getattr(p_obj, "is_moving", False) or getattr(self.feed.world, "_is_player_walking", lambda: False)()
-            if player and player.duration and now < player.started + min(player.duration, 2.5):
-                p_moving = True
-
-            # Mantém vivo se o personagem estiver ativamente se deslocando em direção ao mob
-            if p_moving:
-                self.locked_mob_first_time = now
-
-            # Se após 6.0s parado o mob não sofrer dano (inacessível/bugado), blacklist de 6s e troca de alvo
-            if (now - self.locked_mob_first_time > 6.0) and (last_damaged < self.locked_mob_first_time) and not p_moving:
+            # Se após 4.5s o mob não sofrer dano (inacessível/bugado), blacklist de 6s e troca de alvo
+            if (now - self.locked_mob_first_time > 4.5) and (last_damaged < self.locked_mob_first_time):
                 self._farm_blacklist[self.locked_mob_gid] = now + 6.0
                 self._reset_patrol(px, py)
                 self.locked_mob_gid = None
@@ -5550,92 +4481,77 @@ class Overlay:
                 self._click_debug(f"FARM pausado: já atacando mob:{self.locked_mob_gid} (last_hit={now - last_damaged:.2f}s atrás)")
                 return
 
-            # Se já clicou no monstro e o personagem está se deslocando até ele, aguarda a aproximação
-            if self.locked_mob_clicks >= 1 and p_moving:
-                self._click_debug(f"FARM pausado: personagem andando até mob:{self.locked_mob_gid}")
-                return
-
             mob_cell = self.feed.world.get_entity_cell("mob", target_item.key)
             dist_mob = self._entity_distance("mob", target_item.key, px, py) if (px is not None and py is not None) else 0.0
 
-            # Projeta sprite do monstro com sprite_z = 3.2
-            if mob_cell:
-                u_mob, v_mob, sx_mob, sy_mob = self._project_ground_cell(snapshot, mob_cell[0], mob_cell[1], sprite_z=3.2)
-            else:
-                u_mob, v_mob = target_item.u, target_item.v
-                sx_mob = left + int(u_mob * width)
-                sy_mob = top  + int(v_mob * height)
+            sx = left + int(target_item.u * width)
+            sy = top  + int(target_item.v * height)
+            is_near_edge = (target_item.u < 0.15 or target_item.u > 0.85 or target_item.v < 0.15 or target_item.v > 0.85)
+            is_in_hud = self._is_point_in_hud(sx, sy, margin=10)
 
-            is_in_hud = self._is_point_in_game_ui(sx_mob, sy_mob)
-            is_visible_screen = (0.05 <= u_mob <= 0.95 and 0.05 <= v_mob <= 0.95) and not is_in_hud
-
-            is_attacking = (now - last_damaged) < 1.2
-            started_action = p_moving or is_attacking
-
-            # Se monstro vivo a <= 11.5 células e visível fora do HUD: clica direto no sprite (sprite_z = 3.2)
-            # Só usa A* no chão se dist > 11.5 ou após 2 cliques diretos sem iniciar ataque/movimento
-            if dist_mob <= 11.5 and is_visible_screen and (self.locked_mob_clicks < 2 or started_action):
-                if self.locked_mob_clicks == 0:
-                    if now - self.locked_mob_first_time < 0.10:
-                        return
-                else:
-                    if now - self.last_farm_click < 0.850:
-                        return
-
-                self._click_debug(f"FARM clique #{self.locked_mob_clicks+1} no sprite (z=3.2) em ({sx_mob},{sy_mob}) mob:{self.locked_mob_gid}")
-                self._send_click(target_hwnd, sx_mob, sy_mob)
-                self.last_farm_click = now
-                self.locked_mob_clicks += 1
-                return
-
-            # Caso contrário (dist > 11.5 ou após 2 cliques diretos sem ataque/movimento ou fora do HUD): aproximação via A*
-            if p_moving:
+            # Pausa se o personagem estiver andando em deslocamento ativo
+            if player and player.duration and now < player.started + min(player.duration, 2.5):
                 self._click_debug(f"FARM pausado: personagem andando (mob:{self.locked_mob_gid})")
                 return
 
-            # Se estiver a <= 4.5 células e apenas atrás da UI, tenta passo seguro para desobstruir visão
-            if dist_mob <= 4.5 and is_in_hud and mob_cell:
-                if self._side_step_to_reveal(mob_cell, px, py):
+            # Se o monstro for alcançável mas estiver a > 4.5 células (ou na borda / atrás do HUD): anda via A*
+            if dist_mob > 4.5 or is_near_edge or is_in_hud:
+                # Se estiver a <= 4.5 células e apenas atrás do HUD, tenta passo lateral para desobstruir visão
+                if dist_mob <= 4.5 and is_in_hud and mob_cell:
+                    if self._side_step_to_reveal(mob_cell, px, py):
+                        return
+
+                # Caminhada via A* em direção ao monstro
+                if gat and px is not None and mob_cell:
+                    start_cell = (int(round(px)), int(round(py)))
+                    path = gat.find_path(start_cell, (int(round(mob_cell[0])), int(round(mob_cell[1]))), blocked_cells=self.temp_blocked_cells)
+                    if not path:
+                        self._farm_blacklist[self.locked_mob_gid] = now + 6.0
+                        self._reset_patrol(px, py)
+                        self.locked_mob_gid = None
+                        return
+
+                    self.active_nav_path = list(path)
+                    self.active_nav_color = "#F87171"  # Vermelho = Auto-Farm
+
+                    # Seleciona sub-passo a 8–10 células de distância
+                    cam_pos = getattr(self.feed, "_cam", None) or (px, py)
+                    height_fn = getattr(gat, "get_elevation", gat.height_at)
+                    project = self.feed.camera.projector(snapshot.viewport, cam_pos, height_fn)
+
+                    step_cand = None
+                    max_idx = min(len(path) - 1, 10)
+                    for idx in range(max_idx, 1, -1):
+                        cand = path[idx]
+                        if math.hypot(cand[0] - px, cand[1] - py) < 2.2:
+                            continue
+                        u_c, v_c = project(*cand)
+                        if 0.15 <= u_c <= 0.85 and 0.15 <= v_c <= 0.85:
+                            cand_sx = left + int(u_c * width)
+                            cand_sy = top + int(v_c * height)
+                            if not self._is_point_in_hud(cand_sx, cand_sy, margin=10):
+                                step_cand = (cand, cand_sx, cand_sy)
+                                break
+
+                    if step_cand:
+                        c_cell, c_sx, c_sy = step_cand
+                        self._click_debug(f"FARM A*: andando para mob #{self.locked_mob_gid} (dist={dist_mob:.1f}) via ({c_cell[0]},{c_cell[1]})")
+                        self._send_click(target_hwnd, c_sx, c_sy)
+                        self.last_farm_click = now
+                        return
+
+            # Monstro alcançável a <= 4.5 células, fora do HUD e em área segura: clica para atacar
+            if self.locked_mob_clicks == 0:
+                if now - self.locked_mob_first_time < 0.10:
+                    return
+            else:
+                if now - self.last_farm_click < 0.65:
                     return
 
-            # Caminhada via A* em direção ao monstro
-            if gat and px is not None and mob_cell:
-                start_cell = (int(round(px)), int(round(py)))
-                path = gat.find_path(start_cell, (int(round(mob_cell[0])), int(round(mob_cell[1]))), blocked_cells=self.temp_blocked_cells)
-                if not path:
-                    self._farm_blacklist[self.locked_mob_gid] = now + 6.0
-                    self._reset_patrol(px, py)
-                    self.locked_mob_gid = None
-                    return
-
-                self.active_nav_path = list(path)
-                self.active_nav_color = "#F87171"  # Vermelho = Auto-Farm
-
-                # Seleciona sub-passo a 8–10 células de distância
-                cam_pos = getattr(self.feed, "_cam", None) or (px, py)
-                height_fn = getattr(gat, "get_elevation", gat.height_at)
-                project = self.feed.camera.projector(snapshot.viewport, cam_pos, height_fn)
-
-                step_cand = None
-                max_idx = min(len(path) - 1, 10)
-                for idx in range(max_idx, 1, -1):
-                    cand = path[idx]
-                    if math.hypot(cand[0] - px, cand[1] - py) < 2.2:
-                        continue
-                    u_c, v_c = project(*cand)
-                    if 0.15 <= u_c <= 0.85 and 0.15 <= v_c <= 0.85:
-                        cand_sx = left + int(u_c * width)
-                        cand_sy = top + int(v_c * height)
-                        if not self._is_point_in_game_ui(cand_sx, cand_sy):
-                            step_cand = (cand, cand_sx, cand_sy)
-                            break
-
-                if step_cand:
-                    c_cell, c_sx, c_sy = step_cand
-                    self._click_debug(f"FARM A*: andando para mob #{self.locked_mob_gid} (dist={dist_mob:.1f}) via ({c_cell[0]},{c_cell[1]})")
-                    self._send_click(target_hwnd, c_sx, c_sy)
-                    self.last_farm_click = now
-                    return
+            self._click_debug(f"FARM clique #{self.locked_mob_clicks+1} em ({sx},{sy}) mob:{self.locked_mob_gid}")
+            self._send_click(target_hwnd, sx, sy)
+            self.last_farm_click = now
+            self.locked_mob_clicks += 1
 
     def draw(self, snapshot, stats=None):
         if not self._game_is_foreground():
@@ -5647,18 +4563,8 @@ class Overlay:
             return True
 
         left, top, width, height = snapshot.viewport
-        # Garante que o Toplevel transparente mantenha WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE
-        WS_EX_TOPMOST     = 0x00000008
-        WS_EX_TRANSPARENT = 0x00000020
-        WS_EX_LAYERED     = 0x00080000
-        WS_EX_NOACTIVATE  = 0x08000000
-        req_ex = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE
-        cur_ex = self.user32.GetWindowLongW(self.handle, -20)
-        if (cur_ex & req_ex) != req_ex:
-            self.user32.SetWindowLongW(self.handle, -20, cur_ex | req_ex)
-
-        # Alinha perfeitamente à área cliente do Ragexe.exe mantendo HWND_TOPMOST (-1) e SWP_NOACTIVATE (0x0010)
-        if not self.user32.SetWindowPos(self.handle, wintypes.HWND(-1), left, top, width, height, 0x0010):
+        # SWP_NOZORDER | SWP_NOACTIVATE
+        if not self.user32.SetWindowPos(self.handle, None, left, top, width, height, 0x0014):
             self.canvas_pool.hide_all()
             return False
 
@@ -6063,8 +4969,7 @@ def find_ragnarok_window(pid=None):
                     if w > 50 and h_dim > 50:
                         p_id = wintypes.DWORD()
                         u32.GetWindowThreadProcessId(h, ctypes.byref(p_id))
-                        if p_id.value and p_id.value != os.getpid():
-                            windows.append((h, p_id.value, title_val))
+                        windows.append((h, p_id.value, title_val))
         return True
 
     cb = WNDENUMPROC(enum_cb)
@@ -6075,7 +4980,7 @@ def find_ragnarok_window(pid=None):
     return None, None, None
 
 
-def autodetect_live_session(args, status_callback=None):
+def autodetect_live_session(args):
     """Autodetecta interface, server, port e window a partir de Ragexe.exe ativo."""
     last_status = None
     target_name = "ragexe.exe"
@@ -6098,8 +5003,6 @@ def autodetect_live_session(args, status_callback=None):
             if status != last_status:
                 print(status, flush=True)
                 last_status = status
-                if status_callback:
-                    status_callback(status)
             time.sleep(1)
             continue
 
@@ -6118,8 +5021,6 @@ def autodetect_live_session(args, status_callback=None):
             if status != last_status:
                 print(status, flush=True)
                 last_status = status
-                if status_callback:
-                    status_callback(status)
             time.sleep(1)
             continue
 
@@ -6130,8 +5031,6 @@ def autodetect_live_session(args, status_callback=None):
             if status != last_status:
                 print(status, flush=True)
                 last_status = status
-                if status_callback:
-                    status_callback(status)
             time.sleep(1)
             continue
 
@@ -6142,8 +5041,6 @@ def autodetect_live_session(args, status_callback=None):
             if status != last_status:
                 print(status, flush=True)
                 last_status = status
-                if status_callback:
-                    status_callback(status)
             time.sleep(1)
             continue
 
@@ -6202,8 +5099,6 @@ def autodetect_live_session(args, status_callback=None):
     print(f"  Servidor:Porta: {args.server}:{args.port}", flush=True)
     print(f"  Janela:         {window_display}", flush=True)
     print("-" * 60, flush=True)
-    if status_callback:
-        status_callback(f"Ragexe.exe detectado (PID {target_proc.pid})")
 
 
 def run_live(root, args, names):
@@ -6241,15 +5136,23 @@ def run_live(root, args, names):
         thread.start()
         threads.append(thread)
 
-    # 1. Constrói o Overlay e o painel HUD (root) imediatamente, sem qualquer withdraw()
-    overlay = Overlay(
-        root,
-        LiveFeed(world, terrain, camera, viewport),
-        names,
-        interception_dll=getattr(args, "interception_dll", None),
-        serial_port=getattr(args, "serial_port", None),
-        serial_baud=getattr(args, "serial_baud", 115200),
-    )
+    if args.interface:
+        server, port = ("127.0.0.1", loop.port) if loop else (str(args.server), args.port)
+        ragexe_pid = getattr(args, "ragexe_pid", None)
+        start(lambda: capture(world, lengths, args.interface, server, port, args.local_port, stop, ready, ragexe_pid))
+        print(f"Captura TCP passiva em {args.interface}, servidor {server}:{port}.", flush=True)
+    else:
+        ready.set()
+    if loop:
+        def run_mock():
+            while not ready.wait(.1):
+                if stop.is_set():
+                    return
+            if not stop.is_set():
+                loop.run()
+
+        start(run_mock)
+    overlay = Overlay(root, LiveFeed(world, terrain, camera, viewport), names)
     world.on_pickup_ack_callback = overlay._on_pickup_ack
     overlay._click_method = args.click_method
     overlay._ragexe_pid = getattr(args, "ragexe_pid", None)
@@ -6259,64 +5162,11 @@ def run_live(root, args, names):
     if getattr(args, "route", None):
         r_map, r_x, r_y, r_target = args.route
         overlay.patrol_target_route = (r_map, int(r_x), int(r_y), r_target)
-    overlay.log_backend_status()
-
-    # Garante que root esteja construído, posicionado em tela e atualizado imediatamente
-    root.update_idletasks()
-    root.update()
-    ensure_touch_injection()
-
-    def _start_capture_session():
-        server, port = ("127.0.0.1", loop.port) if loop else (str(args.server), args.port)
-        ragexe_pid = getattr(args, "ragexe_pid", None)
-        start(lambda: capture(world, lengths, args.interface, server, port, args.local_port, stop, ready, ragexe_pid))
-        print(f"Captura TCP passiva em {args.interface}, servidor {server}:{port}.", flush=True)
-
-    if loop:
-        def run_mock():
-            while not ready.wait(.1):
-                if stop.is_set():
-                    return
-            if not stop.is_set():
-                loop.run()
-        start(run_mock)
-
-    if args.mock:
-        if args.interface:
-            _start_capture_session()
-        else:
-            ready.set()
-    else:
-        # Modo Live: se já tiver argumentos de rede completos, inicia imediatamente
-        if args.interface and args.server and args.port:
-            _start_capture_session()
-        else:
-            # Autodetecção não-bloqueante em thread em segundo plano com status no HUD
-            overlay.hud_status = "Aguardando Ragexe.exe..."
-            def _live_detect_worker():
-                def _update_status(msg):
-                    overlay.hud_status = msg
-                try:
-                    autodetect_live_session(args, status_callback=_update_status)
-                    if args.window_handle:
-                        viewport.handle = args.window_handle
-                        camera.target_hwnd = args.window_handle
-                        overlay.game_hwnd = args.window_handle
-                    if args.ragexe_pid:
-                        camera.pid = args.ragexe_pid
-                        overlay._ragexe_pid = args.ragexe_pid
-                    if args.window:
-                        viewport.title = args.window.casefold()
-
-                    _start_capture_session()
-                    overlay.hud_status = f"Conectado ao jogo (PID {args.ragexe_pid})"
-                except Exception as exc:
-                    print(f"[Live] Erro na autodetecção: {exc}", flush=True)
-                    overlay.hud_status = f"Erro autodetecção: {exc}"
-
-            detect_thread = Thread(target=_live_detect_worker, daemon=True)
-            detect_thread.start()
-            threads.append(detect_thread)
+    if getattr(args, "serial_port", None):
+        overlay.serial_hid.connect(args.serial_port, getattr(args, "serial_baud", 115200))
+    if getattr(args, "interception_dll", None):
+        overlay.interception = InterceptionDriver(args.interception_dll)
+    print(f"[Clique] Método de clique ativo: {overlay._click_method}", flush=True)
 
     def watch_worker():
         if errors:
@@ -6352,7 +5202,7 @@ def tcp_port(value):
 
 def main():
     parser = argparse.ArgumentParser(description="Overlay Windows para rAthena e snapshots JSON.")
-    mode = parser.add_mutually_exclusive_group(required=False)
+    mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--live", action="store_true", help="Captura passiva do servidor de mapas rAthena.")
     mode.add_argument("--mock", action="store_true", help="Pacotes mockados via TCP em 127.0.0.1.")
     mode.add_argument("--list-interfaces", action="store_true", help="Lista interfaces disponíveis para captura.")
@@ -6401,8 +5251,6 @@ def main():
     parser.add_argument("--route", nargs=4, metavar=("MAP", "X", "Y", "TARGET"),
                         help="Define rota de destino: mapa x y alvo_npc_ou_portal (ex: gef_fild06 180 120 45)")
     args = parser.parse_args()
-    if not (args.live or args.mock or args.list_interfaces or args.source or args.demo):
-        args.live = True
     if args.click_mode_legacy:
         legacy = args.click_mode_legacy.lower()
         if legacy in ("sendinput", "hybrid"):
@@ -6421,13 +5269,8 @@ def main():
                 wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int
             )
             relaunch.restype = wintypes.HINSTANCE
-            if getattr(sys, "frozen", False):
-                exe_target = sys.executable
-                params = list2cmdline(sys.argv[1:])
-            else:
-                exe_target = sys.executable
-                params = list2cmdline([str(Path(sys.argv[0]).resolve()), *sys.argv[1:]])
-            result = relaunch(None, "runas", exe_target, params, os.getcwd(), 1) or 0
+            command_line = list2cmdline([str(Path(sys.argv[0]).resolve()), *sys.argv[1:]])
+            result = relaunch(None, "runas", sys.executable, command_line, os.getcwd(), 1) or 0
             if result > 32:
                 return
             print(f"[Admin] Elevação UAC não concedida (código {result}). O Windows pode bloquear cliques no jogo.", flush=True)
@@ -6447,7 +5290,9 @@ def main():
             and args.player_speed > 0):
         parser.error("Parâmetros de câmera ou velocidade inválidos.")
 
-    if args.mock and not args.port:
+    if args.live:
+        autodetect_live_session(args)
+    elif args.mock and not args.port:
         args.port = 5121
 
     try:
@@ -6455,10 +5300,8 @@ def main():
     except Exception:
         pass
     root = tk.Tk()
-    root.configure(bg="#0F172A", highlightthickness=0, bd=0)
-    root.update_idletasks()
-    root.update()
-    ensure_touch_injection()
+    root.configure(bg=BG_KEY, highlightthickness=0, bd=0)
+    root.withdraw()
     names = read_catalogs(args.catalog)
     if args.live or args.mock:
         try:
@@ -6468,16 +5311,12 @@ def main():
     elif args.demo:
         with tempfile.TemporaryDirectory(prefix="ragnalok-feed-") as folder:
             path = Path(folder, "snapshot.json")
-            overlay = Overlay(
-                root,
-                SnapshotFeed(path),
-                names,
-                interception_dll=getattr(args, "interception_dll", None),
-                serial_port=getattr(args, "serial_port", None),
-                serial_baud=getattr(args, "serial_baud", 115200),
-            )
+            overlay = Overlay(root, SnapshotFeed(path), names)
             overlay._click_method = args.click_method
-            overlay.log_backend_status()
+            if getattr(args, "serial_port", None):
+                overlay.serial_hid.connect(args.serial_port, getattr(args, "serial_baud", 115200))
+            if getattr(args, "interception_dll", None):
+                overlay.interception = InterceptionDriver(args.interception_dll)
             try:
                 demo(root, path)
                 overlay.refresh()
@@ -6485,16 +5324,12 @@ def main():
             finally:
                 overlay.close()
     else:
-        overlay = Overlay(
-            root,
-            SnapshotFeed(args.source),
-            names,
-            interception_dll=getattr(args, "interception_dll", None),
-            serial_port=getattr(args, "serial_port", None),
-            serial_baud=getattr(args, "serial_baud", 115200),
-        )
+        overlay = Overlay(root, SnapshotFeed(args.source), names)
         overlay._click_method = args.click_method
-        overlay.log_backend_status()
+        if getattr(args, "serial_port", None):
+            overlay.serial_hid.connect(args.serial_port, getattr(args, "serial_baud", 115200))
+        if getattr(args, "interception_dll", None):
+            overlay.interception = InterceptionDriver(args.interception_dll)
         try:
             overlay.refresh()
             root.mainloop()
