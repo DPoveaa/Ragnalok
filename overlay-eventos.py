@@ -6065,7 +6065,7 @@ def tcp_port(value):
 
 def main():
     parser = argparse.ArgumentParser(description="Overlay Windows para rAthena e snapshots JSON.")
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group(required=False)
     mode.add_argument("--live", action="store_true", help="Captura passiva do servidor de mapas rAthena.")
     mode.add_argument("--mock", action="store_true", help="Pacotes mockados via TCP em 127.0.0.1.")
     mode.add_argument("--list-interfaces", action="store_true", help="Lista interfaces disponíveis para captura.")
@@ -6114,6 +6114,8 @@ def main():
     parser.add_argument("--route", nargs=4, metavar=("MAP", "X", "Y", "TARGET"),
                         help="Define rota de destino: mapa x y alvo_npc_ou_portal (ex: gef_fild06 180 120 45)")
     args = parser.parse_args()
+    if not (args.live or args.mock or args.list_interfaces or args.source or args.demo):
+        args.live = True
     if args.click_mode_legacy:
         legacy = args.click_mode_legacy.lower()
         if legacy in ("sendinput", "hybrid"):
@@ -6132,8 +6134,13 @@ def main():
                 wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int
             )
             relaunch.restype = wintypes.HINSTANCE
-            command_line = list2cmdline([str(Path(sys.argv[0]).resolve()), *sys.argv[1:]])
-            result = relaunch(None, "runas", sys.executable, command_line, os.getcwd(), 1) or 0
+            if getattr(sys, "frozen", False):
+                exe_target = sys.executable
+                params = list2cmdline(sys.argv[1:])
+            else:
+                exe_target = sys.executable
+                params = list2cmdline([str(Path(sys.argv[0]).resolve()), *sys.argv[1:]])
+            result = relaunch(None, "runas", exe_target, params, os.getcwd(), 1) or 0
             if result > 32:
                 return
             print(f"[Admin] Elevação UAC não concedida (código {result}). O Windows pode bloquear cliques no jogo.", flush=True)

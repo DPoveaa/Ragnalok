@@ -1,10 +1,10 @@
 {
   "map": "pay_fild08",
   "sectors": {
-    "1,4": 2,
+    "1,4": 3,
     "15,6": 2,
     "16,5": 2
   },
-  "total_spawns": 6,
-  "updated_at": 1795318795.4550107
+  "total_spawns": 7,
+  "updated_at": 1795328135.2189555
 }

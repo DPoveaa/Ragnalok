@@ -1,0 +1,78 @@
+{
+  "payon->pay_fild08": [
+    266,
+    88
+  ],
+  "pay_fild08->pay_fild07": [
+    160,
+    18
+  ],
+  "pay_fild07->pay_fild10": [
+    380,
+    290
+  ],
+  "pay_fild10->pay_fild07": [
+    18,
+    291
+  ],
+  "pay_fild10->rachel": [
+    45,
+    289
+  ],
+  "moc_para01->prontera": [
+    30,
+    11
+  ],
+  "prontera->payon": [
+    149,
+    39
+  ],
+  "pay_fild08->pay_fild09": [
+    260,
+    92
+  ],
+  "pay_fild09->pay_fild08": [
+    18,
+    92
+  ],
+  "pay_fild10->pay_fild09": [
+    113,
+    380
+  ],
+  "pay_fild09->pay_fild10": [
+    112,
+    18
+  ],
+  "in_orcs01->gef_f10_c": [
+    108,
+    88
+  ],
+  "gef_f10_c->moc_para0b": [
+    206,
+    305
+  ],
+  "prontera->prt_fild08": [
+    156,
+    27
+  ],
+  "prt_fild08->prontera": [
+    170,
+    376
+  ],
+  "prontera->gef_fild10": [
+    153,
+    34
+  ],
+  "in_orcs01->gef_f10_b": [
+    30,
+    156
+  ],
+  "gef_f10_b->gef_fild10": [
+    75,
+    332
+  ],
+  "gef_fild10->in_orcs01": [
+    222,
+    204
+  ]
+}

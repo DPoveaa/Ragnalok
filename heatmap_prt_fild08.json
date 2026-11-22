@@ -1,8 +1,10 @@
 {
   "map": "prt_fild08",
   "sectors": {
-    "10,23": 1
+    "10,23": 1,
+    "9,23": 1,
+    "10,22": 1
   },
-  "total_spawns": 1,
-  "updated_at": 1795320912.8524535
+  "total_spawns": 3,
+  "updated_at": 1795369877.1897206
 }
