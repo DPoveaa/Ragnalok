@@ -138,10 +138,11 @@ class Gat:
                 return best
         return None
 
-    def find_path(self, start_xy, goal_xy, blocked_cells=None, max_iterations=7000):
+    def find_path(self, start_xy, goal_xy, blocked_cells=None, max_iterations=7000, *,
+                  cell_costs=None, goal_test=None):
         """A* pathfinding em 8 direções evitando corte de quinas em paredes (preferindo passos diagonais primeiro)."""
         start = (int(start_xy[0]), int(start_xy[1]))
-        goal = (int(goal_xy[0]), int(goal_xy[1]))
+        goal = (int(goal_xy[0]), int(goal_xy[1])) if goal_test is None else None
         blocked_set = set(blocked_cells) if blocked_cells else set()
 
         if not self.is_walkable(*start):
@@ -150,7 +151,7 @@ class Gat:
                 return []
             start = alt_start
 
-        if not self.is_walkable(*goal) or goal in blocked_set:
+        if goal is not None and (not self.is_walkable(*goal) or goal in blocked_set):
             alt_goal = self.find_nearest_walkable(*goal, max_radius=4, blocked_cells=blocked_set)
             if alt_goal is None:
                 return []
@@ -160,6 +161,8 @@ class Gat:
             return [start]
 
         def octile_heuristic(a, b):
+            if b is None:
+                return 0
             dx = abs(a[0] - b[0])
             dy = abs(a[1] - b[1])
             return 10 * (max(dx, dy) - min(dx, dy)) + 14 * min(dx, dy)
@@ -185,7 +188,7 @@ class Gat:
             iterations += 1
             f, h_val, _, current = heapq.heappop(open_heap)
 
-            if current == goal:
+            if current == goal or (goal_test is not None and goal_test(current)):
                 # Reconstrói caminho
                 path = [current]
                 while current in came_from:
@@ -221,6 +224,8 @@ class Gat:
                         continue
 
                 tentative_g = current_g + step_cost
+                if cell_costs is not None:
+                    tentative_g += cell_costs.get(neighbor, 0)
                 if tentative_g < g_score.get(neighbor, float("inf")):
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g

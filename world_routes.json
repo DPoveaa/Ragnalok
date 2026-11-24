@@ -1,0 +1,266 @@
+{
+  "cities": {
+    "prontera": {
+      "name": "Prontera",
+      "map": "prontera",
+      "kafra_pos": [151, 29],
+      "teleports": {
+        "izlude": 600,
+        "geffen": 1200,
+        "payon": 1200,
+        "morocc": 1200,
+        "alberta": 1800
+      }
+    },
+    "izlude": {
+      "name": "Izlude",
+      "map": "izlude",
+      "kafra_pos": [128, 148],
+      "teleports": {
+        "geffen": 1200,
+        "payon": 1200,
+        "morocc": 1200,
+        "alberta": 1200
+      }
+    },
+    "geffen": {
+      "name": "Geffen",
+      "map": "geffen",
+      "kafra_pos": [120, 62],
+      "teleports": {
+        "prontera": 1200,
+        "aldebaran": 1200
+      }
+    },
+    "payon": {
+      "name": "Payon",
+      "map": "payon",
+      "kafra_pos": [181, 104],
+      "teleports": {
+        "prontera": 1200,
+        "alberta": 1200,
+        "morocc": 1200
+      }
+    },
+    "morocc": {
+      "name": "Morocc",
+      "map": "morocc",
+      "kafra_pos": [156, 97],
+      "teleports": {
+        "prontera": 1200,
+        "payon": 1200,
+        "alberta": 1800,
+        "comodo": 1800
+      }
+    },
+    "alberta": {
+      "name": "Alberta",
+      "map": "alberta",
+      "kafra_pos": [113, 60],
+      "teleports": {
+        "prontera": 1800,
+        "payon": 1200,
+        "morocc": 1800
+      }
+    },
+    "aldebaran": {
+      "name": "Aldebaran",
+      "map": "aldebaran",
+      "kafra_pos": [143, 119],
+      "teleports": {
+        "geffen": 1200,
+        "yuno": 1200,
+        "izlude": 1800
+      }
+    },
+    "yuno": {
+      "name": "Yuno",
+      "map": "yuno",
+      "kafra_pos": [152, 187],
+      "teleports": {
+        "aldebaran": 1200
+      }
+    }
+  },
+  "portals": [
+    {"from_map": "prontera", "to_map": "prt_fild08", "wx": 282, "wy": 200},
+    {"from_map": "prt_fild08", "to_map": "prontera", "wx": 14, "wy": 185},
+    {"from_map": "prt_fild08", "to_map": "izlude", "wx": 365, "wy": 212},
+    {"from_map": "izlude", "to_map": "prt_fild08", "wx": 6, "wy": 104},
+    {"from_map": "prontera", "to_map": "prt_fild01", "wx": 156, "wy": 360},
+    {"from_map": "prt_fild01", "to_map": "prontera", "wx": 170, "wy": 15},
+    {"from_map": "prt_fild01", "to_map": "aldebaran", "wx": 170, "wy": 375},
+    {"from_map": "aldebaran", "to_map": "prt_fild01", "wx": 140, "wy": 12},
+    {"from_map": "aldebaran", "to_map": "yuno_fild01", "wx": 140, "wy": 240},
+    {"from_map": "prontera", "to_map": "prt_fild05", "wx": 18, "wy": 156},
+    {"from_map": "prt_fild05", "to_map": "prontera", "wx": 370, "wy": 156},
+    {"from_map": "prt_fild05", "to_map": "gef_fild00", "wx": 15, "wy": 180},
+    {"from_map": "gef_fild00", "to_map": "prt_fild05", "wx": 370, "wy": 180},
+    {"from_map": "gef_fild00", "to_map": "geffen", "wx": 15, "wy": 180},
+    {"from_map": "geffen", "to_map": "gef_fild00", "wx": 180, "wy": 115},
+    {"from_map": "geffen", "to_map": "gef_fild07", "wx": 15, "wy": 115},
+    {"from_map": "gef_fild07", "to_map": "geffen", "wx": 380, "wy": 115},
+    {"from_map": "gef_fild07", "to_map": "gef_fild10", "wx": 180, "wy": 15},
+    {"from_map": "gef_fild10", "to_map": "gef_fild07", "wx": 180, "wy": 380},
+    {"from_map": "geffen", "to_map": "gef_fild04", "wx": 119, "wy": 190},
+    {"from_map": "geffen", "to_map": "gef_fild09", "wx": 119, "wy": 20},
+    {"from_map": "payon", "to_map": "pay_fild08", "wx": 15, "wy": 150},
+    {"from_map": "pay_fild08", "to_map": "payon", "wx": 370, "wy": 150},
+    {"from_map": "pay_fild08", "to_map": "pay_fild07", "wx": 190, "wy": 15},
+    {"from_map": "pay_fild07", "to_map": "pay_fild08", "wx": 190, "wy": 380},
+    {"from_map": "payon", "to_map": "pay_fild01", "wx": 159, "wy": 15},
+    {"from_map": "pay_fild01", "to_map": "payon", "wx": 159, "wy": 380},
+    {"from_map": "pay_fild01", "to_map": "pay_fild02", "wx": 15, "wy": 200},
+    {"from_map": "pay_fild02", "to_map": "pay_fild01", "wx": 380, "wy": 200},
+    {"from_map": "payon", "to_map": "pay_arche", "wx": 156, "wy": 230},
+    {"from_map": "pay_arche", "to_map": "payon", "wx": 35, "wy": 130},
+    {"from_map": "pay_arche", "to_map": "pay_dun00", "wx": 48, "wy": 137},
+    {"from_map": "pay_dun00", "to_map": "pay_arche", "wx": 18, "wy": 170},
+    {"from_map": "pay_dun00", "to_map": "pay_dun01", "wx": 20, "wy": 15},
+    {"from_map": "pay_dun01", "to_map": "pay_dun00", "wx": 20, "wy": 280},
+    {"from_map": "pay_dun01", "to_map": "pay_dun02", "wx": 280, "wy": 20},
+    {"from_map": "alberta", "to_map": "pay_fild03", "wx": 28, "wy": 234},
+    {"from_map": "pay_fild03", "to_map": "alberta", "wx": 380, "wy": 234},
+    {"from_map": "morocc", "to_map": "moc_fild07", "wx": 156, "wy": 290},
+    {"from_map": "moc_fild07", "to_map": "morocc", "wx": 156, "wy": 15},
+    {"from_map": "moc_fild07", "to_map": "moc_fild18", "wx": 180, "wy": 15},
+    {"from_map": "moc_fild18", "to_map": "moc_fild07", "wx": 180, "wy": 380},
+    {"from_map": "morocc", "to_map": "moc_pryd01", "wx": 35, "wy": 175},
+    {"from_map": "moc_pryd01", "to_map": "morocc", "wx": 190, "wy": 12}
+  ],
+  "aliases": {
+    "pé grande": "pay_fild07",
+    "pe grande": "pay_fild07",
+    "big foot": "pay_fild07",
+    "salgueiro ancião": "pay_fild08",
+    "salgueiro anciao": "pay_fild08",
+    "elder willow": "pay_fild08",
+    "esporo": "pay_fild08",
+    "spore": "pay_fild08",
+    "lobo": "pay_fild02",
+    "wolf": "pay_fild02",
+    "escorpião": "moc_fild18",
+    "escorpiao": "moc_fild18",
+    "scorpion": "moc_fild18",
+    "orc": "gef_fild10",
+    "vila dos orcs": "gef_fild10",
+    "orc warrior": "gef_fild10",
+    "poring": "prt_fild08",
+    "fabre": "prt_fild08",
+    "pupa": "prt_fild08",
+    "lunático": "prt_fild08",
+    "lunatico": "prt_fild08",
+    "zumbi": "pay_dun00",
+    "esqueleto": "pay_dun00",
+    "caverna de payon": "pay_dun00",
+    "pirâmide": "moc_pryd01",
+    "piramide": "moc_pryd01"
+  },
+  "world_map_grid": [
+    {
+      "map": "aldebaran",
+      "name": "Al De Baran",
+      "u_min": 0.35, "u_max": 0.50,
+      "v_min": 0.08, "v_max": 0.22,
+      "mobs": "Clock, Punk"
+    },
+    {
+      "map": "yuno",
+      "name": "Yuno",
+      "u_min": 0.18, "u_max": 0.35,
+      "v_min": 0.06, "v_max": 0.20,
+      "mobs": "Bode, Harpia"
+    },
+    {
+      "map": "geffen",
+      "name": "Geffen",
+      "u_min": 0.18, "u_max": 0.35,
+      "v_min": 0.30, "v_max": 0.46,
+      "mobs": "Esporo Venenoso, Kobold"
+    },
+    {
+      "map": "gef_fild10",
+      "name": "Vila dos Orcs (gef_fild10)",
+      "u_min": 0.14, "u_max": 0.30,
+      "v_min": 0.46, "v_max": 0.62,
+      "mobs": "Orc Guerreiro, Orc Fêmea"
+    },
+    {
+      "map": "prontera",
+      "name": "Prontera",
+      "u_min": 0.38, "u_max": 0.56,
+      "v_min": 0.32, "v_max": 0.50,
+      "mobs": "Poring, Lunático, Fabre"
+    },
+    {
+      "map": "prt_fild08",
+      "name": "Campo de Prontera 08",
+      "u_min": 0.56, "u_max": 0.68,
+      "v_min": 0.36, "v_max": 0.50,
+      "mobs": "Poring, Fabre, Pupa"
+    },
+    {
+      "map": "izlude",
+      "name": "Izlude",
+      "u_min": 0.68, "u_max": 0.82,
+      "v_min": 0.38, "v_max": 0.52,
+      "mobs": "Marin, Poring"
+    },
+    {
+      "map": "payon",
+      "name": "Payon",
+      "u_min": 0.60, "u_max": 0.74,
+      "v_min": 0.52, "v_max": 0.66,
+      "mobs": "Esporo, Salgueiro"
+    },
+    {
+      "map": "pay_fild08",
+      "name": "Campo de Payon 08 (Salgueiro Ancião)",
+      "u_min": 0.72, "u_max": 0.84,
+      "v_min": 0.52, "v_max": 0.66,
+      "mobs": "Salgueiro Ancião, Esporo"
+    },
+    {
+      "map": "pay_fild07",
+      "name": "Campo de Payon 07 (Pé Grande)",
+      "u_min": 0.68, "u_max": 0.82,
+      "v_min": 0.66, "v_max": 0.80,
+      "mobs": "Pé Grande"
+    },
+    {
+      "map": "pay_fild02",
+      "name": "Campo de Payon 02 (Lobos)",
+      "u_min": 0.54, "u_max": 0.66,
+      "v_min": 0.52, "v_max": 0.66,
+      "mobs": "Lobo"
+    },
+    {
+      "map": "pay_dun00",
+      "name": "Caverna de Payon (pay_dun00)",
+      "u_min": 0.56, "u_max": 0.68,
+      "v_min": 0.42, "v_max": 0.54,
+      "mobs": "Zumbi, Esqueleto, Faminto"
+    },
+    {
+      "map": "morocc",
+      "name": "Morroc",
+      "u_min": 0.30, "u_max": 0.48,
+      "v_min": 0.66, "v_max": 0.82,
+      "mobs": "Lobo do Deserto"
+    },
+    {
+      "map": "moc_fild18",
+      "name": "Campo de Morroc 18 (Escorpiões)",
+      "u_min": 0.30, "u_max": 0.46,
+      "v_min": 0.82, "v_max": 0.96,
+      "mobs": "Escorpião"
+    },
+    {
+      "map": "alberta",
+      "name": "Alberta",
+      "u_min": 0.80, "u_max": 0.94,
+      "v_min": 0.68, "v_max": 0.86,
+      "mobs": "Picky, Marin"
+    }
+  ]
+}

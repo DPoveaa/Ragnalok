@@ -1,0 +1,37 @@
+{
+  "tier1_items": [
+    "carta",
+    "card",
+    "velha caixa azul",
+    "velha caixa roxa",
+    "álbum de cartas de fotos",
+    "oridecon",
+    "elunium"
+  ],
+  "tier3_items": [
+    "jellopy",
+    "felpa",
+    "pluma",
+    "trevo",
+    "casca",
+    "garrafa vazia"
+  ],
+  "tier3_max_weight_pct": 55,
+  "hud_pause_on_drawer": true,
+  "hud_pause_on_click": true,
+  "survival_enabled": true,
+  "survival_seek_portal": true,
+  "survival_auto_respawn": true,
+  "auto_store_kafra": true,
+  "kafra_trigger_weight_pct": 75,
+  "kafra_trigger_slots": 88,
+  "kafra_pin": "6996",
+  "keep_in_bag": [
+    "Asa de Mosca",
+    "Asa de Borboleta"
+  ],
+  "restock_items": {},
+  "survival_hp_pct": 90,
+  "survival_resume_pct": 100,
+  "survival_danger_radius": 8
+}

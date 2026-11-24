@@ -1,6 +1,6 @@
 """Server-to-client rAthena packets, TCP reassembly and world snapshots."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -14,9 +14,41 @@ DEFAULT_LENGTHS = Path(__file__).with_name("rathena-lengths.txt")
 DEFAULT_GRF = Path("D:/Jogos/Ragnarok/data.grf")
 MAX_BUFFER = 1 << 20
 MASK = 0xFFFFFFFF
+NPC_NAMES_PATH = Path(__file__).with_name("npc_names_cache.json")
+KAFRA_JOBS = frozenset((*range(112, 118), 423, 581, 721, 859, 860, 861, 10242))
+EDEN_JOBS = {951: "Mestre do Éden", 952: "Oficial do Éden", 953: "Guarda do Éden"}
+NPC_JOB_NAMES = {**dict.fromkeys(KAFRA_JOBS, "Kafra"), **EDEN_JOBS}
+EDEN_NPC_NAMES = {("moc_para01", 25, 35, 469): "Instrutora Boya",
+                  ("moc_para01", 23, 35, 468): "Instrutor Ur"}
+
+# Destino, início dos registros, tamanho do registro e largura do ID de item.
+ITEM_LISTS = {
+    0x0991: (0, 4, 24, 2), 0x0992: (0, 4, 31, 2), 0x0A0D: (0, 4, 57, 2),
+    0x0995: (2, 28, 24, 2), 0x0996: (2, 28, 31, 2), 0x0A10: (2, 28, 57, 2),
+    0x0B09: (None, 5, 34, 4), 0x0B0A: (None, 5, 67, 4), 0x0B39: (None, 5, 68, 4),
+}
+EQUIP_LISTS = {0x0992, 0x0A0D, 0x0996, 0x0A10, 0x0B0A, 0x0B39}
+
+
+def inventory_tab(item_type, favorite=False):
+    if favorite:
+        return 3
+    if item_type in (0, 2, 11, 18):
+        return 0
+    if item_type in (4, 5, 8, 10, 12):
+        return 1
+    return 2
+
+
 ACCEPT = {0x0073, 0x02EB, 0x0A18}
 MAP_TRANSFER = {0x0092, 0x0AC7}
 FLOOR = {0x009D, 0x009E, 0x084A, 0x084B, 0x0ADD, 0x0B14, 0x0B15}
+# Bytes depois de result e tamanho do layout com IDs de 32 bits.
+# 0x02C9 é ZC_PARTY_CONFIG, sem campos de coleta.
+PICKUP_ACK = {
+    0x00A0: (0, 33), 0x029A: (4, 37), 0x02D4: (6, 39),
+    0x0990: (6, 41), 0x0A0C: (31, 66), 0x0A37: (34, 69), 0x0B41: (36, 70),
+}
 UNIT = {
     0x0078: "idle", 0x007B: "walk",
     0x02EC: "walk", 0x02ED: "spawn", 0x02EE: "idle",
@@ -28,8 +60,21 @@ UNIT = {
     0x0AFD: "walk", 0x0AFE: "spawn", 0x0AFF: "idle",
 }
 KNOWN_PACKET_SIZES = {
+    0x0080: 7,
+    0x008A: 29,
+    0x0091: 22,
+    0x02E1: 33,
+    0x08C8: 34,
     0x0088: 10,
     0x00B0: 8,
+    0x00B1: 8,
+    0x0ACB: 12,
+    0x00AF: 6, 0x07FA: 8,
+    0x00F0: 3, 0x00F2: 6, 0x00F6: 8, 0x00F8: 2,
+    0x0B44: 58, 0x0908: 5, 0x0999: 11, 0x099A: 9,
+    0x0B08: -1, 0x0B0B: 4,
+    0x0A0F: -1,  # lista de equipamentos do carrinho
+    **dict.fromkeys(ITEM_LISTS, -1),
     0x0BC9: 10,
     0x0B14: 21,
     0x0B15: 21,
@@ -59,6 +104,7 @@ KNOWN_PACKET_SIZES = {
 KNOWN_SYNC_OPCODES = (
     ACCEPT
     | MAP_TRANSFER
+    | PICKUP_ACK.keys()
     | FLOOR
     | set(UNIT.keys())
     | set(KNOWN_PACKET_SIZES.keys())
@@ -67,6 +113,8 @@ KNOWN_SYNC_OPCODES = (
         0x00B4, 0x00B5, 0x00B6, 0x00B7, 0x011C,
         0x01FF, 0x0283, 0x0295, 0x02E1, 0x08C8, 0x09DF, 0x0B18,
         0x0095, 0x0195, 0x0136, 0x0137, 0x00D7, 0x00D8,
+        0x00FE, 0x02C6, 0x00E5, 0x01F4, 0x0207,  # Convites modais (Party, Troca, Amizade)
+        0x013E, 0x07FB,                          # ZC_USESKILL_ACK / ZC_USE_SKILL2
     }
 )
 
@@ -415,6 +463,11 @@ class Entity:
     is_hostile_now: bool = False
     consecutive_approaches: int = 0
     last_player_dist: float = 999.0
+    last_attacker_gid: int | None = None
+    engaged_by_other_until: float = 0.0
+    ignore_until: float = 0.0
+    public_at: float = 0.0
+    unreachable_until: float = 0.0
 
 
 class World:
@@ -433,11 +486,23 @@ class World:
         self.mobs_damaged_by_me = {}
         self.mobs_damaged_by_others = {}
         self.other_players = {}
+        self.last_invite_popup_ts = 0.0
+        self.locked_combat_mob_gid = None
+        self.other_player_kills = []
         self.players = {}
         self.entity_names = {}   # aid -> str (nome real do NPC/player)
+        try:
+            cached = json.loads(NPC_NAMES_PATH.read_text(encoding="utf-8"))
+            self.npc_names = {
+                key: {cell: name for cell, name in value.items() if isinstance(name, str) and name.strip()}
+                for key, value in cached.get("by_job", {}).items() if isinstance(value, dict)
+            }
+        except (OSError, ValueError, AttributeError):
+            self.npc_names = {}
         self.vending_aids = set()  # aids com loja de venda ativa
         self.patrol_npc_blocked_cells = {}
         self.recent_dead_mobs = []
+        self.learned_hostile_mobs = set()
         self.recent_drop_gids = {}
         self.recent_picked_items = []
         self.recent_seen_drops = []
@@ -494,6 +559,127 @@ class World:
             new_track.weight = self.player_weight
             new_track.max_weight = self.player_max_weight
         self.player = new_track
+        self._sync_player_status()
+
+    def _sync_player_status(self):
+        if self.player is not None:
+            self.player.gid = self.player_id
+            self.player.hp = self.player_hp
+            self.player.max_hp = self.player_max_hp
+            self.player.is_dead = self.player_is_dead
+            self.player.is_sitting = self.player_is_sitting
+            self.player.zeny = self.player_zeny
+            self.player.zeny_known = self.zeny_known
+
+    def _set_player_zeny(self, value):
+        self.player_zeny = int(value)
+        self.zeny_known = True
+        self._sync_player_status()
+
+    def npc_name(self, aid, job, cell, map_id):
+        x, y = map(int, cell)
+        key = f"{map_id},{x},{y}"
+        return (self.entity_names.get(aid)
+                or self.npc_names.get(str(job), {}).get(key)
+                or EDEN_NPC_NAMES.get((map_id, x, y, job))
+                or NPC_JOB_NAMES.get(job))
+
+    def _remember_npc_name(self, aid, name):
+        npc = self.entities.get(("npc", aid))
+        if not self.map or npc is None:
+            return
+        x, y = map(int, npc.track.target)
+        key = f"{self.map},{x},{y}"
+        job_cache = self.npc_names.setdefault(str(npc.catalog_id), {})
+        if job_cache.get(key) == name:
+            return
+        job_cache[key] = name
+        temporary = NPC_NAMES_PATH.with_suffix(".tmp")
+        try:
+            temporary.write_text(json.dumps({"by_job": self.npc_names, "base": NPC_JOB_NAMES},
+                                            ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(NPC_NAMES_PATH)
+        except OSError as exc:
+            print(f"[Feed] Falha ao salvar nomes de NPCs: {exc}", flush=True)
+
+    def _read_item_list(self, opcode, data):
+        destination, start, stride, width = ITEM_LISTS[opcode]
+        modern = destination is None
+        if len(data) < start:
+            return
+        if modern:
+            destination = data[4]
+        if destination not in (0, 2):
+            return
+        target = self.inventory if destination == 0 else self.storage_items
+        equipped = opcode in EQUIP_LISTS
+        legacy_stride = stride - 10  # ITID e quatro cartões de 16 bits
+        sizes = [(stride, width)]
+        if modern:
+            sizes.append((legacy_stride, 2))
+        items = None
+        for size, id_width in sizes:
+            if (len(data) - start) % size:
+                continue
+            rows = {}
+            for offset in range(start, len(data), size):
+                index = u16(data, offset)
+                name_id = (u32 if id_width == 4 else u16)(data, offset + 2)
+                type_at = offset + 2 + id_width
+                item_type = data[type_at]
+                count = 1 if equipped else u16(data, type_at + 1)
+                worn = equipped and bool(u32(data, type_at + 5))
+                flags = data[offset + size - 1]
+                tab = inventory_tab(item_type, flags & (4 if equipped else 2))
+                if index < (2 if destination == 0 else 1) or index in rows or not name_id or not count or item_type > 30:
+                    break
+                rows[index] = (name_id, count, tab, worn)
+            else:
+                if items is not None and items != rows:
+                    if destination == 0:
+                        self.inventory_list_valid = self.inventory_ready = False
+                        self.inventory_synced = False
+                    return
+                items = rows
+        if items is not None:
+            if not modern:
+                group = (destination, equipped)
+                for index in self.legacy_item_indices.get(group, ()):
+                    target.pop(index, None)
+                self.legacy_item_indices[group] = items.keys()
+                if destination == 0:
+                    self.inventory_ready = True
+            target.update(items)
+            if destination == 0:
+                self.inventory_slots = {index: item[1] for index, item in target.items()}
+                if not self.inventory_list_open:
+                    self.inventory_synced = True
+                    self.inventory_pickup_blocked = False
+        elif destination == 0:
+            self.inventory_list_valid = self.inventory_ready = False
+            self.inventory_synced = False
+
+    @property
+    def estimated_slots_used(self) -> int:
+        occupied = len(self.inventory_slots)
+        if self.inventory_synced:
+            return occupied
+        return max(occupied, max(0, self.highest_inv_index - 1))
+
+    @staticmethod
+    def _decrement_item(items, index, count):
+        item = items.get(index)
+        if item and 0 < count < item[1]:
+            items[index] = (item[0], item[1] - count, item[2], item[3])
+        elif item and count >= item[1]:
+            del items[index]
+
+    def _mark_player_dead(self):
+        if not self.player_is_dead:
+            self.last_player_death_ts = time.monotonic()
+        self.player_is_dead = True
+        self.player_is_sitting = False
+        self._sync_player_status()
 
     def _sync_heatmap_map(self):
         clean_map = str(self.map or "").lower().removesuffix(".gat").removesuffix(".rsw").strip()
@@ -618,6 +804,7 @@ class World:
                 "weight": w,
                 "max_weight": mw,
                 "weight_ratio": w_ratio,
+                "estimated_slots_used": self.estimated_slots_used,
                 "npc_dialog": dict(self.npc_dialog),
                 "server": self.active_server,
                 "port": self.active_port,
@@ -649,13 +836,37 @@ class World:
     def reset(self, preserve_transfer=False):
         with self.lock:
             if not preserve_transfer:
+                self.player_zeny = None
+                self.zeny_known: bool = False
+                self.inventory = {}
+                self.inventory_ready = False
+                self.inventory_list_valid = False
+                self.inventory_list_open = False
+                self.inventory_slots: dict[int, int] = {}
+                self.inventory_synced = False
+                self.highest_inv_index = 0
+                self.inventory_pickup_blocked = False
+                self.legacy_item_indices = {}
                 self.next_map = None
+                self.learned_hostile_mobs.clear()
+                self.last_player_death_ts = 0.0
+                self.last_map_warp_ts = 0.0
+                self.last_map_warp = None
             self.map = self.next_map or self.initial_map
             self.current_map = f"{self.map}.gat" if self.map else None
             self.player = None
+            self.storage_capacity = None
+            self.storage_items = {}
             self.player_id = None
             self.player_hp = 0
             self.player_max_hp = 0
+            self.player_is_dead = False
+            self.player_is_sitting = False
+            self.last_player_damage_ts = 0.0
+            self.last_player_aggro_ts = 0.0
+            self.last_player_attacker_gid = None
+            self.pending_pickup = None
+            self.farm_target_gid = None
             self.player_sp = 0
             self.player_max_sp = 0
             self.entities = {}
@@ -724,13 +935,9 @@ class World:
             # Atualiza posse de drops expirados após 12 segundos (fim da proteção)
             updated = {}
             for key, entity in self.entities.items():
-                if entity.kind == "drop" and entity.ownership == "LOCKED":
-                    if now - entity.created_at >= 12.0:
-                        entity = Entity(
-                            entity.kind, entity.catalog_id, entity.track,
-                            entity.amount, entity.speed, ownership="FREE",
-                            created_at=entity.created_at
-                        )
+                if entity.kind == "drop":
+                    if entity.ownership == "LOCKED" and now >= (entity.public_at or entity.created_at + 12.0):
+                        entity = replace(entity, ownership="FREE", public_at=0.0, ignore_until=0.0)
                 updated[key] = entity
             self.entities = updated
             return self.map, self.player, tuple(self.entities.items())
@@ -783,7 +990,7 @@ class World:
                 ent = self.entities[key]
                 self.entities[key] = Entity(
                     ent.kind, ent.catalog_id, ent.track, ent.amount, ent.speed,
-                    ownership="LOCKED", created_at=now
+                    ownership="LOCKED", created_at=now, public_at=now + 12.0
                 )
 
     def mark_nearest_drop_locked(self):
@@ -805,14 +1012,19 @@ class World:
             # Marca como LOCKED com tempo ajustado para durar 10s adicionais
             self.entities[nearest_key] = Entity(
                 ent.kind, ent.catalog_id, ent.track, ent.amount, ent.speed,
-                ownership="LOCKED", created_at=now - 2.0
+                ownership="LOCKED", created_at=now - 2.0, public_at=now + 12.0
             )
 
     def _apply(self, opcode, data):
         if opcode == 0x0283:
             self.player_id = u32(data, 2)
+            self._sync_player_status()
         elif opcode in ACCEPT:
             self.entities.clear()
+            self.entity_names.clear()
+            self.aid_to_gid.clear()
+            self.storage_capacity = None
+            self.storage_items.clear()
             self.npc_dialog["open"] = False
             self.npc_dialog["type"] = "closed"
             self.npc_dialog["options"] = []
@@ -832,7 +1044,7 @@ class World:
             name = map_name(raw_name)
             prev_map = self.map
             prev_pos = self.player.cell() if self.player else None
-            if prev_map and name and prev_map != name and prev_pos:
+            if prev_map and name and prev_map != name and prev_pos and not self.player_is_dead:
                 try:
                     from rathena_terrain import save_learned_warp
                     save_learned_warp(prev_map, int(round(prev_pos[0])), int(round(prev_pos[1])), name)
@@ -840,7 +1052,27 @@ class World:
                     pass
             self.map = name
             self.current_map = f"{name}.gat" if name else None
+            if name:
+                self.last_map_warp = name
+                self.last_map_warp_ts = time.monotonic()
+                self.player_is_dead = False
+                self.player_is_sitting = False
+                self.last_player_damage_ts = 0.0
+                self.last_player_aggro_ts = 0.0
+                self.last_player_attacker_gid = None
+                self._sync_player_status()
+            self.pending_pickup = None
+            self.farm_target_gid = None
+            self.recent_dead_mobs.clear()
+            self.other_player_kills.clear()
+            self.mobs_damaged_by_me.clear()
+            self.mobs_damaged_by_others.clear()
+            self.locked_combat_mob_gid = None
             self.entities.clear()
+            self.entity_names.clear()
+            self.aid_to_gid.clear()
+            self.storage_capacity = None
+            self.storage_items.clear()
             self.npc_dialog["open"] = False
             self.npc_dialog["type"] = "closed"
             self.npc_dialog["options"] = []
@@ -912,6 +1144,8 @@ class World:
             self.npc_dialog["text"] = accum_text
             self.npc_dialog["last_ts"] = now_perf
             self.npc_dialog["last_update"] = time.monotonic()
+            self.npc_dialog["text_ts"] = self.npc_dialog["last_update"]
+            self.npc_dialog["text_npc_gid"] = npc_gid
         elif opcode == 0x00B5:  # ZC_WAIT_DIALOG (next)
             npc_gid = struct.unpack_from("<I", data, 2)[0] if len(data) >= 6 else 0
             now_perf = time.perf_counter()
@@ -969,6 +1203,7 @@ class World:
                 y1 = ((b[3] & 0x03) << 8) | b[4]
                 cells = ((x0, y0), (x1, y1))
                 now = time.perf_counter()
+                self.player_is_sitting = False
                 self._set_player_track(Track.walking(cells, self.player_speed, now, gat=self.get_gat()))
                 if self.on_player_move_callback is not None:
                     try:
@@ -999,31 +1234,39 @@ class World:
                 for k in ("mob", "npc", "warp"):
                     ent = self.entities.get((k, target_id)) or self.entities.get((k, aid))
                     if ent:
-                        self.entities[k, target_id] = Entity(
-                            ent.kind, ent.catalog_id, stopped, amount=ent.amount,
-                            speed=ent.speed, ownership=ent.ownership, created_at=ent.created_at,
-                            is_aggro=ent.is_aggro, last_aggro_ts=ent.last_aggro_ts,
-                            is_hostile_now=ent.is_hostile_now,
-                            consecutive_approaches=ent.consecutive_approaches,
-                            last_player_dist=ent.last_player_dist
-                        )
+                        self.entities[k, target_id] = replace(ent, track=stopped)
                         break
 
                 if aid in self.other_players:
                     self.other_players[aid] = ((x, y), time.monotonic())
                 if target_id in self.other_players:
                     self.other_players[target_id] = ((x, y), time.monotonic())
-        elif opcode == 0x00B0:  # ZC_PAR_CHANGE
+        elif opcode == 0x0ACB:  # ZC_LONGLONGPAR_CHANGE
+            if len(data) >= 12:
+                var_id, value = struct.unpack_from("<HQ", data, 2)
+                if var_id == 20:
+                    self._set_player_zeny(value)
+        elif opcode in (0x00B0, 0x00B1):  # ZC_PAR_CHANGE / ZC_LONGPAR_CHANGE
             if len(data) >= 8:
                 var_id, value = struct.unpack_from("<HI", data, 2)
-                if var_id == 0 and 50 <= value <= 1000:
+                if var_id == 20:
+                    self._set_player_zeny(value)
+                elif var_id == 0 and 50 <= value <= 1000:
                     self.player_speed = float(value)
                     if self.player is not None:
                         self.player.speed_ms = float(value)
                 elif var_id == 5:
+                    if value < self.player_hp:
+                        self.last_player_damage_ts = time.monotonic()
                     self.player_hp = int(value)
+                    if value == 0:
+                        self._mark_player_dead()
+                    else:
+                        self.player_is_dead = False
+                        self._sync_player_status()
                 elif var_id == 6:
                     self.player_max_hp = int(value)
+                    self._sync_player_status()
                 elif var_id == 7:
                     self.player_sp = int(value)
                 elif var_id == 8:
@@ -1032,25 +1275,25 @@ class World:
                     val = int(value)
                     self.player_base_level = val
                     if self.player is None:
-                        self.player = Track.stationary((0, 0))
+                        self._set_player_track(Track.stationary((0, 0)))
                     self.player.base_level = val
                 elif var_id == 55:
                     val = int(value)
                     self.player_job_level = val
                     if self.player is None:
-                        self.player = Track.stationary((0, 0))
+                        self._set_player_track(Track.stationary((0, 0)))
                     self.player.job_level = val
                 elif var_id == 24:
                     val = int(value)
                     self.player_weight = val
                     if self.player is None:
-                        self.player = Track.stationary((0, 0))
+                        self._set_player_track(Track.stationary((0, 0)))
                     self.player.weight = val
                 elif var_id == 25:
                     val = max(1, int(value))
                     self.player_max_weight = val
                     if self.player is None:
-                        self.player = Track.stationary((0, 0))
+                        self._set_player_track(Track.stationary((0, 0)))
                     self.player.max_weight = val
         elif opcode == 0x0086:
             if len(data) >= 11:
@@ -1058,50 +1301,89 @@ class World:
                 target_id = self.aid_to_gid.get(aid, aid)
                 if mob := (self.entities.get(("mob", target_id)) or self.entities.get(("mob", aid))):
                     track = Track.walking(movement(data, 6), mob.speed, time.perf_counter() - 0.035, gat=self.get_gat())
-                    self.entities["mob", target_id] = Entity(
-                        "mob", mob.catalog_id, track, speed=mob.speed,
-                        ownership=mob.ownership, created_at=mob.created_at,
-                        is_aggro=mob.is_aggro, last_aggro_ts=mob.last_aggro_ts,
-                        is_hostile_now=mob.is_hostile_now,
-                        consecutive_approaches=mob.consecutive_approaches,
-                        last_player_dist=mob.last_player_dist
-                    )
-        elif opcode in (0x008A, 0x08C8, 0x02E1):  # ZC_NOTIFY_ACT (ataques/dano)
+                    self.entities["mob", target_id] = replace(mob, track=track)
+        elif opcode in (0x00FE, 0x02C6, 0x00E5, 0x01F4, 0x0207):
+            self.last_invite_popup_ts = time.monotonic()
+        elif opcode in (0x008A, 0x08C8, 0x02E1, 0x013E, 0x07FB):  # ZC_NOTIFY_ACT / ZC_USESKILL (ataques/dano/skills)
             if len(data) >= 10:
                 src_id = u32(data, 2)
                 dst_id = u32(data, 6)
                 real_dst = self.aid_to_gid.get(dst_id, dst_id)
+                real_src = self.aid_to_gid.get(src_id, src_id)
                 now = time.monotonic()
                 if self.player_id is None:
                     if src_id not in self.other_players and (("mob", real_dst) in self.entities or ("mob", dst_id) in self.entities):
                         self.player_id = src_id
-                if self.player_id is not None and src_id == self.player_id:
+                        self._sync_player_status()
+                p_aid = getattr(self.player, "aid", None) or self.player_id
+                is_src_player = (p_aid and (src_id == p_aid or real_src == p_aid)) or (self.player_id and (src_id == self.player_id or real_src == self.player_id))
+                is_dst_player = (p_aid and (dst_id == p_aid or real_dst == p_aid)) or (self.player_id and (dst_id == self.player_id or real_dst == self.player_id))
+
+                if opcode in (0x008A, 0x02E1, 0x08C8) and len(data) >= KNOWN_PACKET_SIZES[opcode]:
+                    action_offset = {0x008A: 26, 0x02E1: 28, 0x08C8: 29}[opcode]
+                    action = data[action_offset]
+                    if action in (2, 3):  # DMG_SIT_DOWN / DMG_STAND_UP
+                        if is_src_player and not self.player_is_dead:
+                            self.player_is_sitting = action == 2
+                            self._sync_player_status()
+                        return
+                    if is_dst_player and (opcode != 0x08C8 or data[26] == 0):
+                        damage_format = "<h" if opcode == 0x008A else "<i"
+                        damage = struct.unpack_from(damage_format, data, 22)[0]
+                        damage2 = struct.unpack_from(damage_format, data, action_offset + 1)[0]
+                        if damage > 0 or damage2 > 0:
+                            self.last_player_damage_ts = now
+
+                # Registra mob.last_attacker_gid quando dst_gid for monstro ativo
+                mob_ent = self.entities.get(("mob", real_dst)) or self.entities.get(("mob", dst_id))
+                mob_gid = real_dst if ("mob", real_dst) in self.entities else dst_id
+                if mob_ent is not None:
+                    try:
+                        mob_ent.last_attacker_gid = real_src if real_src else src_id
+                    except Exception:
+                        pass
+
+                if is_src_player:
                     self.mobs_damaged_by_me[real_dst] = now
                     self.mobs_damaged_by_me[dst_id] = now
-                elif src_id in self.other_players and src_id != self.player_id:
+                    if mob_ent is not None:
+                        self.locked_combat_mob_gid = mob_gid
+                elif not is_src_player and mob_ent is not None:
+                    # Outro player atacando mob que não é o combat mob travado
+                    if mob_gid != getattr(self, "locked_combat_mob_gid", None):
+                        try:
+                            mob_ent.engaged_by_other_until = now + 8.0
+                        except Exception:
+                            pass
                     self.mobs_damaged_by_others[real_dst] = now
                     self.mobs_damaged_by_others[dst_id] = now
 
-                # Marca aggro se o alvo for o jogador (target_aid == player.aid / player_id)
-                p_aid = getattr(self.player, "aid", None) or self.player_id
-                if (p_aid and (dst_id == p_aid or real_dst == p_aid)) or (self.player_id and (dst_id == self.player_id or real_dst == self.player_id)):
-                    mob_ent = self.entities.get(("mob", src_id)) or self.entities.get(("mob", self.aid_to_gid.get(src_id, src_id)))
-                    if mob_ent is not None:
+                # Marca aggro e locked_combat_mob_gid se o alvo for o jogador
+                if is_dst_player:
+                    src_mob_ent = self.entities.get(("mob", real_src)) or self.entities.get(("mob", src_id))
+                    src_mob_gid = real_src if ("mob", real_src) in self.entities else src_id
+                    if src_mob_ent is not None:
+                        if self.locked_combat_mob_gid is None:
+                            self.locked_combat_mob_gid = src_mob_gid
+                        if opcode in (0x008A, 0x02E1, 0x08C8):
+                            self.last_player_aggro_ts = now
+                            self.last_player_attacker_gid = src_mob_gid
+                            self.learned_hostile_mobs.add(src_mob_ent.catalog_id)
                         try:
-                            mob_ent.is_aggro = True
-                            mob_ent.is_hostile_now = True
-                            mob_ent.last_aggro_ts = now
+                            src_mob_ent.is_aggro = True
+                            src_mob_ent.is_hostile_now = True
+                            src_mob_ent.last_aggro_ts = now
                         except Exception:
                             pass
         elif opcode in (0x008E, 0x0295, 0x09DF):  # Chat / mensagens do servidor
             try:
                 text = data[2:].decode("cp1252", errors="ignore").lower()
-                triggers = ("não pode", "outro jogador", "cannot pick", "someone else", "pertence", "bloqueado")
+                triggers = ("outro jogador", "someone else", "pertence")
                 if any(w in text for w in triggers):
                     self.mark_nearest_drop_locked()
             except Exception:
                 pass
-        elif opcode == 0x0095:  # ZC_ACK_REQNAME (30 bytes: opcode u16 + aid u32 + name 24s)
+        elif opcode in (0x0095, 0x0195):  # ZC_ACK_REQNAME / ZC_ACK_REQNAMEALL
             if len(data) >= 30:
                 aid_name = u32(data, 2)
                 raw = data[6:30].split(b"\x00", 1)[0]
@@ -1111,16 +1393,72 @@ class World:
                     name_str = raw.decode("latin1", errors="replace")
                 if name_str:
                     self.entity_names[aid_name] = name_str
-        elif opcode == 0x0195:  # ZC_ACK_REQNAMEALL (102 bytes)
-            if len(data) >= 30:
-                aid_name = u32(data, 2)
-                raw = data[6:30].split(b"\x00", 1)[0]
-                try:
-                    name_str = raw.decode("cp1252")
-                except Exception:
-                    name_str = raw.decode("latin1", errors="replace")
-                if name_str:
-                    self.entity_names[aid_name] = name_str
+                    npc_id = self.aid_to_gid.get(aid_name, aid_name)
+                    self.entity_names[npc_id] = name_str
+                    self._remember_npc_name(npc_id, name_str)
+        elif opcode in ITEM_LISTS:
+            self._read_item_list(opcode, data)
+        elif opcode == 0x0B08 and len(data) >= 5:
+            if data[4] == 0:
+                self.inventory.clear()
+                self.inventory_slots.clear()
+                self.inventory_synced = False
+                self.highest_inv_index = 0
+                self.inventory_ready = False
+                self.inventory_list_valid = True
+                self.inventory_list_open = True
+                for group in ((0, False), (0, True)):
+                    self.legacy_item_indices.pop(group, None)
+            elif data[4] == 2:
+                self.storage_items.clear()
+                self.storage_capacity = None
+        elif opcode == 0x0B0B and len(data) >= 4 and data[2] == 0:
+            self.inventory_ready = self.inventory_list_valid
+            self.inventory_list_open = False
+            self.inventory_synced = self.inventory_ready
+            if self.inventory_synced:
+                self.inventory_pickup_blocked = False
+        elif opcode == 0x00F2 and len(data) == 6:
+            self.storage_capacity = (u16(data, 2), u16(data, 4))
+        elif opcode == 0x00F8:
+            self.storage_capacity = None
+            self.storage_items.clear()
+            self.highest_inv_index = len(self.inventory_slots)
+            self.inventory_pickup_blocked = False
+        elif opcode == 0x00F6 and len(data) == 8:
+            self._decrement_item(self.storage_items, u16(data, 2), u32(data, 4))
+        elif opcode in (0x00F4, 0x01C4, 0x0A0A, 0x0B44) and len(data) >= 11:
+            # Este índice é do armazém. O débito da mochila chega em 0x07FA/0x00AF.
+            index, count = u16(data, 2), u32(data, 4)
+            wide = opcode == 0x0B44 or (opcode == 0x0A0A and len(data) >= 57)
+            name_id = (u32 if wide else u16)(data, 8)
+            item_type = 3 if opcode == 0x00F4 else data[12 if wide else 10]
+            previous = self.storage_items.get(index)
+            tab = previous[2] if previous and previous[0] == name_id else inventory_tab(item_type)
+            total = count + (previous[1] if previous and previous[0] == name_id else 0)
+            self.storage_items[index] = (name_id, total, tab, False)
+        elif opcode in (0x00AF, 0x07FA) and len(data) >= (6 if opcode == 0x00AF else 8):
+            offset = 2 if opcode == 0x00AF else 4
+            index, count = u16(data, offset), u16(data, offset + 2)
+            self._decrement_item(self.inventory, index, count)
+            if item := self.inventory.get(index):
+                self.inventory_slots[index] = item[1]
+            else:
+                self.inventory_slots.pop(index, None)
+            if count:
+                self.inventory_pickup_blocked = False
+        elif opcode in (0x0999, 0x099A, 0x0908):
+            index = u16(data, 2)
+            if item := self.inventory.get(index):
+                if opcode == 0x0908:
+                    tab = 3 if data[4] else (1 if item[3] else 2)
+                    if not data[4]:
+                        self.inventory_ready = False  # A aba anterior requer nova lista.
+                    self.inventory[index] = (*item[:2], tab, item[3])
+                elif opcode == 0x0999 and u32(data, 4):
+                    self.inventory[index] = (*item[:3], True)
+                elif opcode == 0x099A and data[-1] == 0:
+                    self.inventory[index] = (*item[:3], False)
         elif opcode == 0x0136:  # ZC_SHOW_VENDING_BOARD
             if len(data) >= 6:
                 self.vending_aids.add(u32(data, 2))
@@ -1140,24 +1478,38 @@ class World:
                 real_gid = self.aid_to_gid.get(gid, gid)
                 if opcode == 0x0080:
                     vanish_type = data[6] if len(data) >= 7 else 0
+                    player_ids = (self.player_id, getattr(self.player, "aid", None))
+                    if vanish_type == 1 and (gid in player_ids or real_gid in player_ids):
+                        self.player_hp = 0
+                        self._mark_player_dead()
                     mob = self.entities.get(("mob", real_gid)) or self.entities.get(("mob", gid))
                     if mob and vanish_type == 1:  # 1 = DEAD
                         now = time.monotonic()
-                        mob_cell = mob.track.cell(now)
+                        mob_cell = mob.track.cell()
+                        p_aid = getattr(self.player, "aid", None) or self.player_id
+                        last_att = getattr(mob, "last_attacker_gid", None)
+                        if last_att is not None and (p_aid is None or (last_att != p_aid and last_att != self.player_id)):
+                            self.other_player_kills.append((now, mob_cell[0], mob_cell[1]))
+                            for (ekind, egid), eent in self.entities.items():
+                                if ekind == "drop":
+                                    dc = eent.track.cell(now)
+                                    if math.hypot(dc[0] - mob_cell[0], dc[1] - mob_cell[1]) <= 3.0:
+                                        self.entities[ekind, egid] = replace(
+                                            eent, ownership="LOCKED", public_at=max(eent.public_at, now + 12.0)
+                                        )
+                        self.other_player_kills = [(ts, kx, ky) for ts, kx, ky in self.other_player_kills if now - ts <= 2.0]
                         by_me = (gid in self.mobs_damaged_by_me or real_gid in self.mobs_damaged_by_me) and (
                             now - self.mobs_damaged_by_me.get(real_gid, self.mobs_damaged_by_me.get(gid, 0)) < 15.0
                         )
                         by_others = (gid in self.mobs_damaged_by_others or real_gid in self.mobs_damaged_by_others) and (
                             now - self.mobs_damaged_by_others.get(real_gid, self.mobs_damaged_by_others.get(gid, 0)) < 15.0
                         )
-                        # Verifica proximidade: <= 12 células do jogador ou era alvo do jogador
-                        px_k, py_k = self.player.cell(now) if self.player else (None, None)
-                        near_player = (
-                            px_k is not None and
-                            math.hypot(mob_cell[0] - px_k, mob_cell[1] - py_k) <= 12.0
-                        ) or by_me
+                        near_player = self.player is not None and math.dist(mob_cell, self.player.cell()) <= 14
                         self.recent_dead_mobs.append({
                             "gid": real_gid,
+                            "aid": gid,
+                            "was_target": any(target in (gid, real_gid)
+                                              for target in (self.locked_combat_mob_gid, self.farm_target_gid)),
                             "catalog_id": mob.catalog_id if mob else 0,
                             "job_id": mob.catalog_id if mob else 0,
                             "cell": mob_cell,
@@ -1169,6 +1521,10 @@ class World:
                         })
                         if len(self.recent_dead_mobs) > 40:
                             self.recent_dead_mobs.pop(0)
+                    if getattr(self, "locked_combat_mob_gid", None) in (gid, real_gid):
+                        self.locked_combat_mob_gid = None
+                    if self.farm_target_gid in (gid, real_gid):
+                        self.farm_target_gid = None
                     self.other_players.pop(gid, None)
                     self.other_players.pop(real_gid, None)
                     self.players.pop(gid, None)
@@ -1194,17 +1550,37 @@ class World:
                 for k in ("mob", "npc", "warp", "drop"):
                     self.entities.pop((k, real_gid), None)
                     self.entities.pop((k, gid), None)
-        elif opcode == 0x00A0:  # ZC_ITEM_PICKUP_ACK
-            if len(data) >= 8:
-                count = struct.unpack_from("<H", data, 4)[0]
-                fail = data[-1]
-                # Suporte a nameid de 4 bytes (clientes mais novos) ou 2 bytes (legado)
-                if len(data) >= 25:
-                    nameid4 = struct.unpack_from("<I", data, 6)[0]
-                    nameid = nameid4 if 1 <= nameid4 <= 100000 else struct.unpack_from("<H", data, 6)[0]
-                else:
-                    nameid = struct.unpack_from("<H", data, 6)[0]
+        elif opcode in PICKUP_ACK:
+            trailing, wide_size = PICKUP_ACK[opcode]
+            result_offset = len(data) - trailing - 1
+            if result_offset >= 10:
+                count = u16(data, 4)
+                fail = data[result_offset]
+                nameid = u32(data, 6) if len(data) >= wide_size else u16(data, 6)
+                index = u16(data, 2)
+                if not fail and index >= 2 and nameid and count:
+                    item_type = data[result_offset - 1]
+                    previous = self.inventory.get(index)
+                    favorite = data[-5] if opcode == 0x0B41 else data[-3] if opcode == 0x0A37 else 0
+                    tab = inventory_tab(item_type, favorite)
+                    if previous and previous[0] == nameid:
+                        self.inventory[index] = (nameid, previous[1] + count, *previous[2:])
+                    else:
+                        self.inventory[index] = (nameid, count, tab, False)
+                    self.inventory_slots[index] = self.inventory[index][1]
+                    self.highest_inv_index = max(self.highest_inv_index, index)
+                elif fail in (2, 4):  # Sobrepeso ou ausência de slot, se a prevenção não disparou.
+                    self.inventory_pickup_blocked = True
                 now = time.monotonic()
+                if self.pending_pickup:
+                    gid, clicked_at = self.pending_pickup
+                    key = ("drop", gid)
+                    drop = self.entities.get(key)
+                    if (drop and now - clicked_at <= 1.2 and nameid in (0, drop.catalog_id)
+                            and self.player and math.dist(drop.track.target, self.player.cell()) <= 2.2):
+                        self.pending_pickup = None
+                        if fail:
+                            self.entities[key] = replace(drop, ownership="LOCKED", public_at=now + 12.0)
                 self.recent_picked_items.append({
                     "item_id": nameid,
                     "count": max(1, count),
@@ -1247,23 +1623,16 @@ class World:
         y = None
         cnt = 1
 
-        if opcode == 0x0ADD:
-            # Layout ZC_ITEM_FALL_ENTRY moderno (rAthena Renewal, 24 bytes):
-            #  0: opcode(2) | 2: ITAID(u32) | 6: ITID(u32) | 10: type(u16)
-            # 12: IsIdentified(B) | 13: x(u16) | 15: y(u16) | 17: subX(B) | 18: subY(B) | 19: count(u16)
-            if len(data) >= 21:
-                aid  = u32(data, 2)
-                item = u32(data, 6)
-                x    = u16(data, 13)
-                y    = u16(data, 15)
-                cnt  = u16(data, 19)
-            elif len(data) >= 17:
-                # fallback para layout parcial (sem count)
-                aid  = u32(data, 2)
-                item = u32(data, 6)
-                x    = u16(data, 13)
-                y    = u16(data, 15)
-                cnt  = 1
+        if opcode in (0x009E, 0x084B, 0x0ADD):
+            legacy_size = {0x009E: 17, 0x084B: 19, 0x0ADD: 22}[opcode]
+            if len(data) >= legacy_size:
+                wide = len(data) >= legacy_size + 2
+                pos_offset = 9 + 2 * wide + 2 * (opcode != 0x009E)
+                aid = u32(data, 2)
+                item = u32(data, 6) if wide else u16(data, 6)
+                x = u16(data, pos_offset)
+                y = u16(data, pos_offset + 2)
+                cnt = u16(data, pos_offset + 6)
 
         elif opcode in (0x0B14, 0x0B15):
             # ZC_ITEM_ENTRY / ZC_ITEM_FALL_ENTRY5 moderno: suporta 19 e 21 bytes
@@ -1283,20 +1652,15 @@ class World:
                         x, y = x19, y19
                         cnt = u16(data, 15) if len(data) >= 17 else 1
 
-        elif opcode in (0x084A, 0x084B):
+        elif opcode == 0x084A:
             if len(data) >= 14:
                 aid  = u32(data, 2)
-                item = u32(data, 6) if (opcode == 0x084A and len(data) >= 19) else u16(data, 6)
-                if opcode == 0x084B:
-                    x   = u16(data, 10)
-                    y   = u16(data, 12)
-                    cnt = u16(data, 17) if len(data) >= 19 else 1
-                else:
-                    x   = u16(data, 9)
-                    y   = u16(data, 11)
-                    cnt = u16(data, 13) if len(data) >= 15 else 1
+                item = u32(data, 6) if len(data) >= 19 else u16(data, 6)
+                x   = u16(data, 9)
+                y   = u16(data, 11)
+                cnt = u16(data, 13) if len(data) >= 15 else 1
 
-        elif opcode in (0x009D, 0x009E):
+        elif opcode == 0x009D:
             # 0x009D legacy (17 bytes) e moderno (19 bytes com ITID u32):
             #   offset 2: ITAID u32 | offset 6: ITID u32 (19b) ou u16 (17b)
             #   19 bytes: x=u16@11, y=u16@13, count=u16@15
@@ -1318,20 +1682,31 @@ class World:
                 item = u16(data, 6)
                 x    = u16(data, 9)
                 y    = u16(data, 11)
-                cnt  = u16(data, 16) if len(data) >= 18 else 1
+                cnt  = u16(data, 13) if len(data) >= 15 else 1
 
         if aid is not None:
             self.recent_drop_gids[aid] = now
 
         if aid is not None and item is not None and x is not None and y is not None:
-            px, py = self.player.cell(now) if self.player else (None, None)
-            dist = max(abs(x - px), abs(y - py)) if px is not None else 0
-            if 0 <= x < 2048 and 0 <= y < 2048 and item and (px is None or dist <= 60):
+            if 0 <= x < 2048 and 0 <= y < 2048 and item:
                 cell = (x, y)
+                current = self.entities.get(("drop", aid))
+                if current and current.catalog_id == item and current.track.target == cell:
+                    self.entities["drop", aid] = replace(current, amount=max(1, cnt))
+                    return
                 ownership = self._classify_drop(cell)
+                drop_ignore_until = 0.0
+                drop_public_at = 0.0
+                for k_ts, kx, ky in getattr(self, "other_player_kills", []):
+                    if now - k_ts <= 2.0 and math.hypot(x - kx, y - ky) <= 3.0:
+                        drop_ignore_until = now + 12.0
+                        drop_public_at = now + 12.0
+                        break
                 self.entities["drop", aid] = Entity(
                     "drop", item, Track.stationary(cell), max(1, cnt),
-                    ownership=ownership, created_at=now
+                    ownership="LOCKED" if drop_public_at > 0.0 else ownership, created_at=now,
+                    ignore_until=drop_ignore_until,
+                    public_at=drop_public_at
                 )
                 self.recent_seen_drops.append({
                     "aid": aid,
@@ -1485,6 +1860,9 @@ class World:
             is_hostile_now = old_ent.is_hostile_now if old_ent else False
             consecutive_approaches = old_ent.consecutive_approaches if old_ent else 0
             last_player_dist = old_ent.last_player_dist if old_ent else 999.0
+            last_attacker_gid = getattr(old_ent, "last_attacker_gid", None) if old_ent else None
+            engaged_by_other_until = getattr(old_ent, "engaged_by_other_until", 0.0) if old_ent else 0.0
+            ignore_until = getattr(old_ent, "ignore_until", 0.0) if old_ent else 0.0
 
             if kind == "mob":
                 now_m = time.monotonic()
@@ -1523,8 +1901,17 @@ class World:
                 is_aggro=is_aggro, last_aggro_ts=last_aggro_ts,
                 is_hostile_now=is_hostile_now,
                 consecutive_approaches=consecutive_approaches,
-                last_player_dist=last_player_dist
+                last_player_dist=last_player_dist,
+                last_attacker_gid=last_attacker_gid,
+                engaged_by_other_until=engaged_by_other_until,
+                ignore_until=ignore_until,
+                unreachable_until=old_ent.unreachable_until if old_ent else 0.0,
             )
+            if kind == "npc" and (name := self.entity_names.get(entity_id)):
+                self._remember_npc_name(entity_id, name)
+            elif kind == "npc" and gid and (name := self.entity_names.get(gid)):
+                self.entity_names[entity_id] = name
+                self._remember_npc_name(entity_id, name)
 
             # Log [MobDebug] dos primeiros 3 mobs para confirmar detecção e offset
             if kind == "mob" and self._mob_debug_count < 3:
