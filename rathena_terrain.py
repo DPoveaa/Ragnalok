@@ -299,11 +299,110 @@ class Gat:
         return None
 
 
+class PureGrfArchive:
+    """Leitor 100% Python puro (struct + zlib) para arquivos .grf (v0x200 e v0x300).
+    Elimina dependências de C/mmap e previne qualquer falha de access violation.
+    """
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.entries: dict[str, tuple[int, int, int, int, int]] = {}
+        self._parse()
+
+    def _parse(self):
+        if not self.path.is_file():
+            return
+        try:
+            with open(self.path, "rb") as f:
+                header = f.read(46)
+                if len(header) < 46:
+                    return
+                if not (header.startswith(b"Master of Magic\0") or header.startswith(b"Event Horizon\0")):
+                    return
+                version = struct.unpack_from("<I", header, 42)[0]
+                major = (version >> 8) & 0xFF
+                is_64 = (major == 3 and header[35] == header[36] == header[37] == 0)
+                if is_64:
+                    table_offset = struct.unpack_from("<q", header, 30)[0]
+                    base = 46 + table_offset + 4
+                    f.seek(base)
+                    compressed_size, uncompressed_size = struct.unpack("<II", f.read(8))
+                    raw_table = zlib.decompress(f.read(compressed_size))
+                    unpack = struct.Struct("<IIIBq").unpack_from
+                    trailer = 21
+                elif major in (2, 3):
+                    table_offset = struct.unpack_from("<I", header, 30)[0]
+                    base = 46 + table_offset
+                    f.seek(base)
+                    compressed_size, uncompressed_size = struct.unpack("<II", f.read(8))
+                    raw_table = zlib.decompress(f.read(compressed_size))
+                    unpack = struct.Struct("<IIIBI").unpack_from
+                    trailer = 17
+                else:
+                    return
+
+                pos = 0
+                l = len(raw_table)
+                find = raw_table.find
+                while pos < l:
+                    end = find(b"\0", pos)
+                    if end < 0:
+                        break
+                    name_bytes = raw_table[pos:end]
+                    pos = end + 1
+                    c, ca, u, fl, off = unpack(raw_table, pos)
+                    pos += trailer
+                    if not (fl & 0x01):
+                        continue
+                    name_str = name_bytes.decode("cp949", errors="replace").lower().replace("/", "\\")
+                    self.entries[name_str] = (off, c, ca, u, fl)
+        except Exception as exc:
+            print(f"[PureGrfArchive] Aviso ao ler GRF ({self.path}): {exc}", flush=True)
+
+    def _lookup(self, path: str):
+        norm = path.lower().replace("/", "\\").strip("\\")
+        if norm in self.entries:
+            return self.entries[norm]
+        data_norm = f"data\\{norm}"
+        if data_norm in self.entries:
+            return self.entries[data_norm]
+        if norm.startswith("data\\"):
+            sub_norm = norm[5:]
+            if sub_norm in self.entries:
+                return self.entries[sub_norm]
+        return None
+
+    def __contains__(self, path: str) -> bool:
+        return self._lookup(path) is not None
+
+    def namelist(self) -> list[str]:
+        return list(self.entries.keys())
+
+    def read(self, path: str) -> bytes:
+        entry = self._lookup(path)
+        if entry is None:
+            raise FileNotFoundError(f"{path} não encontrado no GRF {self.path}")
+        off, c, ca, u, fl = entry
+        with open(self.path, "rb") as f:
+            f.seek(46 + off)
+            raw = f.read(ca)
+            return zlib.decompress(raw[:c])
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
 class Terrain:
     def __init__(self, path="D:/Jogos/Ragnarok/data.grf", local_maps_dir="./maps"):
         self.grf_path = Path(path)
         self.local_maps_dir = Path(local_maps_dir)
         self.client_data_dir = Path("D:/Jogos/Ragnarok/data")
+        self.cache_dir = _get_base_dir() / ".gat_cache"
         self.archive = None
         self.aliases = {}
         self.cached_gats = {}
@@ -313,9 +412,8 @@ class Terrain:
 
     def _init_grf(self):
         try:
-            from ragx.grf import GrfArchive
             if self.grf_path.is_file():
-                self.archive = GrfArchive(self.grf_path)
+                self.archive = PureGrfArchive(self.grf_path)
                 if "data/resnametable.txt" in self.archive:
                     rows = self.archive.read("data/resnametable.txt").decode("cp949", errors="replace")
                     for row in rows.splitlines():
@@ -338,8 +436,9 @@ class Terrain:
         key = f"{norm_name}.gat"
         candidates = list(dict.fromkeys((key, self.aliases.get(key, key))))
 
-        # 1. Procura em arquivos .gat locais (./maps/, script_dir/maps/, D:\Jogos\Ragnarok\data\)
+        # 1. Procura em cache local (.gat_cache) e arquivos .gat locais
         search_dirs = [
+            self.cache_dir,
             self.local_maps_dir,
             Path(__file__).parent / "maps",
             self.client_data_dir,
@@ -360,12 +459,17 @@ class Terrain:
                     except Exception as exc:
                         print(f"[Terrain] Erro ao carregar .gat local {file_path}: {exc}", flush=True)
 
-        # 2. Fallback para leitura direta do .grf principal via GrfArchive (zlib)
+        # 2. Leitura direta do .grf principal via PureGrfArchive (struct + zlib)
         if self.archive is not None:
             for cand in candidates:
                 for grf_key in (f"data/{cand}", cand):
                     try:
                         data = self.archive.read(grf_key)
+                        try:
+                            self.cache_dir.mkdir(parents=True, exist_ok=True)
+                            (self.cache_dir / f"{norm_name}.gat").write_bytes(data)
+                        except Exception:
+                            pass
                         gat = Gat(data, name=norm_name)
                         self.cached_gats[norm_name] = gat
                         self.name = norm_name
@@ -383,12 +487,16 @@ class Terrain:
                 if other_grf.resolve() == self.grf_path.resolve():
                     continue
                 try:
-                    from ragx.grf import GrfArchive
-                    with GrfArchive(other_grf) as extra_arc:
+                    with PureGrfArchive(other_grf) as extra_arc:
                         for cand in candidates:
                             for grf_key in (f"data/{cand}", cand):
                                 if grf_key in extra_arc:
                                     data = extra_arc.read(grf_key)
+                                    try:
+                                        self.cache_dir.mkdir(parents=True, exist_ok=True)
+                                        (self.cache_dir / f"{norm_name}.gat").write_bytes(data)
+                                    except Exception:
+                                        pass
                                     gat = Gat(data, name=norm_name)
                                     self.cached_gats[norm_name] = gat
                                     self.name = norm_name
@@ -484,8 +592,7 @@ def _load_camera_tables(grf_path="D:/Jogos/Ragnarok/data.grf", data_dir="D:/Jogo
         if indoor_raw is not None and viewpoint_raw is not None:
             break
         try:
-            from ragx.grf import GrfArchive
-            with GrfArchive(gfile) as arc:
+            with PureGrfArchive(gfile) as arc:
                 if indoor_raw is None:
                     for k in ("data/indoorrswtable.txt", "data\\indoorrswtable.txt", "indoorrswtable.txt"):
                         if k in arc:
@@ -1383,10 +1490,9 @@ def load_item_catalog(grf_path="D:/Jogos/Ragnarok/data.grf", lua_path="D:/Jogos/
     # 2. Fallback via GRF somente se itemInfo não carregou nomes
     if not names:
         try:
-            from ragx.grf import GrfArchive
             grf_p = Path(grf_path)
             if grf_p.is_file():
-                a = GrfArchive(grf_p)
+                a = PureGrfArchive(grf_p)
                 for k in a.namelist():
                     kl = k.lower().replace("/", "\\")
                     if "idnum2itemdisplaynametable.txt" in kl and not kl.endswith(".txt.txt"):

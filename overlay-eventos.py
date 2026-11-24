@@ -4270,10 +4270,10 @@ class Overlay:
 
     def _handle_respawn(self, world, current_map, now):
         with world.lock:
-            dead = world.player_is_dead
+            dead = world.player_is_dead or (world.player_hp == 0 and world.player_max_hp > 0)
             death_ts = world.last_player_death_ts
             warp_ts = world.last_map_warp_ts
-            warped = bool(world.last_map_warp == current_map and warp_ts > death_ts)
+            warped = bool(warp_ts > death_ts)
             hp = world.player_hp
 
         if not self.filters_config["survival_auto_respawn"]:
@@ -4293,12 +4293,30 @@ class Overlay:
 
         if not self._respawn_started:
             return dead
-        if dead:
-            if now >= self._respawn_next_attempt and self._respawn_attempts < 2:
+        if dead and hp <= 0 and not warped:
+            if now >= self._respawn_next_attempt:
+                hwnd = self.get_game_hwnd()
+                if hwnd:
+                    bounds = wintypes.RECT()
+                    if u32.GetClientRect(hwnd, ctypes.byref(bounds)) and bounds.right > 0 and bounds.bottom > 0:
+                        client_w = bounds.right
+                        client_h = bounds.bottom
+                        cx = int(client_w * 0.50)
+                        cy = int(client_h * 0.608)
+                        pt = wintypes.POINT(cx, cy)
+                        if u32.ClientToScreen(hwnd, ctypes.byref(pt)):
+                            sx, sy = pt.x, pt.y
+                        else:
+                            origin = wintypes.POINT()
+                            if u32.ClientToScreen(hwnd, ctypes.byref(origin)):
+                                sx, sy = origin.x + cx, origin.y + cy
+                            else:
+                                sx, sy = cx, cy
+                        self.touch_postmsg(sx, sy, game_hwnd=hwnd)
+                        self._click_debug(f"RESSUSCITAR: Clique em Voltar ao Ponto de Retorno ({sx}, {sy}).")
                 self._send_game_key(0x0D)
-                self._click_debug("RESSUSCITAR: Enter enviado à janela de morte.")
                 self._respawn_attempts += 1
-                self._respawn_next_attempt = now + 1.2
+                self._respawn_next_attempt = now + 2.5
             return True
 
         if not warped or hp <= 0 or now < warp_ts + 1.5:
@@ -4365,30 +4383,78 @@ class Overlay:
         hwnd = self.get_game_hwnd()
         if not hwnd:
             return
+
+        now = time.monotonic()
+        # Enquanto estiver caminhando e distância até sub-alvo atual da fuga for > 3.5 células,
+        # aguarda pelo menos 650ms antes de re-clicar (corrida contínua sem stutter-step)
+        is_walking = getattr(self.feed.world, "_is_player_walking", lambda: False)() if hasattr(self.feed, "world") else False
+        last_tgt = getattr(self, "_last_retreat_target", None)
+        last_click_ts = getattr(self, "_last_retreat_click_time", 0.0)
+        if is_walking and last_tgt is not None:
+            dist_to_last = math.hypot(player_cell[0] - last_tgt[0], player_cell[1] - last_tgt[1])
+            if dist_to_last > 3.5 and (now - last_click_ts < 0.650):
+                return
+
         left, top, width, height = snapshot.viewport
         camera_cell = getattr(self.feed, "_cam", None) or player_cell
         height_fn = getattr(gat, "get_elevation", gat.height_at)
         project = self.feed.camera.projector(snapshot.viewport, camera_cell, height_fn)
-        # Restringe cada clique a um trecho reto para o cliente não cortar o desvio do A*.
-        step = path[1] if len(path) > 1 else path[0]
-        dx, dy = step[0] - path[0][0], step[1] - path[0][1]
-        segment = [step]
-        for index, cell in enumerate(path[2:5], start=2):
-            if cell != (path[0][0] + dx * index, path[0][1] + dy * index):
-                break
-            segment.append(cell)
-        for cell in reversed(segment):
-            u, v = project(*cell)
-            sx, sy = left + int(u * width), top + int(v * height)
-            if (0.05 <= u <= 0.95 and 0.05 <= v <= 0.95
-                    and not self._is_point_in_game_ui(sx, sy)
-                    and not self._is_point_in_hud(sx, sy, margin=10)):
-                self._send_click(hwnd, sx, sy)
-                return
+
+        px, py = player_cell[0], player_cell[1]
+
+        candidates = []
+        for cell in path[1:]:
+            cx, cy = cell
+            dist_p = math.hypot(cx - px, cy - py)
+            u, v = project(cx, cy)
+            if not (0.06 <= u <= 0.94 and 0.06 <= v <= 0.94):
+                continue
+            sx = left + int(u * width)
+            sy = top + int(v * height)
+            if self._is_point_in_game_ui(sx, sy) or self._is_point_in_hud(sx, sy, margin=10):
+                continue
+            candidates.append((dist_p, cell, sx, sy))
+
+        if not candidates:
+            return
+
+        # Escolhe a célula mais distante dentro de 9 a 14 células (nunca 1-4 células perto dos pés)
+        in_range = [c for c in candidates if 9.0 <= c[0] <= 14.5]
+        if in_range:
+            in_range.sort(key=lambda item: item[0], reverse=True)
+            chosen_dist, chosen_cell, sx, sy = in_range[0]
+        else:
+            beyond = [c for c in candidates if c[0] > 14.5]
+            if beyond:
+                beyond.sort(key=lambda item: item[0])
+                chosen_dist, chosen_cell, sx, sy = beyond[0]
+            else:
+                closer = [c for c in candidates if c[0] > 4.0]
+                if closer:
+                    closer.sort(key=lambda item: item[0], reverse=True)
+                    chosen_dist, chosen_cell, sx, sy = closer[0]
+                elif len(path) > 1 and math.hypot(path[-1][0] - px, path[-1][1] - py) <= 4.0:
+                    dest_cand = [c for c in candidates if c[1] == path[-1]]
+                    if dest_cand:
+                        chosen_dist, chosen_cell, sx, sy = dest_cand[0]
+                    else:
+                        return
+                else:
+                    return
+
+        self._last_retreat_target = chosen_cell
+        self._last_retreat_click_time = now
+        self.touch_postmsg(sx, sy, game_hwnd=hwnd)
+        self._click_debug(f"FUGA: Passo longo para {chosen_cell} dist={chosen_dist:.1f} tela ({sx},{sy})")
 
     def _handle_survival(self, snapshot, world, player, current_map, now, hp_pct, entities):
         cfg = self.filters_config
-        low_hp = cfg["survival_enabled"] and hp_pct < cfg["survival_hp_pct"]
+        with world.lock:
+            p_hp = world.player_hp
+            p_max_hp = world.player_max_hp
+            p_dead = world.player_is_dead
+        has_known_hp = (p_max_hp > 0 and p_hp > 0 and not p_dead)
+        low_hp = cfg["survival_enabled"] and has_known_hp and (hp_pct < cfg["survival_hp_pct"])
         if self._survival_state == SURVIVAL_RETURN and low_hp:
             if not (self.travel_plan and self.travel_plan.get("mode") == "farm"):
                 self.travel_plan = None
@@ -5167,7 +5233,7 @@ class Overlay:
         sub_step_v = None
 
         p_elev = gat.get_elevation(px, py) if hasattr(gat, "get_elevation") else 0.0
-        max_scan = min(len(self.current_patrol_path), 15)
+        max_scan = min(len(self.current_patrol_path), 20)
         candidates_forward = []
         short_patrol = roaming and math.dist((px, py), self.current_waypoint) <= 3.0
         min_step_dist = 1.0 if short_patrol else 2.2
@@ -5258,9 +5324,9 @@ class Overlay:
 
             candidates_forward.append((dist_p, cand, u, v))
 
-        # Seleciona nó preferencialmente no intervalo 10–14 células à frente
+        # Seleciona sub-passo preferencialmente no intervalo 8–13 células à frente
         if candidates_forward:
-            in_range = [c for c in candidates_forward if 10.0 <= c[0] <= 14.5]
+            in_range = [c for c in candidates_forward if 8.0 <= c[0] <= 13.0]
             if in_range:
                 in_range.sort(key=lambda item: item[0], reverse=True)
                 _, sub_step_cell, sub_step_u, sub_step_v = in_range[0]
@@ -5276,17 +5342,18 @@ class Overlay:
             return
 
         # ── Cadência Inteligente de Caminhada ──
-        # Se o personagem já está ativamente caminhando rumo ao destino e ainda tem mais
-        # de 2.2 células a percorrer no passo atual, não interrompe a animação com novos cliques
-        w_player = getattr(getattr(self.feed, "world", None), "player", None)
-        is_walking = getattr(self.feed.world, "_is_player_walking", lambda: False)()
-        if is_walking and w_player:
-            w_tgt = getattr(w_player, "target", None)
-            if w_tgt:
-                rem_walk = math.hypot(px - w_tgt[0], py - w_tgt[1])
-                if rem_walk >= 2.2 and (now - self.last_patrol_click_time < 1.1):
-                    return
-            elif now - self.last_patrol_click_time < 0.85:
+        # Monitora movimento do personagem para detectar se está parado (> 750ms)
+        last_p = getattr(self, "_last_patrol_px_py", None)
+        if last_p is None or math.hypot(px - last_p[0], py - last_p[1]) >= 0.2:
+            self._last_patrol_px_py = (px, py)
+            self._last_patrol_move_time = now
+
+        stationary_time = now - getattr(self, "_last_patrol_move_time", now)
+        current_sub = getattr(self, "_current_patrol_sub_step", None)
+        if current_sub is not None:
+            dist_to_sub = math.hypot(px - current_sub[0], py - current_sub[1])
+            # Só dispara novo clique quando o personagem chegar a <= 3.5 células ou ficar parado por > 750ms
+            if dist_to_sub > 3.5 and stationary_time <= 0.750:
                 return
 
         dist_player = math.hypot(sub_step_cell[0] - px, sub_step_cell[1] - py)
@@ -5302,6 +5369,7 @@ class Overlay:
         _pre_tcp_time = getattr(_w, "last_player_move_pkt_time", 0.0) if _w else 0.0
 
         self._click_debug(f"PATROL: Passo em ({sub_step_cell[0]}, {sub_step_cell[1]}) -> tela ({sx}, {sy})")
+        self._current_patrol_sub_step = (sub_step_cell[0], sub_step_cell[1])
         self.patrol_move_and_click(sx, sy, hwnd=target_hwnd)
         self.last_patrol_click_time = now
         self.last_patrol_click_player_pos = (px, py)
@@ -5647,6 +5715,7 @@ class Overlay:
         self.patrol_path = []
         self.current_waypoint = None
         self.patrol_waypoint = None
+        self._current_patrol_sub_step = None
         self._last_patrol_click_target = None
         if px is not None and py is not None:
             cur = (int(round(px)), int(round(py)))
@@ -6656,8 +6725,16 @@ class Overlay:
                     if item := objects.get(f"drop:{gid}"):
                         return item
 
+        if self._survival_state == SURVIVAL_RETREAT:
+            if getattr(self, "_last_retreat_target", None):
+                return self._last_retreat_target
+            if self.active_nav_path:
+                return self.active_nav_path[-1]
+
         if not travelling and not self.auto_patrol:
             return None
+        if getattr(self, "_current_patrol_sub_step", None) and self.auto_patrol:
+            return self._current_patrol_sub_step
         if self._last_patrol_click_target and (self.current_patrol_path or travelling):
             return self._last_patrol_click_target[3:5]
         if self.current_patrol_path and getattr(snapshot.player, "is_moving", False):
@@ -6705,22 +6782,14 @@ class Overlay:
                 pass
         cam_pos = getattr(self.feed, "_cam", None) or player_cell or (0, 0)
         project = camera.projector(snapshot.viewport, cam_pos, height_fn)
-        points = [project(*cell) for cell in path] if path else []
 
-        for (u1, v1), (u2, v2) in zip(points, points[1:]):
-            if (not all(math.isfinite(value) for value in (u1, v1, u2, v2))
-                    or max(u1, u2) < 0 or min(u1, u2) > 1
-                    or max(v1, v2) < 0 or min(v1, v2) > 1):
-                continue
-            self.canvas_pool.get_line(
-                u1 * width, v1 * height, u2 * width, v2 * height,
-                fill=color, width=3, dash=(6, 4),
-            )
-
+        # Exibe exclusivamente a linha dinâmica única em tempo real até o alvo ativo
         if target is not None:
             player_u, player_v = project(*player_cell, 5.5)
             line_color, marker_color = "#8b5cf6", "#3b82f6"
-            if isinstance(target, ScreenObject):
+            if self._survival_state == SURVIVAL_RETREAT:
+                line_color, marker_color = "#f87171", "#ef4444"
+            elif isinstance(target, ScreenObject):
                 u, v = target.u, target.v
                 if target.kind == "mob":
                     line_color, marker_color = "#ef4444", "#f97316"
