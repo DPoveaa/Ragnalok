@@ -12,7 +12,6 @@ import json
 import math
 import os
 from pathlib import Path
-import random
 import re
 from subprocess import list2cmdline
 import tempfile
@@ -944,7 +943,7 @@ class CameraTracker:
         in_viewport = (left <= pt.x < left + width and top <= pt.y < top + height)
 
         rmb = bool(u32.GetAsyncKeyState(0x02) & 0x8000)
-        lmb = (is_focused and not win32_input.is_bot_clicking(0.65)
+        lmb = (is_focused and not win32_input.is_bot_clicking(0.85)
                and bool(u32.GetAsyncKeyState(0x01) & 0x8000))
         shift = bool(u32.GetAsyncKeyState(0x10) & 0x8000)
         ctrl = bool(u32.GetAsyncKeyState(0x11) & 0x8000)
@@ -1589,6 +1588,7 @@ class Overlay:
         self._navi_hook_handle = None  # handle do WH_KEYBOARD_LL
         self._navi_hook_proc = None   # mantém referência ao CFUNCTYPE vivo
         self._click_in_progress = False
+        self._action_click_used = None
         self._last_patrol_click_target = None
         self._patrol_stuck_attempts = 0
         self._npc_click_state = {}
@@ -2363,7 +2363,7 @@ class Overlay:
         self._save_hud_setting("hud_hotkeys", self._hud_hotkeys)
 
     def _manual_mouse_button_pressed(self):
-        if win32_input.is_bot_clicking(0.65) or self._is_hud_foreground():
+        if win32_input.is_bot_clicking(0.85) or self._is_hud_foreground():
             return False
         pt = wintypes.POINT()
         if u32.GetCursorPos(ctypes.byref(pt)) and self._is_point_in_hud(pt.x, pt.y, margin=0):
@@ -2378,7 +2378,7 @@ class Overlay:
         if self._is_hud_foreground(fg) or not self._is_game_focused(fg):
             return
         clicked_at = time.monotonic()
-        if win32_input.is_bot_clicking(0.65):
+        if win32_input.is_bot_clicking(0.85):
             return
         start, end = self._hud_click_grace
         if left_button and start <= clicked_at <= end:
@@ -2395,7 +2395,7 @@ class Overlay:
         viewport = self.current_viewport
         while self._hud_manual_clicks:
             sx, sy, left_button, clicked_at = self._hud_manual_clicks.popleft()
-            if self._click_in_progress or win32_input.is_bot_clicking(0.65):
+            if self._click_in_progress or win32_input.is_bot_clicking(0.85):
                 continue
             start, end = self._hud_click_grace
             if left_button and start <= clicked_at <= end:
@@ -2811,7 +2811,8 @@ class Overlay:
                 self._side_step_to_reveal((tx, ty), px_i, py_i)
             else:
                 self._click_debug(f"INTERAGIR: clique #{_npc_st['clicks']+1} a {dist_i:.1f} células em ({sx_i},{sy_i})")
-                self._send_click(g_hwnd_i, sx_i, sy_i)
+                if not self.patrol_move_and_click(sx_i, sy_i, hwnd=g_hwnd_i):
+                    return
                 self._hud_npc_line_target = (f"{kind}:{aid}", selected_map, now_i + 0.950)
                 _npc_st["clicks"] += 1
                 _npc_st["last_click_ts"] = now_i
@@ -2912,7 +2913,7 @@ class Overlay:
                         self.last_kafra_click_ts = now
                         self._city_travel_state["last_action_time"] = now
                         self._click_debug(f"[ClickDebug] KAFRA: clicando Kafra em ({sx}, {sy}) (dist={dist_kafra:.1f})")
-                        self._send_click(target_hwnd, sx, sy)
+                        self.patrol_move_and_click(sx, sy, hwnd=target_hwnd)
                 else:
                     # Longe (> 3.5 células): aproxima da Kafra via nav_goal sem ligar auto_patrol
                     self.nav_goal = (curr_map, int(kx), int(ky))
@@ -3373,7 +3374,8 @@ class Overlay:
                 self.nav_goal = self.patrol_target_route = None
                 self._clear_patrol_route()
                 left, top, width, height = snapshot.viewport
-                self._send_click(hwnd, left + npc.u * width, top + npc.v * height)
+                if not self.patrol_move_and_click(left + npc.u * width, top + npc.v * height, hwnd=hwnd):
+                    return
                 cycle.update(phase="dialog", npc=int(npc.key.split(":")[1]),
                              seq=dialog.get("seq"), clicked_at=now, deadline=now + 12, next=now + 0.25)
                 return
@@ -3426,7 +3428,7 @@ class Overlay:
         # O controle já foi identificado na janela do jogo, sobre a interface nativa.
         x, y = self._kafra_screen_point(snapshot, hwnd, point)
         ensure_input_desktop()
-        self._touch_postmsg_sync(x, y, hwnd)
+        self._move_and_click_sync(x, y, hwnd)
 
     def _kafra_hover(self, snapshot, hwnd, point):
         x, y = self._kafra_screen_point(snapshot, hwnd, point)
@@ -4038,7 +4040,11 @@ class Overlay:
             self._hud_drawer_walk_since = None
 
         if snapshot is not None and foreground:
-            self._handle_actions(snapshot)
+            self._action_click_used = False
+            try:
+                self._handle_actions(snapshot)
+            finally:
+                self._action_click_used = None
             if self._hud_can_run() and (self.auto_farm or self.auto_patrol or self._has_hud_travel()):
                 self._session_active_since = now
 
@@ -4082,7 +4088,7 @@ class Overlay:
         self.post_kill_wait_until = 0.0
         self.last_kill_pos = None
 
-    def _handle_respawn(self, snapshot, world, current_map, now):
+    def _handle_respawn(self, world, current_map, now):
         with world.lock:
             dead = world.player_is_dead
             death_ts = world.last_player_death_ts
@@ -4109,15 +4115,8 @@ class Overlay:
             return dead
         if dead:
             if now >= self._respawn_next_attempt and self._respawn_attempts < 2:
-                if self._respawn_attempts == 0:
-                    self._send_game_key(0x0D)
-                    self._click_debug("RESSUSCITAR: Enter enviado à janela de morte.")
-                else:
-                    hwnd = self.get_game_hwnd()
-                    left, top, width, height = snapshot.viewport
-                    if hwnd:
-                        self._send_click(hwnd, left + width // 2, top + height // 2)
-                        self._click_debug("RESSUSCITAR: tentativa pelo centro da janela de morte.")
+                self._send_game_key(0x0D)
+                self._click_debug("RESSUSCITAR: Enter enviado à janela de morte.")
                 self._respawn_attempts += 1
                 self._respawn_next_attempt = now + 1.2
             return True
@@ -4392,7 +4391,7 @@ class Overlay:
         curr_m = curr_m or getattr(self, "current_map", "")
         if self._kafra_cycle and world.player_is_dead:
             self._finish_kafra_storage("ciclo interrompido pela morte do personagem.", curr_m)
-        if self._handle_respawn(snapshot, world, curr_m, now):
+        if self._handle_respawn(world, curr_m, now):
             return
         if (self.auto_farm or self.auto_patrol) and self.farm_map is None and curr_m:
             self.farm_map = curr_m
@@ -4552,7 +4551,7 @@ class Overlay:
         return True
 
     def _try_auto_patrol(self, snapshot, px, py):
-        """Auto-Patrol: patrulha mapa por A*, calculando sub-passos a 8-11 células e clicando via touch_postmsg."""
+        """Auto-Patrol: patrulha mapa por A*, calculando sub-passos a 8-11 células e clicando via movimento relativo."""
         if not snapshot or not hasattr(self.feed, "world"):
             return
 
@@ -4602,7 +4601,7 @@ class Overlay:
                 sx_ng = left + int(u_ng * width)
                 sy_ng = top + int(v_ng * height)
                 if not self._is_point_in_hud(sx_ng, sy_ng, margin=10):
-                    self._send_click(target_hwnd, sx_ng, sy_ng)
+                    self.patrol_move_and_click(sx_ng, sy_ng, hwnd=target_hwnd)
             return
 
         try:
@@ -4679,7 +4678,8 @@ class Overlay:
                                         self._side_step_to_reveal((r_x, r_y), px, py)
                                         return
                                     self._click_debug(f"PATROL: Interagindo com alvo na rota {item.key} em ({sx},{sy})")
-                                    self._send_click(target_hwnd, sx, sy)
+                                    if not self.patrol_move_and_click(sx, sy, hwnd=target_hwnd):
+                                        return
                                     self._hud_npc_line_target = (item.key, curr_map, now + 0.950)
                                     self.patrol_target_route = None
                                     self._reset_patrol(px, py)
@@ -4756,10 +4756,9 @@ class Overlay:
                         _, chosen_gx, chosen_gy, chosen_sx, chosen_sy = cand_neighbors[0]
                         self._click_debug(f"PATROL [TCP sem 0x0087]: Não moveu! Tentando célula vizinha ({chosen_gx},{chosen_gy}) tela ({chosen_sx},{chosen_sy}) tentativa {retry_count + 1}")
                         self.temp_blocked_cells[(int(pc_gx), int(pc_gy))] = now + 25.0
-                        self._natural_dodge_cursor(chosen_sx, chosen_sy)
                         _post_cnt = getattr(self.feed.world, "player_move_pkt_count", 0) if hasattr(self.feed, "world") else 0
                         _post_time = getattr(self.feed.world, "last_player_move_pkt_time", 0.0) if hasattr(self.feed, "world") else 0.0
-                        self._send_click(target_hwnd, chosen_sx, chosen_sy)
+                        self.patrol_move_and_click(chosen_sx, chosen_sy, hwnd=target_hwnd)
                         self.last_patrol_click_time = now
                         self.last_patrol_click_player_pos = (px, py)
                         self._last_patrol_click_target = (now, px, py, chosen_gx, chosen_gy, chosen_sx, chosen_sy, _post_cnt, _post_time, retry_count + 1)
@@ -4847,10 +4846,9 @@ class Overlay:
                     if rescue_cell:
                         _rc, _ry2, _rsx2, _rsy2 = rescue_cell
                         self._click_debug(f"PATROL: Passo de escape em área livre ({_rc},{_ry2}) tela ({_rsx2},{_rsy2})")
-                        self._natural_dodge_cursor(_rsx2, _rsy2)
                         _post_cnt = getattr(self.feed.world, "player_move_pkt_count", 0) if hasattr(self.feed, "world") else 0
                         _post_time = getattr(self.feed.world, "last_player_move_pkt_time", 0.0) if hasattr(self.feed, "world") else 0.0
-                        self._send_click(target_hwnd, _rsx2, _rsy2)
+                        self.patrol_move_and_click(_rsx2, _rsy2, hwnd=target_hwnd)
                         self.last_patrol_click_time = now
                         self.last_patrol_click_player_pos = (px, py)
                         self._last_patrol_click_target = (now, px, py, _rc, _ry2, _rsx2, _rsy2, _post_cnt, _post_time, 0)
@@ -5099,7 +5097,7 @@ class Overlay:
         _pre_tcp_time = getattr(_w, "last_player_move_pkt_time", 0.0) if _w else 0.0
 
         self._click_debug(f"PATROL: Passo em ({sub_step_cell[0]}, {sub_step_cell[1]}) -> tela ({sx}, {sy})")
-        self._send_click(target_hwnd, sx, sy)
+        self.patrol_move_and_click(sx, sy, hwnd=target_hwnd)
         self.last_patrol_click_time = now
         self.last_patrol_click_player_pos = (px, py)
         # Salva o alvo e dados para verificação estrita por pacotes TCP (0x0087)
@@ -5410,8 +5408,7 @@ class Overlay:
         if candidates:
             sx_c, sy_c, sc_x, sc_y = candidates[0]
             self._click_debug(f"PASSO DESLOCAMENTO CÂMERA: movendo char para ({sx_c},{sy_c}) para tirar alvo de trás da interface")
-            self._send_click(target_hwnd, sc_x, sc_y)
-            return True
+            return self.patrol_move_and_click(sc_x, sc_y, hwnd=target_hwnd)
         return False
 
     def _project_ground_cell(self, snapshot, gx, gy, sprite_z=0.0):
@@ -5555,8 +5552,7 @@ class Overlay:
             return True
         if self._click_in_progress:
             return True
-        if (self._click_method == "touch_postmsg"
-                and time.perf_counter() - getattr(self, "_last_click_ts", 0.0) < 0.35):
+        if time.perf_counter() - getattr(self, "_last_click_ts", 0.0) < 0.35:
             return True
         hwnd = self.get_game_hwnd()
         if not hwnd:
@@ -5606,8 +5602,7 @@ class Overlay:
 
         def click(point, phase, delay):
             clicked_at = time.monotonic()
-            dispatched = self._send_click(hwnd, *point)
-            if self._click_method == "touch_postmsg" and not dispatched:
+            if not self.patrol_move_and_click(*point, hwnd=hwnd):
                 return True
             state.update(phase=phase, deadline=clicked_at + delay, origin=position,
                          click_point=point, clicked_at=clicked_at)
@@ -5773,7 +5768,7 @@ class Overlay:
         except psutil.Error:
             return False
 
-    def _touch_postmsg_sync(self, sx, sy, hwnd):
+    def _move_and_click_sync(self, sx, sy, hwnd):
         # Os controles da Kafra precisam esperar o clique anterior antes de avançar.
         deadline = time.perf_counter() + 2.0
         while (self._click_in_progress
@@ -5782,7 +5777,7 @@ class Overlay:
                 raise ValueError("tempo limite aguardando o clique anterior.")
             time.sleep(0.01)
         completed_at = getattr(self, "_last_click_end_ts", 0.0)
-        if not self.touch_postmsg(sx, sy, hwnd):
+        if not self._schedule_game_click(sx, sy, hwnd):
             raise ValueError("não foi possível iniciar o clique no controle da Kafra.")
         while self._click_in_progress:
             if time.perf_counter() >= deadline:
@@ -5812,7 +5807,7 @@ class Overlay:
         err_up = ctypes.get_last_error()
         return ok_init, err_init, r_down, err_down, r_up, err_up
 
-    def touch_postmsg(self, sx, sy, game_hwnd=None, *, test_mode=False):
+    def _schedule_game_click(self, sx, sy, game_hwnd=None):
         """Agenda o clique do jogo e mantém o estado da automação."""
         now = time.perf_counter()
         if getattr(self, "_click_in_progress", False):
@@ -5826,7 +5821,7 @@ class Overlay:
         # Valida hwnd: nunca aceitar a janela do overlay/HUD (somente Ragexe.exe)
         hwnd = self.get_game_hwnd(game_hwnd or getattr(self, "game_hwnd", None))
         if not hwnd or not self.is_valid_ragexe_hwnd(hwnd):
-            self._click_debug("touch_postmsg: janela do Ragexe indisponível")
+            self._click_debug("move_and_click: janela do Ragexe indisponível")
             return False
         self.game_hwnd = hwnd
         game_window = self._remember_game_window(hwnd)
@@ -5837,20 +5832,21 @@ class Overlay:
         def _do_smooth_click():
             sent = False
             try:
-                sent = win32_input.touch_postmsg(
+                sent = win32_input.move_and_click(
                     sx, sy, hwnd, root_hwnd,
                     is_focused=lambda: self._is_game_focused(game_window=game_window),
                     debug=self._click_debug, log=log_click_file,
                     is_admin=getattr(self, "is_admin", False),
                 )
             except Exception as exc:
-                print(f"[ClickDebug] touch_postmsg erro: {exc}", flush=True)
+                print(f"[ClickDebug] move_and_click erro: {exc}", flush=True)
             finally:
                 finished_at = time.perf_counter()
                 self._last_click_ts = self.last_bot_click_ts = finished_at
                 if sent:
                     self._last_click_end_ts = finished_at
                 self._last_touch_result = ((int(sx), int(sy)), time.monotonic(), sent)
+                win32_input.finish_bot_click()
                 self._click_busy = False
                 self._click_in_progress = False
 
@@ -5860,96 +5856,26 @@ class Overlay:
             self._click_busy = True
             self._click_start_ts = now
             self._last_click_ts = self.last_bot_click_ts = now
+            win32_input.begin_bot_click()
             threading.Thread(target=_do_smooth_click, daemon=True).start()
             started = True
         finally:
             if not started:
+                win32_input.finish_bot_click()
                 self._click_busy = self._click_in_progress = False
         return True
 
     def _touch_click_aborted(self, point, clicked_at):
         result = getattr(self, "_last_touch_result", None)
-        return (self._click_method == "touch_postmsg" and result is not None
+        return (result is not None
                 and not result[2] and result[1] >= clicked_at and result[0] == point)
 
-    def _natural_dodge_cursor(self, sx, sy):
-        """Executa movimento natural de desvio no cursor (arco suave de 20..35px para o lado via InjectTouchInput + micro-move)."""
-        try:
-            dx = random.choice([22, 28, 33, -22, -28, -33])
-            dy = random.choice([8, -8, 12, -12])
-            steps = 4
-            for i in range(1, steps + 1):
-                t = i / steps
-                # Arco suave em curva senoidal
-                arc_y = int(math.sin(t * math.pi) * 8.0)
-                cx = int(sx + dx * t)
-                cy = int(sy + dy * t - arc_y)
-                self._move_pointer_with_touch(cx, cy)
-                try:
-                    self.user32.mouse_event(0x0001, 1, 0, 0, 0)
-                    self.user32.mouse_event(0x0001, -1, 0, 0, 0)
-                except Exception:
-                    pass
-                time.sleep(0.012)
-        except Exception as exc:
-            self._click_debug(f"Erro no desvio suave do cursor: {exc}")
-
-    def _smooth_move_to(self, sx: int, sy: int, game_hwnd=None):
-        """Deslizamento interpolado ease-out do cursor até (sx, sy) para o DirectX reconhecer hover."""
-        if game_hwnd is not None:
-            return win32_input._smooth_move_to_click(sx, sy, game_hwnd)
-        if getattr(self, "_click_in_progress", False):
+    def _smooth_move_to(self, sx: int, sy: int):
+        if self._click_in_progress:
             return
         self._click_in_progress = True
         try:
-            pt = wintypes.POINT()
-            u32.GetCursorPos(ctypes.byref(pt))
-            x0, y0 = pt.x, pt.y
-            dist = math.hypot(sx - x0, sy - y0)
-            if dist > 8:
-                steps = max(5, min(12, int(dist / 55)))
-                for i in range(1, steps + 1):
-                    t = i / steps
-                    eased = 1.0 - (1.0 - t) ** 2
-                    ix = int(x0 + (sx - x0) * eased)
-                    iy = int(y0 + (sy - y0) * eased)
-                    if 1 <= i < steps:
-                        ix += random.randint(-2, 2)
-                        iy += random.randint(-1, 1)
-                    contact = POINTER_TOUCH_INFO()
-                    contact.pointerInfo.pointerType = 0x00000002
-                    contact.pointerInfo.pointerId = 0
-                    contact.pointerInfo.ptPixelLocation.x = ix
-                    contact.pointerInfo.ptPixelLocation.y = iy
-                    contact.pointerInfo.pointerFlags = 0x0001 | 0x4000
-                    contact.touchFlags = 0
-                    contact.touchMask = 0
-                    contact.rcContact.left = ix - 2
-                    contact.rcContact.top = iy - 2
-                    contact.rcContact.right = ix + 2
-                    contact.rcContact.bottom = iy + 2
-                    u32.InjectTouchInput(1, ctypes.byref(contact))
-                    game_hwnd_sm = self.get_game_hwnd(None)
-                    if game_hwnd_sm:
-                        pt_cl = wintypes.POINT(ix, iy)
-                        if u32.ScreenToClient(game_hwnd_sm, ctypes.byref(pt_cl)):
-                            lparam_m = ((pt_cl.y & 0xFFFF) << 16) | (pt_cl.x & 0xFFFF)
-                            u32.PostMessageW(game_hwnd_sm, 0x0200, 0, lparam_m)
-                    time.sleep(0.006)
-            # Pouso exato
-            contact_final = POINTER_TOUCH_INFO()
-            contact_final.pointerInfo.pointerType = 0x00000002
-            contact_final.pointerInfo.pointerId = 0
-            contact_final.pointerInfo.ptPixelLocation.x = sx
-            contact_final.pointerInfo.ptPixelLocation.y = sy
-            contact_final.pointerInfo.pointerFlags = 0x0001 | 0x4000
-            contact_final.touchFlags = 0
-            contact_final.touchMask = 0
-            contact_final.rcContact.left = sx - 2
-            contact_final.rcContact.top = sy - 2
-            contact_final.rcContact.right = sx + 2
-            contact_final.rcContact.bottom = sy + 2
-            u32.InjectTouchInput(1, ctypes.byref(contact_final))
+            win32_input.move_cursor_relative(sx, sy)
         finally:
             self._click_in_progress = False
 
@@ -5994,7 +5920,15 @@ class Overlay:
         """Compatibilidade: navega pelo menu delegando para _send_menu_selection."""
         self._send_menu_selection(option_index)
 
+    def patrol_move_and_click(self, sx, sy, *, hwnd=None):
+        """Agenda o movimento e clique usados pelo Patrol em coordenadas de tela."""
+        return self._dispatch_game_click(hwnd, sx, sy, method="touch_postmsg")
+
     def _send_click(self, hwnd, screen_x, screen_y, test_mode=False, **_kwargs):
+        return self._dispatch_game_click(hwnd, screen_x, screen_y,
+                                         method=self._click_method, test_mode=test_mode)
+
+    def _dispatch_game_click(self, hwnd, screen_x, screen_y, *, method, test_mode=False):
         """Envia clique na posição física (screen_x, screen_y)."""
         # ── Proteção de Concorrência: previne cliques sobrepostos entre ticks ──
         if not test_mode and getattr(self, "_click_in_progress", False):
@@ -6021,7 +5955,11 @@ class Overlay:
             self._click_debug(f"CLIQUE BLOQUEADO: ({sx},{sy}) está sobre a UI nativa do Ragnarok")
             return
 
-        method = self._click_method
+        if not test_mode and self._action_click_used is not None:
+            if self._action_click_used:
+                return False
+            self._action_click_used = True
+
         owns_click_lock = not test_mode and method != "touch_postmsg"
         if owns_click_lock:
             self._click_in_progress = True
@@ -6034,7 +5972,7 @@ class Overlay:
 
             if method == "touch_postmsg":
                 ensure_input_desktop()
-                return self.touch_postmsg(sx, sy, self.get_game_hwnd(hwnd), test_mode=test_mode)
+                return self._schedule_game_click(sx, sy, self.get_game_hwnd(hwnd))
 
             # ── 0. Hardware USB HID (Serial) Bypass se conectado ────────────────
             if not test_mode and hasattr(self, "serial_hid") and self.serial_hid and self.serial_hid.is_connected:
@@ -7198,7 +7136,7 @@ def main():
     parser.add_argument("--zoom", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--click-method", default=DEFAULT_CLICK_METHOD,
                         choices=["touch_postmsg", "touch_win32", "win32", "postmsg", "absolute", "touch", "touch_hybrid"],
-                        help="Método de clique. Padrão: %(default)s (InjectTouchInput + PostMessageW).")
+                        help="Método de clique. Padrão: %(default)s (movimento relativo + mouse_event).")
     parser.add_argument("--click-mode", dest="click_mode_legacy", default=None,
                         choices=["absolute", "sendinput", "postmessage", "hybrid", "win32", "touch", "touch_hybrid", "postmsg"],
                         help=argparse.SUPPRESS)
