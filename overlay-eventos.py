@@ -1365,6 +1365,7 @@ class Overlay:
         self._last_rendered_drops_items = []
         self._click_in_progress = False
         self._last_patrol_click_target = None
+        self._patrol_stuck_attempts = 0
         self._npc_click_state = {}
         self._kill_history = []
         self._loot_history = []
@@ -1922,52 +1923,37 @@ class Overlay:
                 if not sel:
                     return
                 idx = sel[0]
-                if idx < len(self._npc_list_data):
-                    _aid, _kind, tx, ty, _name = self._npc_list_data[idx]
-                    curr_map = getattr(getattr(self.feed, "world", None), "map", "") or ""
-                    # Verifica distância atual
-                    now_i = time.monotonic()
-                    px_i, py_i = None, None
-                    if hasattr(self.feed, "world") and self.feed.world.player:
-                        px_i, py_i = self.feed.world.player.cell(now_i)
-                    dist_i = math.hypot(px_i - tx, py_i - ty) if px_i is not None else 999.0
-                    gat_i = None
-                    if hasattr(self.feed, "terrain") and self.feed.terrain:
-                        try:
-                            gat_i = self.feed.terrain.for_map(curr_map)
-                        except Exception:
-                            pass
+                if idx >= len(self._npc_list_data):
+                    return
+                _aid, _kind, tx, ty, _name = self._npc_list_data[idx]
+                curr_map = getattr(getattr(self.feed, "world", None), "map", "") or ""
 
-                    # Checa caminho livre se gat disponível
-                    has_path = True
-                    if gat_i and px_i is not None:
-                        start_c = (int(round(px_i)), int(round(py_i)))
-                        has_path = bool(gat_i.find_path(start_c, (tx, ty), blocked_cells=self.temp_blocked_cells))
+                # Inicializa estado de cliques para este NPC (máximo 2 tentativas)
+                _npc_key = (_aid, tx, ty)
+                _npc_st = self._npc_click_state.get(_npc_key, {"clicks": 0, "last_click_ts": 0.0})
 
-                    if dist_i <= 4.0 and has_path:
-                        # Próximo (<= 4.0 células): clica direto no centro do sprite sem forçar o personagem a colar
-                        snap_i = self.feed.current()
-                        if snap_i:
-                            vp_i = snap_i.viewport
-                            left_i, top_i, w_i, h_i = vp_i
-                            sprite_z_i = 5.5 if _kind == "npc" else 1.2
-                            h_fn_i = getattr(gat_i, "get_elevation", None) if gat_i else None
-                            cam_i = getattr(self.feed, "_cam", None) or (px_i, py_i)
-                            proj_i = self.feed.camera.projector(vp_i, cam_i, h_fn_i)
-                            u_i, v_i = proj_i(tx, ty, sprite_z_i)
-                            sx_i = left_i + int(u_i * w_i)
-                            sy_i = top_i + int(v_i * h_i)
-                            g_hwnd_i = self.get_game_hwnd(None)
-                            if g_hwnd_i:
-                                u32.SetForegroundWindow(g_hwnd_i)
-                            if self._is_point_in_hud(sx_i, sy_i):
-                                self._side_step_to_reveal((tx, ty), px_i, py_i)
-                            else:
-                                self._click_debug(f"INTERAGIR: clique direto a {dist_i:.1f} células em ({sx_i},{sy_i})")
-                                self._send_click(g_hwnd_i, sx_i, sy_i)
-                            return
+                now_i = time.monotonic()
+                px_i, py_i = None, None
+                if hasattr(self.feed, "world") and self.feed.world.player:
+                    px_i, py_i = self.feed.world.player.cell(now_i)
+                dist_i = math.hypot(px_i - tx, py_i - ty) if px_i is not None else 999.0
 
-                    # Longe (> 4.0 células): traça rota A* e caminha até ficar a <= 3.8 células via nav_goal
+                gat_i = None
+                if hasattr(self.feed, "terrain") and self.feed.terrain:
+                    try:
+                        gat_i = self.feed.terrain.for_map(curr_map)
+                    except Exception:
+                        pass
+
+                # Verifica se diálogo já foi aberto → encerra imediatamente
+                npc_dlg = getattr(getattr(self.feed, "world", None), "npc_dialog", {})
+                if npc_dlg.get("open"):
+                    self._npc_click_state.pop(_npc_key, None)
+                    self.nav_goal = None
+                    return
+
+                # Aproximação obrigatória: > 3.8 células → navega via A*
+                if dist_i > 3.8 or px_i is None:
                     self.nav_goal = (curr_map, tx, ty)
                     self.patrol_target_route = (curr_map, tx, ty, _aid)
                     self.active_nav_color = "#A78BFA"
@@ -1977,6 +1963,42 @@ class Overlay:
                     for _, upd in self._hud_btns.values():
                         try: upd()
                         except Exception: pass
+                    return
+
+                # A <= 3.5 células: verifica limite de 2 tentativas e intervalo mínimo de 950ms
+                if _npc_st["clicks"] >= 2:
+                    # 2 tentativas sem abrir diálogo → desiste
+                    self._click_debug(f"INTERAGIR: 2 tentativas sem diálogo para {_name}. Encerrando.")
+                    self._npc_click_state.pop(_npc_key, None)
+                    self.nav_goal = None
+                    return
+
+                if now_i - _npc_st["last_click_ts"] < 0.950:
+                    return  # aguarda intervalo mínimo
+
+                # Projeta e clica no sprite
+                snap_i = self.feed.current()
+                if snap_i:
+                    vp_i = snap_i.viewport
+                    left_i, top_i, w_i, h_i = vp_i
+                    sprite_z_i = 5.5 if _kind == "npc" else 1.2
+                    h_fn_i = getattr(gat_i, "get_elevation", None) if gat_i else None
+                    cam_i = getattr(self.feed, "_cam", None) or (px_i, py_i)
+                    proj_i = self.feed.camera.projector(vp_i, cam_i, h_fn_i)
+                    u_i, v_i = proj_i(tx, ty, sprite_z_i)
+                    sx_i = left_i + int(u_i * w_i)
+                    sy_i = top_i + int(v_i * h_i)
+                    g_hwnd_i = self.get_game_hwnd(None)
+                    if g_hwnd_i:
+                        u32.SetForegroundWindow(g_hwnd_i)
+                    if self._is_point_in_game_ui(sx_i, sy_i):
+                        self._side_step_to_reveal((tx, ty), px_i, py_i)
+                    else:
+                        self._click_debug(f"INTERAGIR: clique #{_npc_st['clicks']+1} a {dist_i:.1f} células em ({sx_i},{sy_i})")
+                        self._send_click(g_hwnd_i, sx_i, sy_i)
+                        _npc_st["clicks"] += 1
+                        _npc_st["last_click_ts"] = now_i
+                        self._npc_click_state[_npc_key] = _npc_st
 
             self._npc_listbox.bind("<Double-Button-1>", lambda _e: _go_interact())
             tk.Button(body_frame, text="Ir / Interagir (ou Duplo-Clique)", command=_go_interact,
@@ -2088,9 +2110,13 @@ class Overlay:
                             names_h = dict(getattr(w, "entity_names", {}))
                             ents_h = list(w.entities.items())
                         new_npc_data = []
+                        # NPCs invisíveis/gatilhos de script: ignorar jobs 111, 139, 32767
+                        _INVISIBLE_NPC_JOBS = (111, 139, 32767)
                         if px_h is not None:
                             for (ekind, aid_h), ent_h in ents_h:
                                 if ekind in ("npc", "warp"):
+                                    if ekind == "npc" and ent_h.catalog_id in _INVISIBLE_NPC_JOBS:
+                                        continue  # ignora NPCs invisíveis/gatilhos
                                     tx_h = int(ent_h.track.target[0])
                                     ty_h = int(ent_h.track.target[1])
                                     if max(abs(tx_h - int(px_h)), abs(ty_h - int(py_h))) <= 30:
@@ -2124,32 +2150,54 @@ class Overlay:
                                 pass
                             self._last_rendered_npc_items = curr_sig
 
-                    # 2. Atualização da mini-lista de Monstros (Vivos + Abatidos via 0x0080)
+                    # 2. Atualização da mini-lista de Monstros (apenas Vivos; mortos vão para Histórico de Kills)
                     if hasattr(self.feed, "world") and hasattr(self, "_mobs_listbox") and self._mobs_listbox:
                         w = self.feed.world
+                        now_m = time.monotonic()
                         alive_mobs = []
                         with w.lock:
                             for (ekind, _), ent in w.entities.items():
                                 if ekind == "mob":
                                     cid = ent.catalog_id
                                     mname = self.names.get("mob", {}).get(cid, f"Mob #{cid}")
-                                    alive_mobs.append((cid, mname, "[VIVO]"))
-                            dead_mobs = [
-                                (d.get("catalog_id", 0), self.names.get("mob", {}).get(d.get("catalog_id", 0), f"Mob #{d.get('catalog_id', 0)}"), "[MORTO]")
-                                for d in reversed(w.recent_dead_mobs) if d.get("catalog_id")
-                            ]
-                        combined_mobs = []
-                        seen_mobs = set()
-                        for cid, mname, status in (alive_mobs + dead_mobs):
-                            if cid not in seen_mobs:
-                                seen_mobs.add(cid)
-                                combined_mobs.append((cid, mname, f"{status} {mname} (#{cid})"))
-                        mob_sig = [m[0] for m in combined_mobs[:10]]
+                                    alive_mobs.append((cid, mname))
+                            # Atualiza kill history a partir de recent_dead_mobs novos
+                            _kill_last_check = getattr(self, "_kill_history_last_check", 0.0)
+                            for dead in w.recent_dead_mobs:
+                                dtime = dead.get("time", 0.0)
+                                if dtime > _kill_last_check:
+                                    cid_d = dead.get("catalog_id", 0)
+                                    if cid_d:
+                                        mname_d = self.names.get("mob", {}).get(cid_d, f"Mob #{cid_d}")
+                                        kts = dead.get("kill_ts", time.strftime("%H:%M:%S"))
+                                        self._kill_history.insert(0, (kts, mname_d, cid_d))
+                                        if len(self._kill_history) > 60:
+                                            self._kill_history.pop()
+                                        self._session_kill_count += 1
+                            self._kill_history_last_check = now_m
+
+                        # Ordena por distância se tiver posição do jogador
+                        px_m2, py_m2 = None, None
+                        try:
+                            if w.player:
+                                px_m2, py_m2 = w.player.cell(now_m)
+                        except Exception:
+                            pass
+                        if px_m2 is not None:
+                            with w.lock:
+                                dist_map = {}
+                                for (ekind2, aid2), ent2 in w.entities.items():
+                                    if ekind2 == "mob":
+                                        ex, ey = ent2.track.target
+                                        dist_map[ent2.catalog_id] = math.hypot(ex - px_m2, ey - py_m2)
+                            alive_mobs.sort(key=lambda x: dist_map.get(x[0], 999.0))
+
+                        mob_sig = [m[0] for m in alive_mobs[:10]]
                         if mob_sig != getattr(self, "_last_rendered_mobs_items", None):
-                            self._mobs_list_data = [(m[0], m[1]) for m in combined_mobs[:10]]
+                            self._mobs_list_data = [(m[0], m[1]) for m in alive_mobs[:10]]
                             self._mobs_listbox.delete(0, tk.END)
-                            for _, _, text in combined_mobs[:10]:
-                                self._mobs_listbox.insert(tk.END, text)
+                            for cid_v, mname_v in alive_mobs[:10]:
+                                self._mobs_listbox.insert(tk.END, f"[VIVO] {mname_v} (#{cid_v})")
                             self._last_rendered_mobs_items = mob_sig
 
                     # 3. Atualização da mini-lista de Drops (Vistos via 0x0ADD + Coletados via 0x00A0)
@@ -2577,7 +2625,7 @@ class Overlay:
         if hasattr(self.feed, "world"):
             _, player, _ = self.feed.world.snapshot()
             if player:
-                px, py = player.cell(now)
+                px, py = player.cell()
 
         # Limpa blacklists expiradas
         self._drop_blacklist = {gid: exp for gid, exp in self._drop_blacklist.items() if now < exp}
@@ -2805,6 +2853,25 @@ class Overlay:
         farm_busy = False
         loot_busy = False
 
+        # ── WATCHDOG GLOBAL DE INATIVIDADE (DESBLOQUEIO DE LOCKS E DESTRAVAMENTO) ──
+        if self.auto_patrol and px is not None:
+            is_walking = getattr(self.feed.world, "_is_player_walking", lambda: False)()
+            last_action_t = max(
+                getattr(self, "last_patrol_click_time", 0.0),
+                getattr(self, "last_farm_click", 0.0),
+                getattr(self, "last_loot_click", 0.0)
+            )
+            if not is_walking and (now - last_action_t > 1.8):
+                if self.locked_drop_gid is not None:
+                    self._drop_blacklist[self.locked_drop_gid] = now + 10.0
+                    self._loot_retry_state.pop(self.locked_drop_gid, None)
+                    self.locked_drop_gid = None
+                    self.locked_drop_clicks = 0
+                if self.locked_mob_gid is not None:
+                    self._farm_blacklist[self.locked_mob_gid] = now + 10.0
+                    self.locked_mob_gid = None
+                self._last_patrol_click_target = None
+
         # ── PRIORIDADE 1: Autodefesa – mob agressor ou <= 3.0 células ──
         if (self.auto_farm or self.auto_loot) and px is not None:
             has_threat = False
@@ -2886,7 +2953,6 @@ class Overlay:
                         break
 
             if has_valid_drop or self.locked_drop_gid is not None:
-                self._reset_patrol(px, py)
                 self._try_auto_loot(snapshot, px, py)
                 return
 
@@ -2906,7 +2972,6 @@ class Overlay:
                         farm_target_available_local = True
                         break
             if farm_target_available_local or self.locked_mob_gid is not None:
-                self._reset_patrol(px, py)
                 self._try_auto_farm(snapshot, px, py, max_search_dist=22.0)
                 return
 
@@ -2916,6 +2981,25 @@ class Overlay:
             self._try_auto_patrol(snapshot, px, py)
         elif self.auto_patrol and px is not None and py is not None:
             self._try_auto_patrol(snapshot, px, py)
+
+    @staticmethod
+    def _has_walkable_line(p0, p1, gat):
+        """Verifica se há linha de caminhada direta sem colisão de paredes entre dois pontos."""
+        if not gat:
+            return True
+        x0, y0 = int(round(p0[0])), int(round(p0[1]))
+        x1, y1 = int(round(p1[0])), int(round(p1[1]))
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        steps = max(dx, dy)
+        if steps <= 1:
+            return gat.is_walkable(x1, y1)
+        for s in range(1, steps + 1):
+            tx = int(round(x0 + s * (x1 - x0) / steps))
+            ty = int(round(y0 + s * (y1 - y0) / steps))
+            if not gat.is_walkable(tx, ty):
+                return False
+        return True
 
     def _try_auto_patrol(self, snapshot, px, py):
         """Auto-Patrol: patrulha mapa por A*, calculando sub-passos a 8-11 células e clicando via touch_postmsg."""
@@ -3049,41 +3133,177 @@ class Overlay:
                     self.patrol_target_route = None
                     self._reset_patrol(px, py)
 
-        # ── Watchdog de Destravamento (450ms sem pacote 0x0087) ──
-        if getattr(self, "_walk_watchdog", None):
-            last_pkt = getattr(getattr(self.feed, "world", None), "last_player_move_pkt_time", 0.0)
-            if last_pkt > self._walk_watchdog["time"]:
-                self._walk_watchdog = None
-            elif now - self._walk_watchdog["time"] >= 0.450:
-                w_sx = self._walk_watchdog["sx"]
-                w_sy = self._walk_watchdog["sy"]
-                stuck_cell = self._walk_watchdog["cell"]
-                self._walk_watchdog = None
-                self._click_debug(f"WATCHDOG: Travamento em {stuck_cell} (>450ms sem 0x0087). Desvio suave do cursor e bloqueio por 15s.")
-                self._natural_dodge_cursor(w_sx, w_sy)
-                self.temp_blocked_cells[stuck_cell] = now + 15.0
-                alt_cell = gat.find_safe_alternative_step(stuck_cell, (px, py), blocked_cells=self.temp_blocked_cells, min_neighbors=7)
-                if alt_cell:
-                    self._click_debug(f"WATCHDOG: Sub-passo alternativo livre no .gat: {alt_cell}")
-                    u_alt, v_alt = project(*alt_cell)
-                    if 0.05 <= u_alt <= 0.95 and 0.05 <= v_alt <= 0.95:
-                        alt_sx = left + int(u_alt * width)
-                        alt_sy = top + int(v_alt * height)
-                        if math.hypot(alt_cell[0] - px, alt_cell[1] - py) >= 2.2:
-                            self._send_click(target_hwnd, alt_sx, alt_sy)
-                            self._walk_watchdog = {"time": now, "cell": alt_cell, "sx": alt_sx, "sy": alt_sy, "px": px, "py": py}
-                            return
-                self.current_patrol_path = []
-                self.current_waypoint = None
+        # ── Verificação de Movimento Estritamente por Pacotes TCP (0x0087 ZC_NOTIFY_PLAYERMOVE) ──
+        if getattr(self, "_last_patrol_click_target", None) is not None:
+            raw_tgt = self._last_patrol_click_target
+            pc_time = raw_tgt[0]
+            elapsed_pc = now - pc_time
+
+            if elapsed_pc < 0.380:
+                # Aguarda janela de 380ms para confirmação de pacote TCP pelo servidor
                 return
 
-        # ── Detecção de Travamento (> 1.8s parado mesmo após clicar) ──
+            w = getattr(self.feed, "world", None)
+            cur_tcp_cnt = getattr(w, "player_move_pkt_count", 0) if w else 0
+            cur_tcp_time = getattr(w, "last_player_move_pkt_time", 0.0) if w else 0.0
+            pc_px, pc_py, pc_gx, pc_gy = raw_tgt[1], raw_tgt[2], raw_tgt[3], raw_tgt[4]
+            pc_sx = raw_tgt[5] if len(raw_tgt) > 5 else None
+            pc_sy = raw_tgt[6] if len(raw_tgt) > 6 else None
+            pc_tcp_cnt = raw_tgt[7] if len(raw_tgt) > 7 else 0
+            pc_tcp_time = raw_tgt[8] if len(raw_tgt) > 8 else 0.0
+            retry_count = raw_tgt[9] if len(raw_tgt) > 9 else 0
+
+            # Confirmação ESTRITA por pacotes TCP (0x0087 ZC_NOTIFY_PLAYERMOVE):
+            tcp_confirmed = (cur_tcp_cnt > pc_tcp_cnt) or (cur_tcp_time > pc_time)
+
+            if tcp_confirmed:
+                # Pacote TCP 0x0087 recebido: o servidor confirmou que o personagem está se movendo!
+                self._last_patrol_click_target = None
+                self._patrol_stuck_attempts = 0
+            else:
+                # TCP 0x0087 NÃO recebido em 380ms: o personagem NÃO se moveu!
+                # 1. Tenta clicar em quadrados vizinhos ao que estávamos clicando (retry_count < 2)
+                neighbor_clicked = False
+                if retry_count < 2:
+                    cand_neighbors = []
+                    for dx in (-1, 0, 1, -2, 2):
+                        for dy in (-1, 0, 1, -2, 2):
+                            if dx == 0 and dy == 0:
+                                continue
+                            n_gx = int(pc_gx) + dx
+                            n_gy = int(pc_gy) + dy
+                            if not (0 <= n_gx < gat.width and 0 <= n_gy < gat.height):
+                                continue
+                            if not gat.is_walkable(n_gx, n_gy):
+                                continue
+                            if (n_gx, n_gy) in self.temp_blocked_cells:
+                                continue
+                            if gat.count_walkable_neighbors(n_gx, n_gy) < 5:
+                                continue
+                            dist_to_p = math.hypot(n_gx - px, n_gy - py)
+                            if dist_to_p < 2.0:
+                                continue
+                            nu, nv = project(n_gx, n_gy)
+                            if not (0.16 <= nu <= 0.84 and 0.18 <= nv <= 0.82):
+                                continue
+                            nsx = left + int(nu * width)
+                            nsy = top + int(nv * height)
+                            if self._is_point_in_game_ui(nsx, nsy):
+                                continue
+                            wp_d = math.hypot(n_gx - self.current_waypoint[0], n_gy - self.current_waypoint[1]) if self.current_waypoint else 0.0
+                            cand_neighbors.append((wp_d, n_gx, n_gy, nsx, nsy))
+
+                    if cand_neighbors:
+                        cand_neighbors.sort(key=lambda item: item[0])
+                        _, chosen_gx, chosen_gy, chosen_sx, chosen_sy = cand_neighbors[0]
+                        self._click_debug(f"PATROL [TCP sem 0x0087]: Não moveu! Tentando célula vizinha ({chosen_gx},{chosen_gy}) tela ({chosen_sx},{chosen_sy}) tentativa {retry_count + 1}")
+                        self.temp_blocked_cells[(int(pc_gx), int(pc_gy))] = now + 25.0
+                        self._natural_dodge_cursor(chosen_sx, chosen_sy)
+                        _post_cnt = getattr(self.feed.world, "player_move_pkt_count", 0) if hasattr(self.feed, "world") else 0
+                        _post_time = getattr(self.feed.world, "last_player_move_pkt_time", 0.0) if hasattr(self.feed, "world") else 0.0
+                        self._send_click(target_hwnd, chosen_sx, chosen_sy)
+                        self.last_patrol_click_time = now
+                        self.last_patrol_click_player_pos = (px, py)
+                        self._last_patrol_click_target = (now, px, py, chosen_gx, chosen_gy, chosen_sx, chosen_sy, _post_cnt, _post_time, retry_count + 1)
+                        neighbor_clicked = True
+                        return
+
+                # Se retry_count >= 2 ou nenhum vizinho viável:
+                # O obstáculo é extenso (árvore/rocha/RSW). MUDAR DE ROTA IMEDIATAMENTE!
+                self._click_debug(f"PATROL [TCP sem 0x0087]: Célula ({pc_gx},{pc_gy}) e vizinhos bloqueados. Mudando de rota!")
+                for _bx in range(int(pc_gx) - 3, int(pc_gx) + 4):
+                    for _by in range(int(pc_gy) - 3, int(pc_gy) + 4):
+                        self.temp_blocked_cells[(_bx, _by)] = now + 35.0
+
+                wp = self.current_waypoint
+                if wp and math.hypot(wp[0] - pc_gx, wp[1] - pc_gy) <= 6.0:
+                    self.temp_blocked_cells[(int(wp[0]), int(wp[1]))] = now + 35.0
+                    self.current_waypoint = None
+
+                cur_pt = (int(round(px)), int(round(py)))
+                recalc_path = None
+                if self.current_waypoint:
+                    recalc_path = gat.find_path(cur_pt, self.current_waypoint, blocked_cells=self.temp_blocked_cells)
+
+                if recalc_path and len(recalc_path) > 1 and math.hypot(recalc_path[1][0] - pc_gx, recalc_path[1][1] - pc_gy) >= 2.0:
+                    self._click_debug(f"PATROL: Nova rota A* para contornar obstáculo ({len(recalc_path)} passos).")
+                    self.current_patrol_path = recalc_path
+                    self.active_nav_path = list(recalc_path)
+                    self._last_patrol_click_target = None
+                else:
+                    self._click_debug("PATROL: Rota obstruída. Selecionando novo waypoint e mudando direção!")
+                    self.visited_cells.append((int(pc_gx), int(pc_gy)))
+                    self.current_patrol_path = []
+                    self.current_waypoint = None
+                    self._last_patrol_click_target = None
+
+                    hmap = self.feed.world.get_heatmap_sectors() if (hasattr(self.feed, "world") and hasattr(self.feed.world, "get_heatmap_sectors")) else None
+                    new_wp = gat.pick_next_waypoint(
+                        (px, py), visited_cells=self.visited_cells,
+                        min_dist=14, max_dist=28, blocked_cells=self.temp_blocked_cells,
+                        heatmap=hmap
+                    )
+                    if new_wp:
+                        self.current_waypoint = new_wp
+                        new_route = gat.find_path(cur_pt, new_wp, blocked_cells=self.temp_blocked_cells)
+                        if new_route:
+                            self.current_patrol_path = new_route
+                            self.active_nav_path = list(new_route)
+                            self._click_debug(f"PATROL: Novo waypoint selecionado: {new_wp} ({len(new_route)} passos)")
+
+                    # Passo imediato de fuga em direção oposta ao obstáculo
+                    rescue_cell = None
+                    _angles16 = [i * (360.0 / 16) for i in range(16)]
+                    _blocked_dir_dx = pc_gx - px if px is not None else 0
+                    _blocked_dir_dy = pc_gy - py if py is not None else 0
+                    for _r in (3, 4, 5):
+                        for _ang_deg in _angles16:
+                            _ang_rad = math.radians(_ang_deg)
+                            _cx = int(round(px + math.cos(_ang_rad) * _r))
+                            _cy = int(round(py + math.sin(_ang_rad) * _r))
+                            if not (0 <= _cx < gat.width and 0 <= _cy < gat.height):
+                                continue
+                            if not gat.is_walkable(_cx, _cy):
+                                continue
+                            if (_cx, _cy) in self.temp_blocked_cells:
+                                continue
+                            if gat.count_walkable_neighbors(_cx, _cy) < 6:
+                                continue
+                            _cos_sim = ((_cx - px) * _blocked_dir_dx + (_cy - py) * _blocked_dir_dy)
+                            _mag = math.hypot(_cx - px, _cy - py) * math.hypot(_blocked_dir_dx, _blocked_dir_dy)
+                            if _mag > 0.01 and _cos_sim / _mag > 0.3:
+                                continue
+                            _u, _v = project(_cx, _cy)
+                            if not (0.16 <= _u <= 0.84 and 0.18 <= _v <= 0.82):
+                                continue
+                            _rsx = left + int(_u * width)
+                            _rsy = top + int(_v * height)
+                            if self._is_point_in_game_ui(_rsx, _rsy):
+                                continue
+                            rescue_cell = (_cx, _cy, _rsx, _rsy)
+                            break
+                        if rescue_cell:
+                            break
+
+                    if rescue_cell:
+                        _rc, _ry2, _rsx2, _rsy2 = rescue_cell
+                        self._click_debug(f"PATROL: Passo de escape em área livre ({_rc},{_ry2}) tela ({_rsx2},{_rsy2})")
+                        self._natural_dodge_cursor(_rsx2, _rsy2)
+                        _post_cnt = getattr(self.feed.world, "player_move_pkt_count", 0) if hasattr(self.feed, "world") else 0
+                        _post_time = getattr(self.feed.world, "last_player_move_pkt_time", 0.0) if hasattr(self.feed, "world") else 0.0
+                        self._send_click(target_hwnd, _rsx2, _rsy2)
+                        self.last_patrol_click_time = now
+                        self.last_patrol_click_player_pos = (px, py)
+                        self._last_patrol_click_target = (now, px, py, _rc, _ry2, _rsx2, _rsy2, _post_cnt, _post_time, 0)
+                    return
+
+        # ── Detecção Complementar de Travamento por Tempo (> 1.8s sem mover) ──
         if self.last_patrol_click_time > 0 and (now - self.last_patrol_click_time > 1.8):
             if self.last_patrol_click_player_pos:
                 dist_moved = math.hypot(px - self.last_patrol_click_player_pos[0], py - self.last_patrol_click_player_pos[1])
                 if dist_moved < 0.6:
                     stuck_cell = self.current_patrol_path[0] if self.current_patrol_path else cur_cell
-                    self.temp_blocked_cells[stuck_cell] = now + 12.0
+                    self.temp_blocked_cells[stuck_cell] = now + 15.0
                     self._click_debug(f"PATROL: Travamento detectado (>1.8s sem mover)! Bloqueando {stuck_cell} e recalculando rota.")
                     self.current_patrol_path = []
                     self.stuck_count += 1
@@ -3142,141 +3362,167 @@ class Overlay:
                 self.current_waypoint = None
                 return
 
-        # Descarta células da rota já ultrapassadas
-        while self.current_patrol_path and math.hypot(px - self.current_patrol_path[0][0], py - self.current_patrol_path[0][1]) <= 1.2:
-            self.current_patrol_path.pop(0)
+        # ── Detecção e Poda Precisa de Avanço na Rota ──
+        if self.current_patrol_path:
+            closest_idx = 0
+            min_dist_to_path = float("inf")
+            for i, (cx, cy) in enumerate(self.current_patrol_path):
+                d = math.hypot(px - cx, py - cy)
+                if d < min_dist_to_path:
+                    min_dist_to_path = d
+                    closest_idx = i
+
+            # Se o jogador já avançou pela rota, descarta nós anteriores ao ponto mais próximo
+            if closest_idx > 0 and min_dist_to_path <= 4.0:
+                self.current_patrol_path = self.current_patrol_path[closest_idx:]
+
+            # Remove os nós iniciais que o jogador já alcançou (distância <= 1.8 células)
+            while self.current_patrol_path and math.hypot(self.current_patrol_path[0][0] - px, self.current_patrol_path[0][1] - py) <= 1.8:
+                self.current_patrol_path.pop(0)
+
+            # Se o personagem se desviou muito da rota (> 4.5 células), recalcula a partir de onde ele está
+            if min_dist_to_path > 4.5 and self.current_waypoint:
+                cur_cell_p = (int(round(px)), int(round(py)))
+                recalc_p = gat.find_path(cur_cell_p, self.current_waypoint, blocked_cells=self.temp_blocked_cells)
+                if recalc_p:
+                    self.current_patrol_path = recalc_p
+                    self.active_nav_path = list(recalc_p)
 
         if not self.current_patrol_path:
             self.current_waypoint = None
             return
 
-        # ── Projeta sub-passo a 8–11 células à frente na área segura da tela ──
+        # ── Projeta sub-passo INTELIGENTE AO LONGO DA ROTA (SEM PULAR MONTANHAS/DESPENHADEIROS) ──
         sub_step_cell = None
         sub_step_u = None
         sub_step_v = None
 
-        # Busca ponto a 11 até 4 células à frente dentro da área segura
-        max_idx = min(len(self.current_patrol_path) - 1, 11)
-        for idx in range(max_idx, 2, -1):
+        p_elev = gat.get_elevation(px, py) if hasattr(gat, "get_elevation") else 0.0
+        max_scan = min(len(self.current_patrol_path), 12)
+        candidates_forward = []
+
+        for idx in range(max_scan):
             cand = self.current_patrol_path[idx]
-            # Zona de exclusão nos pés do jogador: nunca clica a < 2.2 células
-            if math.hypot(cand[0] - px, cand[1] - py) < 2.2:
+            cx, cy = cand
+            dist_p = math.hypot(cx - px, cy - py)
+            if dist_p < 2.2:
                 continue
-            u, v = project(*cand)
-            if 0.22 <= u <= 0.78 and 0.24 <= v <= 0.76:
-                # Exige célula caminhável com pelo menos 7 das 8 vizinhas caminháveis (evita quinas e árvores)
-                gx_c, gy_c = cand
-                walkable_neighbors = (
-                    gat.count_walkable_neighbors(gx_c, gy_c)
-                    if hasattr(gat, "count_walkable_neighbors")
-                    else sum(1 for ddx in (-1, 0, 1) for ddy in (-1, 0, 1) if (ddx != 0 or ddy != 0) and gat.is_walkable(gx_c + ddx, gy_c + ddy))
-                )
-                if walkable_neighbors < 7:
-                    continue
-                sub_step_cell = cand
-                sub_step_u = u
-                sub_step_v = v
+
+            # Proteção contra relevo/montanha: não clica do topo para o fundo de despenhadeiro
+            if hasattr(gat, "get_elevation"):
+                c_elev = gat.get_elevation(cx, cy)
+                if abs(c_elev - p_elev) > 16.0:
+                    # Desnível muito íngreme direto entre o player e este ponto;
+                    # interrompe o scan adiante para forçar contorno suave da rota
+                    break
+
+            # Linha direta caminhável: não pode atravessar paredes ou abismos entre player e sub-passo
+            if not self._has_walkable_line((px, py), (cx, cy), gat):
                 break
 
-        # Fallback para ponto visível mais distante
-        if sub_step_cell is None:
-            for cand in reversed(self.current_patrol_path[:max_idx + 1]):
-                if math.hypot(cand[0] - px, cand[1] - py) < 2.2:
-                    continue
-                u, v = project(*cand)
-                if 0.22 <= u <= 0.78 and 0.24 <= v <= 0.76:
-                    gx_c, gy_c = cand
-                    walkable_neighbors = (
-                        gat.count_walkable_neighbors(gx_c, gy_c)
-                        if hasattr(gat, "count_walkable_neighbors")
-                        else sum(1 for ddx in (-1, 0, 1) for ddy in (-1, 0, 1) if (ddx != 0 or ddy != 0) and gat.is_walkable(gx_c + ddx, gy_c + ddy))
-                    )
-                    if walkable_neighbors < 7:
-                        continue
-                    sub_step_cell = cand
-                    sub_step_u = u
-                    sub_step_v = v
-                    break
+            # Célula caminhável e segura
+            if not gat.is_walkable(cx, cy):
+                continue
+            if (cx, cy) in self.temp_blocked_cells:
+                continue
+            if gat.count_walkable_neighbors(cx, cy) < 5:
+                continue
 
-        if sub_step_cell is None:
-            for cand in self.current_patrol_path[min(len(self.current_patrol_path) - 1, 4):]:
-                if math.hypot(cand[0] - px, cand[1] - py) < 2.2:
-                    continue
-                u, v = project(*cand)
-                if 0.05 <= u <= 0.95 and 0.05 <= v <= 0.95:
-                    sub_step_cell = cand
-                    sub_step_u = u
-                    sub_step_v = v
-                    break
+            # Projeção segura na tela
+            u, v = project(cx, cy)
+            if not (0.16 <= u <= 0.84 and 0.18 <= v <= 0.82):
+                continue
 
-        if sub_step_cell is None:
-            return
+            cand_sx = left + int(u * width)
+            cand_sy = top + int(v * height)
+            if self._is_point_in_game_ui(cand_sx, cand_sy):
+                continue
 
-        # Zona de exclusão: nunca clica se NPC, portal, player ou loja estiver a <= 2.5 células
-        gx, gy = sub_step_cell
-        skip_cell = False
-        if hasattr(self.feed, "world"):
-            w = self.feed.world
-            with w.lock:
-                for (ekind, _), ent in w.entities.items():
-                    if ekind in ("npc", "warp"):
-                        ec = ent.track.target
-                        if max(abs(ec[0] - gx), abs(ec[1] - gy)) <= 2.5:
-                            skip_cell = True
-                            break
-                if not skip_cell:
-                    for _pid, (pc, _) in w.other_players.items():
-                        if max(abs(pc[0] - gx), abs(pc[1] - gy)) <= 2.5:
-                            skip_cell = True
-                            break
-                if not skip_cell:
-                    for vaid in w.vending_aids:
-                        ent = w.entities.get(("npc", vaid))
-                        if ent:
+            # Zona de exclusão de entidades no mapa (NPC, warp, lojas, players)
+            skip_ent = False
+            if hasattr(self.feed, "world"):
+                w = self.feed.world
+                with w.lock:
+                    for (ekind, _), ent in w.entities.items():
+                        if ekind in ("npc", "warp"):
                             ec = ent.track.target
-                            if max(abs(ec[0] - gx), abs(ec[1] - gy)) <= 2.5:
-                                skip_cell = True
+                            if max(abs(ec[0] - cx), abs(ec[1] - cy)) <= 2.2:
+                                skip_ent = True
                                 break
-        if skip_cell:
-            self._click_debug(f"PATROL: célula {sub_step_cell} bloqueada por entidade próxima")
+                    if not skip_ent:
+                        for _pid, (pc, _) in w.other_players.items():
+                            if max(abs(pc[0] - cx), abs(pc[1] - cy)) <= 2.2:
+                                skip_ent = True
+                                break
+                    if not skip_ent:
+                        for vaid in w.vending_aids:
+                            ent = w.entities.get(("npc", vaid))
+                            if ent:
+                                ec = ent.track.target
+                                if max(abs(ec[0] - cx), abs(ec[1] - cy)) <= 2.2:
+                                    skip_ent = True
+                                    break
+            if skip_ent:
+                continue
+
+            # Verifica proximidade visual de NPCs/Portais na tela (50px)
+            near_screen_ent = False
+            for item in snapshot.objects:
+                if item.kind in ("npc", "warp"):
+                    ix = left + int(item.u * width)
+                    iy = top + int(item.v * height)
+                    if math.hypot(cand_sx - ix, cand_sy - iy) < 50:
+                        near_screen_ent = True
+                        break
+            if near_screen_ent:
+                continue
+
+            candidates_forward.append((dist_p, cand, u, v))
+
+        # Seleciona o nó mais distante ao longo do contorno seguro
+        if candidates_forward:
+            candidates_forward.sort(key=lambda item: item[0], reverse=True)
+            _, sub_step_cell, sub_step_u, sub_step_v = candidates_forward[0]
+
+        if sub_step_cell is None:
+            self._click_debug("PATROL: Rota sem sub-passo clicável. Reiniciando patrol para nova rota!")
+            self._reset_patrol(px, py)
+            self.current_patrol_path = []
+            self.current_waypoint = None
             return
 
-        # Verifica distância em px de entidades na tela (55px)
-        sx_cand = left + int(sub_step_u * width)
-        sy_cand = top + int(sub_step_v * height)
-        for item in snapshot.objects:
-            if item.kind in ("npc", "warp"):
-                ix = left + int(item.u * width)
-                iy = top + int(item.v * height)
-                if math.hypot(sx_cand - ix, sy_cand - iy) < 55:
-                    self._click_debug(f"PATROL: célula {sub_step_cell} a < 55px de entidade na tela")
-                    return
-
-        # Cadência de cliques: não clica em excesso se o jogador já estiver andando
+        # ── Cadência Inteligente de Caminhada ──
+        # Se o personagem já está ativamente caminhando rumo ao destino e ainda tem mais
+        # de 2.2 células a percorrer no passo atual, não interrompe a animação com novos cliques
+        w_player = getattr(getattr(self.feed, "world", None), "player", None)
         is_walking = getattr(self.feed.world, "_is_player_walking", lambda: False)()
-        if is_walking and (now - self.last_patrol_click_time < 0.85):
-            return
+        if is_walking and w_player:
+            w_tgt = getattr(w_player, "target", None)
+            if w_tgt:
+                rem_walk = math.hypot(px - w_tgt[0], py - w_tgt[1])
+                if rem_walk >= 2.2 and (now - self.last_patrol_click_time < 1.1):
+                    return
+            elif now - self.last_patrol_click_time < 0.85:
+                return
 
         dist_player = math.hypot(sub_step_cell[0] - px, sub_step_cell[1] - py)
         if dist_player < 2.2:
-            self._click_debug(f"PATROL: clique descartado por zona de exclusão nos pés ({dist_player:.2f} < 2.2)")
+            self._click_debug(f"PATROL: clique descartado por proximidade aos pés ({dist_player:.2f} < 2.2)")
             return
 
         sx = left + int(sub_step_u * width)
         sy = top + int(sub_step_v * height)
 
+        _w = getattr(self.feed, "world", None)
+        _pre_tcp_cnt = getattr(_w, "player_move_pkt_count", 0) if _w else 0
+        _pre_tcp_time = getattr(_w, "last_player_move_pkt_time", 0.0) if _w else 0.0
+
         self._click_debug(f"PATROL: Passo em ({sub_step_cell[0]}, {sub_step_cell[1]}) -> tela ({sx}, {sy})")
         self._send_click(target_hwnd, sx, sy)
         self.last_patrol_click_time = now
         self.last_patrol_click_player_pos = (px, py)
-        self._walk_watchdog = {
-            "time": now,
-            "cell": sub_step_cell,
-            "sx": sx,
-            "sy": sy,
-            "px": px,
-            "py": py,
-        }
+        # Salva o alvo e dados para verificação estrita por pacotes TCP (0x0087)
+        self._last_patrol_click_target = (now, px, py, sub_step_cell[0], sub_step_cell[1], sx, sy, _pre_tcp_cnt, _pre_tcp_time, 0)
 
     def _game_is_foreground(self):
         """Verifica se o Ragexe.exe ou o processo do overlay está em primeiro plano."""
@@ -3332,6 +3578,42 @@ class Overlay:
                     return True
             except Exception:
                 pass
+        return False
+
+    def _is_point_in_game_ui(self, sx, sy):
+        """Verifica se (sx, sy) cai sobre a interface nativa do Ragnarok (chat, status, minimapa) ou sobre o HUD.
+        Retorna True se o ponto estiver em zona proibida de clique.
+        """
+        # 1. HUD panel (ControlPanel) com margem de 12px
+        hud = getattr(self, "_hud_panel", None)
+        if hud:
+            try:
+                if hud.winfo_exists() and hud.winfo_viewable():
+                    hx = hud.winfo_rootx() - 12
+                    hy = hud.winfo_rooty() - 12
+                    hw = hud.winfo_width() + 24
+                    hh = hud.winfo_height() + 24
+                    if hx <= sx <= hx + hw and hy <= sy <= hy + hh:
+                        return True
+            except Exception:
+                pass
+
+        # 2. Regiões da interface nativa do Ragnarok (baseadas na área cliente do jogo)
+        vp = getattr(self, "current_viewport", None)
+        if vp is None:
+            vp_obj = getattr(self.feed, "viewport", None)
+            vp = vp_obj() if callable(vp_obj) else None
+        if vp is not None:
+            vx, vy, vw, vh = vp
+            # Caixa de Chat (canto inferior esquerdo)
+            if sx <= vx + 470 and sy >= vy + vh - 235:
+                return True
+            # Janela de Status/Skills (canto superior esquerdo)
+            if sx <= vx + 435 and sy <= vy + 165:
+                return True
+            # Minimapa e Lista de Quests (canto superior direito)
+            if sx >= vx + vw - 265 and sy <= vy + 340:
+                return True
         return False
 
     def _side_step_to_reveal(self, target_cell, px, py):
@@ -3442,9 +3724,37 @@ class Overlay:
         self._picked_items_history.insert(0, (hora, item_name, max(1, cnt), is_fail))
         if len(self._picked_items_history) > 40:
             self._picked_items_history.pop()
+
         if not is_fail:
             # Coleta bem-sucedida: zera contador de tentativas (item em pilha não bloqueia)
             self.locked_drop_clicks = 0
+            # Registra no Histórico de Loot Coletado
+            self._loot_history.insert(0, (hora, item_name, max(1, cnt), item_id))
+            if len(self._loot_history) > 60:
+                self._loot_history.pop()
+            # Cruzamento com o último drop removido por 0x00A1 a <= 2.5 células do jogador
+            w = getattr(self.feed, "world", None)
+            if w:
+                try:
+                    now_m = time.monotonic()
+                    px_p, py_p = w.player.cell(now_m) if w.player else (None, None)
+                    if px_p is not None:
+                        # Verifica recent_seen_drops: drops que foram removidos com 0x00A1 (pick)
+                        for _rsd in list(getattr(w, "recent_seen_drops", {}).values()):
+                            if now_m - _rsd.get("removed_at", 0) < 3.0:
+                                rx, ry = _rsd.get("cell", (None, None))
+                                if rx is not None and math.hypot(rx - px_p, ry - py_p) <= 2.5:
+                                    # Confirma nameid
+                                    rnameid = _rsd.get("item_id", 0)
+                                    if rnameid and rnameid != item_id:
+                                        # Adiciona também este item ao histórico de loot
+                                        rname = self.names.get("drop", {}).get(rnameid, f"Item #{rnameid}")
+                                        self._loot_history.insert(0, (hora, rname, 1, rnameid))
+                                        if len(self._loot_history) > 60:
+                                            self._loot_history.pop()
+                except Exception:
+                    pass
+
         if is_fail:
             target_gid = self.locked_drop_gid
             self._click_debug(f"LOOT FALHOU (0x00A0 fail={fail}): item #{item_id} (gid={target_gid}) bloqueado por 8s")
@@ -3488,7 +3798,7 @@ class Overlay:
         now = time.monotonic()
         _, player, _ = self.feed.world.snapshot()
         if px is None or py is None:
-            px, py = player.cell(now) if player else (None, None)
+            px, py = player.cell() if player else (None, None)
         left, top, width, height = snapshot.viewport
 
         curr_map = getattr(getattr(self.feed, "world", None), "map", None)
@@ -3602,10 +3912,15 @@ class Overlay:
             is_near_edge = (target_item.u < 0.15 or target_item.u > 0.85 or target_item.v < 0.15 or target_item.v > 0.85)
             is_in_hud = self._is_point_in_hud(sx, sy, margin=10)
 
-            # Pausa se o personagem estiver andando em deslocamento ativo
-            if player and player.duration and now < player.started + min(player.duration, 2.5):
-                self._click_debug(f"LOOT pausado: personagem andando (drop:{self.locked_drop_gid})")
-                return
+            # Se o drop estiver distante (> 2.2 células) e o personagem já estiver caminhando em direção a ele,
+            # aguarda aproximar sem travar a tomada de decisão; se já estiver aos pés (<= 2.2), coleta em movimento!
+            is_walking = getattr(self.feed.world, "_is_player_walking", lambda: False)()
+            if is_walking and dist_drop > 2.2:
+                w_player = getattr(getattr(self.feed, "world", None), "player", None)
+                if w_player and getattr(w_player, "target", None):
+                    rem_w = math.hypot(px - w_player.target[0], py - w_player.target[1])
+                    if rem_w >= 1.8 and (now - getattr(self, "last_loot_click", 0.0) < 0.85):
+                        return
 
             # A* para aproximação: se estiver a > 3.5 células, ou na borda, ou atrás do HUD
             if dist_drop > 3.5 or is_near_edge or is_in_hud:
@@ -4033,193 +4348,217 @@ class Overlay:
 
     def _send_click(self, hwnd, screen_x, screen_y, test_mode=False, **_kwargs):
         """Envia clique na posição física (screen_x, screen_y)."""
+        # ── Proteção de Concorrência: previne cliques sobrepostos entre ticks ──
+        if not test_mode and getattr(self, "_click_in_progress", False):
+            self._click_debug(f"CLIQUE IGNORADO (concorrência): ({int(screen_x)},{int(screen_y)})")
+            return
+
         sx = int(screen_x)
         sy = int(screen_y)
+
+        # Validação de limites: descarta cliques fora da área de tela
+        sw = getattr(self, "_screen_w", 1920)
+        sh = getattr(self, "_screen_h", 1080)
+        if not (0 <= sx < sw and 0 <= sy < sh):
+            self._click_debug(f"CLIQUE BLOQUEADO: ({sx},{sy}) fora da tela ({sw}x{sh})")
+            return
 
         # Zona Proibida do Retângulo do HUD (com margem de 10px): nunca clique ali
         if not test_mode and self._is_point_in_hud(sx, sy, margin=10):
             self._click_debug(f"CLIQUE BLOQUEADO: ({sx},{sy}) está dentro do HUD (zona proibida)")
             return
 
-        # Registra clique no CameraTracker para auto-calibração PnP
-        if not test_mode and hasattr(self, "feed") and hasattr(self.feed, "camera"):
-            vp = getattr(self, "current_viewport", None) or (self.feed.viewport() if callable(getattr(self.feed, "viewport", None)) else None)
-            if vp and hasattr(self.feed.camera, "record_click"):
-                self.feed.camera.record_click(sx, sy, vp)
-
-        method = self._click_method
-
-        if method == "touch_postmsg":
-            ensure_input_desktop()
-            self.touch_postmsg(sx, sy, self.get_game_hwnd(hwnd), test_mode=test_mode)
+        # Zona Proibida da Interface Nativa do Jogo (chat, status, minimapa)
+        if not test_mode and self._is_point_in_game_ui(sx, sy):
+            self._click_debug(f"CLIQUE BLOQUEADO: ({sx},{sy}) está sobre a UI nativa do Ragnarok")
             return
 
-        # ── 0. Hardware USB HID (Serial) Bypass se conectado ────────────────
-        if not test_mode and hasattr(self, "serial_hid") and self.serial_hid and self.serial_hid.is_connected:
-            ok_serial = self.serial_hid.send_click(sx, sy)
-            if ok_serial:
-                self._click_debug(f"CLIQUE em ({sx},{sy}) via Serial HID ({self.serial_hid.port}): Sucesso")
+        # ── Trava de concorrência: try/finally garante que nunca fica presa em True ──
+        if not test_mode:
+            self._click_in_progress = True
+        try:
+            # Registra clique no CameraTracker para auto-calibração PnP
+            if not test_mode and hasattr(self, "feed") and hasattr(self.feed, "camera"):
+                vp = getattr(self, "current_viewport", None) or (self.feed.viewport() if callable(getattr(self.feed, "viewport", None)) else None)
+                if vp and hasattr(self.feed.camera, "record_click"):
+                    self.feed.camera.record_click(sx, sy, vp)
+
+            method = self._click_method
+
+            if method == "touch_postmsg":
+                ensure_input_desktop()
+                self.touch_postmsg(sx, sy, self.get_game_hwnd(hwnd), test_mode=test_mode)
                 return
 
-        # ── 0.1 Driver Kernel HID (interception.dll) ─────────────────────
-        if not test_mode and hasattr(self, "interception") and self.interception and self.interception.is_available:
-            ok_inter = self.interception.send_click(sx, sy, self._screen_w, self._screen_h)
-            if ok_inter:
-                self._click_debug(f"CLIQUE em ({sx},{sy}) via Interception Driver: Sucesso [Kernel Filter Bypass]")
-                return
+            # ── 0. Hardware USB HID (Serial) Bypass se conectado ────────────────
+            if not test_mode and hasattr(self, "serial_hid") and self.serial_hid and self.serial_hid.is_connected:
+                ok_serial = self.serial_hid.send_click(sx, sy)
+                if ok_serial:
+                    self._click_debug(f"CLIQUE em ({sx},{sy}) via Serial HID ({self.serial_hid.port}): Sucesso")
+                    return
 
-        # Revalida/redetecta a janela do jogo
-        hwnd = self.get_game_hwnd(hwnd)
-        ensure_input_desktop()
+            # ── 0.1 Driver Kernel HID (interception.dll) ─────────────────────
+            if not test_mode and hasattr(self, "interception") and self.interception and self.interception.is_available:
+                ok_inter = self.interception.send_click(sx, sy, self._screen_w, self._screen_h)
+                if ok_inter:
+                    self._click_debug(f"CLIQUE em ({sx},{sy}) via Interception Driver: Sucesso [Kernel Filter Bypass]")
+                    return
 
-        # ── Coordenadas normalizadas para Virtual Screen (MOUSEEVENTF_ABSOLUTE) ──
-        SM_XVIRTUALSCREEN = 76
-        SM_YVIRTUALSCREEN = 77
-        SM_CXVIRTUALSCREEN = 78
-        SM_CYVIRTUALSCREEN = 79
-        v_left = self.user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
-        v_top  = self.user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
-        v_w    = self.user32.GetSystemMetrics(SM_CXVIRTUALSCREEN) or self._screen_w
-        v_h    = self.user32.GetSystemMetrics(SM_CYVIRTUALSCREEN) or self._screen_h
-        norm_x = max(0, min(65535, int(((sx - v_left) * 65535) / max(1, v_w - 1))))
-        norm_y = max(0, min(65535, int(((sy - v_top)  * 65535) / max(1, v_h - 1))))
-        MOUSEEVENTF_VIRTUALDESK = 0x4000
-        abs_flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+            # Revalida/redetecta a janela do jogo
+            hwnd = self.get_game_hwnd(hwnd)
+            ensure_input_desktop()
 
-        is_admin_now = bool(ctypes.windll.shell32.IsUserAnAdmin())
+            # ── Coordenadas normalizadas para Virtual Screen (MOUSEEVENTF_ABSOLUTE) ──
+            SM_XVIRTUALSCREEN = 76
+            SM_YVIRTUALSCREEN = 77
+            SM_CXVIRTUALSCREEN = 78
+            SM_CYVIRTUALSCREEN = 79
+            v_left = self.user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+            v_top  = self.user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+            v_w    = self.user32.GetSystemMetrics(SM_CXVIRTUALSCREEN) or self._screen_w
+            v_h    = self.user32.GetSystemMetrics(SM_CYVIRTUALSCREEN) or self._screen_h
+            norm_x = max(0, min(65535, int(((sx - v_left) * 65535) / max(1, v_w - 1))))
+            norm_y = max(0, min(65535, int(((sy - v_top)  * 65535) / max(1, v_h - 1))))
+            MOUSEEVENTF_VIRTUALDESK = 0x4000
+            abs_flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
 
-        if method == "touch_win32":
-            # ── Método touch_win32: InjectTouchInput para posicionar → 30ms → SendInput clique ──
-            # InjectTouchInput serve APENAS para mover o ponteiro do sistema sem bloquear o cursor.
-            # Depois, SendInput exclusivo (LEFTDOWN → 55ms → LEFTUP).
-            ok_init, err_init, r_touch_down, err_touch_down, r_touch_up, err_touch_up = (
-                self._move_pointer_with_touch(sx, sy)
-            )
+            is_admin_now = bool(ctypes.windll.shell32.IsUserAnAdmin())
 
-            # Captura cursor antes
-            pt_before = wintypes.POINT()
-            u32.GetCursorPos(ctypes.byref(pt_before))
+            if method == "touch_win32":
+                # ── Método touch_win32: InjectTouchInput para posicionar → 30ms → SendInput clique ──
+                # InjectTouchInput serve APENAS para mover o ponteiro do sistema sem bloquear o cursor.
+                # Depois, SendInput exclusivo (LEFTDOWN → 55ms → LEFTUP).
+                ok_init, err_init, r_touch_down, err_touch_down, r_touch_up, err_touch_up = (
+                    self._move_pointer_with_touch(sx, sy)
+                )
 
-            # SendInput LEFTDOWN (40 bytes, exclusivo)
-            inp_down = INPUT(type=INPUT_MOUSE)
-            inp_down.mi.dx = norm_x
-            inp_down.mi.dy = norm_y
-            inp_down.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | abs_flags
-            ctypes.windll.kernel32.SetLastError(0)
-            r_si_down = int(u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT)))
-            err_si_down = ctypes.get_last_error()
+                # Captura cursor antes
+                pt_before = wintypes.POINT()
+                u32.GetCursorPos(ctypes.byref(pt_before))
 
-            time.sleep(0.055)
+                # SendInput LEFTDOWN (40 bytes, exclusivo)
+                inp_down = INPUT(type=INPUT_MOUSE)
+                inp_down.mi.dx = norm_x
+                inp_down.mi.dy = norm_y
+                inp_down.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | abs_flags
+                ctypes.windll.kernel32.SetLastError(0)
+                r_si_down = int(u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT)))
+                err_si_down = ctypes.get_last_error()
 
-            # SendInput LEFTUP (40 bytes, exclusivo)
-            inp_up = INPUT(type=INPUT_MOUSE)
-            inp_up.mi.dx = norm_x
-            inp_up.mi.dy = norm_y
-            inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
-            ctypes.windll.kernel32.SetLastError(0)
-            r_si_up = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
-            err_si_up = ctypes.get_last_error()
+                time.sleep(0.055)
 
-            pt_after = wintypes.POINT()
-            u32.GetCursorPos(ctypes.byref(pt_after))
+                # SendInput LEFTUP (40 bytes, exclusivo)
+                inp_up = INPUT(type=INPUT_MOUSE)
+                inp_up.mi.dx = norm_x
+                inp_up.mi.dy = norm_y
+                inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
+                ctypes.windll.kernel32.SetLastError(0)
+                r_si_up = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
+                err_si_up = ctypes.get_last_error()
 
-            fg_hwnd = u32.GetForegroundWindow()
-            fg_pid_v = wintypes.DWORD()
-            u32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid_v))
+                pt_after = wintypes.POINT()
+                u32.GetCursorPos(ctypes.byref(pt_after))
 
-            msg = (
-                f"touch_win32 ({sx},{sy}): "
-                f"is_admin={is_admin_now} fg_pid={fg_pid_v.value} "
-                f"cursor_antes=({pt_before.x},{pt_before.y}) cursor_depois=({pt_after.x},{pt_after.y}) "
-                f"TouchInit={ok_init}(err={err_init}) "
-                f"TouchDown={r_touch_down}(err={err_touch_down}) TouchUp={r_touch_up}(err={err_touch_up}) "
-                f"SI_DOWN={r_si_down}(err={err_si_down}) SI_UP={r_si_up}(err={err_si_up})"
-            )
-            log_click_file(msg)
-            if test_mode:
-                for line in msg.split(" "):
-                    print(f"    [Passo] {line}", flush=True)
+                fg_hwnd = u32.GetForegroundWindow()
+                fg_pid_v = wintypes.DWORD()
+                u32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid_v))
 
-        elif method == "win32":
-            # ── Método win32: SetCursorPos + micro-deslocamento relativo + 30ms + SendInput ──
-            # Foca janela do jogo se necessário
-            if hwnd and u32.IsWindow(hwnd):
-                fg = u32.GetForegroundWindow()
-                if not fg or int(fg) != int(hwnd):
-                    u32.SetForegroundWindow(hwnd)
-                    u32.BringWindowToTop(hwnd)
+                msg = (
+                    f"touch_win32 ({sx},{sy}): "
+                    f"is_admin={is_admin_now} fg_pid={fg_pid_v.value} "
+                    f"cursor_antes=({pt_before.x},{pt_before.y}) cursor_depois=({pt_after.x},{pt_after.y}) "
+                    f"TouchInit={ok_init}(err={err_init}) "
+                    f"TouchDown={r_touch_down}(err={err_touch_down}) TouchUp={r_touch_up}(err={err_touch_up}) "
+                    f"SI_DOWN={r_si_down}(err={err_si_down}) SI_UP={r_si_up}(err={err_si_up})"
+                )
+                log_click_file(msg)
+                if test_mode:
+                    for line in msg.split(" "):
+                        print(f"    [Passo] {line}", flush=True)
 
-            # Posiciona cursor
-            ctypes.windll.kernel32.SetLastError(0)
-            ok_pos = bool(u32.SetCursorPos(sx, sy))
-            err_pos = ctypes.get_last_error()
+            elif method == "win32":
+                # ── Método win32: SetCursorPos + micro-deslocamento relativo + 30ms + SendInput ──
+                # Foca janela do jogo se necessário
+                if hwnd and u32.IsWindow(hwnd):
+                    fg = u32.GetForegroundWindow()
+                    if not fg or int(fg) != int(hwnd):
+                        u32.SetForegroundWindow(hwnd)
+                        u32.BringWindowToTop(hwnd)
 
-            # Micro-deslocamento relativo (força atualização de janela hover)
-            inp_rel1 = INPUT(type=INPUT_MOUSE)
-            inp_rel1.mi.dx = 1
-            inp_rel1.mi.dy = 0
-            inp_rel1.mi.dwFlags = MOUSEEVENTF_MOVE  # relativo (sem ABSOLUTE)
-            u32.SendInput(1, ctypes.byref(inp_rel1), ctypes.sizeof(INPUT))
+                # Posiciona cursor
+                ctypes.windll.kernel32.SetLastError(0)
+                ok_pos = bool(u32.SetCursorPos(sx, sy))
+                err_pos = ctypes.get_last_error()
 
-            inp_rel2 = INPUT(type=INPUT_MOUSE)
-            inp_rel2.mi.dx = -1
-            inp_rel2.mi.dy = 0
-            inp_rel2.mi.dwFlags = MOUSEEVENTF_MOVE
-            u32.SendInput(1, ctypes.byref(inp_rel2), ctypes.sizeof(INPUT))
+                # Micro-deslocamento relativo (força atualização de janela hover)
+                inp_rel1 = INPUT(type=INPUT_MOUSE)
+                inp_rel1.mi.dx = 1
+                inp_rel1.mi.dy = 0
+                inp_rel1.mi.dwFlags = MOUSEEVENTF_MOVE  # relativo (sem ABSOLUTE)
+                u32.SendInput(1, ctypes.byref(inp_rel1), ctypes.sizeof(INPUT))
 
-            pt_before = wintypes.POINT()
-            u32.GetCursorPos(ctypes.byref(pt_before))
+                inp_rel2 = INPUT(type=INPUT_MOUSE)
+                inp_rel2.mi.dx = -1
+                inp_rel2.mi.dy = 0
+                inp_rel2.mi.dwFlags = MOUSEEVENTF_MOVE
+                u32.SendInput(1, ctypes.byref(inp_rel2), ctypes.sizeof(INPUT))
 
-            time.sleep(0.030)
+                pt_before = wintypes.POINT()
+                u32.GetCursorPos(ctypes.byref(pt_before))
 
-            # SendInput LEFTDOWN exclusivo
-            inp_down = INPUT(type=INPUT_MOUSE)
-            inp_down.mi.dx = norm_x
-            inp_down.mi.dy = norm_y
-            inp_down.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | abs_flags
-            ctypes.windll.kernel32.SetLastError(0)
-            r_si_down = int(u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT)))
-            err_si_down = ctypes.get_last_error()
+                time.sleep(0.030)
 
-            time.sleep(0.055)
+                # SendInput LEFTDOWN exclusivo
+                inp_down = INPUT(type=INPUT_MOUSE)
+                inp_down.mi.dx = norm_x
+                inp_down.mi.dy = norm_y
+                inp_down.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | abs_flags
+                ctypes.windll.kernel32.SetLastError(0)
+                r_si_down = int(u32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT)))
+                err_si_down = ctypes.get_last_error()
 
-            # SendInput LEFTUP exclusivo
-            inp_up = INPUT(type=INPUT_MOUSE)
-            inp_up.mi.dx = norm_x
-            inp_up.mi.dy = norm_y
-            inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
-            ctypes.windll.kernel32.SetLastError(0)
-            r_si_up = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
-            err_si_up = ctypes.get_last_error()
+                time.sleep(0.055)
 
-            pt_after = wintypes.POINT()
-            u32.GetCursorPos(ctypes.byref(pt_after))
+                # SendInput LEFTUP exclusivo
+                inp_up = INPUT(type=INPUT_MOUSE)
+                inp_up.mi.dx = norm_x
+                inp_up.mi.dy = norm_y
+                inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
+                ctypes.windll.kernel32.SetLastError(0)
+                r_si_up = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
+                err_si_up = ctypes.get_last_error()
 
-            fg_hwnd = u32.GetForegroundWindow()
-            fg_pid_v = wintypes.DWORD()
-            u32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid_v))
+                pt_after = wintypes.POINT()
+                u32.GetCursorPos(ctypes.byref(pt_after))
 
-            msg = (
-                f"win32 ({sx},{sy}): "
-                f"is_admin={is_admin_now} fg_pid={fg_pid_v.value} "
-                f"cursor_antes=({pt_before.x},{pt_before.y}) cursor_depois=({pt_after.x},{pt_after.y}) "
-                f"SetCursorPos={ok_pos}(err={err_pos}) "
-                f"SI_DOWN={r_si_down}(err={err_si_down}) SI_UP={r_si_up}(err={err_si_up})"
-            )
-            log_click_file(msg)
-            if test_mode:
-                for line in msg.split(" "):
-                    print(f"    [Passo] {line}", flush=True)
+                fg_hwnd = u32.GetForegroundWindow()
+                fg_pid_v = wintypes.DWORD()
+                u32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid_v))
 
-        elif method == "postmsg":
-            self._postmsg_click(hwnd, sx, sy, test_mode)
+                msg = (
+                    f"win32 ({sx},{sy}): "
+                    f"is_admin={is_admin_now} fg_pid={fg_pid_v.value} "
+                    f"cursor_antes=({pt_before.x},{pt_before.y}) cursor_depois=({pt_after.x},{pt_after.y}) "
+                    f"SetCursorPos={ok_pos}(err={err_pos}) "
+                    f"SI_DOWN={r_si_down}(err={err_si_down}) SI_UP={r_si_up}(err={err_si_up})"
+                )
+                log_click_file(msg)
+                if test_mode:
+                    for line in msg.split(" "):
+                        print(f"    [Passo] {line}", flush=True)
 
-        else:
-            # Fallback para métodos legados (absolute, touch, touch_hybrid)
-            # Mantém comportamento anterior para compatibilidade
-            self._send_click_legacy(hwnd, sx, sy, test_mode=test_mode,
-                                     norm_x=norm_x, norm_y=norm_y, abs_flags=abs_flags,
-                                     is_admin_now=is_admin_now)
+            elif method == "postmsg":
+                self._postmsg_click(hwnd, sx, sy, test_mode)
+
+            else:
+                # Fallback para métodos legados (absolute, touch, touch_hybrid)
+                # Mantém comportamento anterior para compatibilidade
+                self._send_click_legacy(hwnd, sx, sy, test_mode=test_mode,
+                                         norm_x=norm_x, norm_y=norm_y, abs_flags=abs_flags,
+                                         is_admin_now=is_admin_now)
+        finally:
+            if not test_mode:
+                self._click_in_progress = False
 
     def _send_click_legacy(self, hwnd, sx, sy, test_mode=False, norm_x=0, norm_y=0, abs_flags=0, is_admin_now=False):
         """Fallback para métodos de clique legados (absolute, touch, touch_hybrid)."""
@@ -4489,66 +4828,111 @@ class Overlay:
             is_near_edge = (target_item.u < 0.15 or target_item.u > 0.85 or target_item.v < 0.15 or target_item.v > 0.85)
             is_in_hud = self._is_point_in_hud(sx, sy, margin=10)
 
-            # Pausa se o personagem estiver andando em deslocamento ativo
-            if player and player.duration and now < player.started + min(player.duration, 2.5):
-                self._click_debug(f"FARM pausado: personagem andando (mob:{self.locked_mob_gid})")
-                return
+            # Avalia se há linha direta de ataque (sem abismos, paredes ou desnível íngreme)
+            p_elev = gat.get_elevation(px, py) if (gat and hasattr(gat, "get_elevation")) else 0.0
+            m_elev = gat.get_elevation(mob_cell[0], mob_cell[1]) if (gat and hasattr(gat, "get_elevation") and mob_cell) else p_elev
+            elev_diff = abs(m_elev - p_elev)
+            has_direct_line = (
+                mob_cell is not None and
+                elev_diff <= 14.0 and
+                self._has_walkable_line((px, py), mob_cell, gat)
+            )
 
-            # Se o monstro for alcançável mas estiver a > 4.5 células (ou na borda / atrás do HUD): anda via A*
-            if dist_mob > 4.5 or is_near_edge or is_in_hud:
-                # Se estiver a <= 4.5 células e apenas atrás do HUD, tenta passo lateral para desobstruir visão
-                if dist_mob <= 4.5 and is_in_hud and mob_cell:
+            is_walking = getattr(self.feed.world, "_is_player_walking", lambda: False)()
+
+            # O monstro só pode ser atacado diretamente se estiver a <= 2.2 células (alcance corpo-a-corpo),
+            # com linha direta caminhável, sem desnível de penhasco, fora do HUD e em área segura da tela:
+            can_direct_attack = (dist_mob <= 2.2 and has_direct_line and not is_near_edge and not is_in_hud)
+
+            if not can_direct_attack:
+                # Monstro fora de alcance ou obstruído por relevo/obstáculo: APROXIMAÇÃO VIA ROTA A*
+                # Se estiver a <= 3.5 células e apenas atrás do HUD, tenta passo lateral para desobstruir visão
+                if dist_mob <= 3.5 and is_in_hud and mob_cell:
                     if self._side_step_to_reveal(mob_cell, px, py):
                         return
 
-                # Caminhada via A* em direção ao monstro
+                # Se o personagem já está caminhando rumo ao monstro e ainda tem mais de 2.0 células para andar,
+                # não envia novos cliques de chão a cada tick, mantendo o movimento fluido
+                w_player = getattr(getattr(self.feed, "world", None), "player", None)
+                if is_walking and w_player:
+                    w_tgt = getattr(w_player, "target", None)
+                    if w_tgt and math.hypot(px - w_tgt[0], py - w_tgt[1]) >= 2.0 and (now - self.last_farm_click < 0.9):
+                        return
+
                 if gat and px is not None and mob_cell:
                     start_cell = (int(round(px)), int(round(py)))
-                    path = gat.find_path(start_cell, (int(round(mob_cell[0])), int(round(mob_cell[1]))), blocked_cells=self.temp_blocked_cells)
+                    target_goal = (int(round(mob_cell[0])), int(round(mob_cell[1])))
+                    path = gat.find_path(start_cell, target_goal, blocked_cells=self.temp_blocked_cells)
+                    if not path:
+                        # Se não há rota direta para a célula do mob (ex: mob em água ou encosta), tenta adjacente
+                        alt_goal = gat.find_nearest_walkable(*target_goal, max_radius=3, blocked_cells=self.temp_blocked_cells)
+                        if alt_goal:
+                            path = gat.find_path(start_cell, alt_goal, blocked_cells=self.temp_blocked_cells)
+
                     if not path:
                         self._farm_blacklist[self.locked_mob_gid] = now + 6.0
-                        self._reset_patrol(px, py)
                         self.locked_mob_gid = None
+                        self.locked_mob_clicks = 0
                         return
 
                     self.active_nav_path = list(path)
                     self.active_nav_color = "#F87171"  # Vermelho = Auto-Farm
 
-                    # Seleciona sub-passo a 8–10 células de distância
                     cam_pos = getattr(self.feed, "_cam", None) or (px, py)
                     height_fn = getattr(gat, "get_elevation", gat.height_at)
                     project = self.feed.camera.projector(snapshot.viewport, cam_pos, height_fn)
 
+                    # Seleciona o sub-passo mais avançado seguro ao longo da rota A* (até 8 nós à frente)
                     step_cand = None
-                    max_idx = min(len(path) - 1, 10)
-                    for idx in range(max_idx, 1, -1):
+                    max_idx = min(len(path) - 1, 8)
+                    for idx in range(max_idx, 0, -1):
                         cand = path[idx]
-                        if math.hypot(cand[0] - px, cand[1] - py) < 2.2:
+                        if math.hypot(cand[0] - px, cand[1] - py) < 1.8:
+                            continue
+                        if hasattr(gat, "get_elevation"):
+                            cand_elev = gat.get_elevation(cand[0], cand[1])
+                            if abs(cand_elev - p_elev) > 16.0:
+                                continue
+                        if not self._has_walkable_line((px, py), cand, gat):
                             continue
                         u_c, v_c = project(*cand)
                         if 0.15 <= u_c <= 0.85 and 0.15 <= v_c <= 0.85:
                             cand_sx = left + int(u_c * width)
                             cand_sy = top + int(v_c * height)
-                            if not self._is_point_in_hud(cand_sx, cand_sy, margin=10):
+                            if not self._is_point_in_hud(cand_sx, cand_sy, margin=10) and not self._is_point_in_game_ui(cand_sx, cand_sy):
                                 step_cand = (cand, cand_sx, cand_sy)
                                 break
 
                     if step_cand:
                         c_cell, c_sx, c_sy = step_cand
-                        self._click_debug(f"FARM A*: andando para mob #{self.locked_mob_gid} (dist={dist_mob:.1f}) via ({c_cell[0]},{c_cell[1]})")
+                        self._click_debug(f"FARM A*: aproximando do mob #{self.locked_mob_gid} (dist={dist_mob:.1f}) via ({c_cell[0]},{c_cell[1]})")
                         self._send_click(target_hwnd, c_sx, c_sy)
                         self.last_farm_click = now
                         return
+                    elif not is_walking:
+                        # Se não encontrou sub-passo seguro e está parado, clica no primeiro passo adjacente viável
+                        for idx in range(min(len(path) - 1, 3), 0, -1):
+                            cand = path[idx]
+                            u_c, v_c = project(*cand)
+                            cand_sx = left + int(u_c * width)
+                            cand_sy = top + int(v_c * height)
+                            if not self._is_point_in_hud(cand_sx, cand_sy) and not self._is_point_in_game_ui(cand_sx, cand_sy):
+                                self._send_click(target_hwnd, cand_sx, cand_sy)
+                                self.last_farm_click = now
+                                return
 
-            # Monstro alcançável a <= 4.5 células, fora do HUD e em área segura: clica para atacar
+                return
+
+            # Monstro em alcance direto de ataque (<= 2.2 células): clica para atacar
+            # Não espera o personagem parar de andar: se chegou em alcance de ataque, clica no monstro imediatamente!
             if self.locked_mob_clicks == 0:
-                if now - self.locked_mob_first_time < 0.10:
+                if now - self.locked_mob_first_time < 0.08:
                     return
             else:
-                if now - self.last_farm_click < 0.65:
+                if now - self.last_farm_click < 0.60:
                     return
 
-            self._click_debug(f"FARM clique #{self.locked_mob_clicks+1} em ({sx},{sy}) mob:{self.locked_mob_gid}")
+            self._click_debug(f"FARM clique #{self.locked_mob_clicks+1} em ({sx},{sy}) mob:{self.locked_mob_gid} (dist={dist_mob:.1f})")
             self._send_click(target_hwnd, sx, sy)
             self.last_farm_click = now
             self.locked_mob_clicks += 1

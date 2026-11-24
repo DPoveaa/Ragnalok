@@ -442,6 +442,7 @@ class World:
         self.recent_picked_items = []
         self.recent_seen_drops = []
         self.last_player_move_pkt_time = 0.0
+        self.player_move_pkt_count = 0
         self.current_map = f"{self.initial_map}.gat" if self.initial_map else None
         self.npc_dialog = {
             "open": False,
@@ -670,6 +671,8 @@ class World:
             self.recent_drop_gids.clear()
             self.recent_picked_items.clear()
             self.recent_seen_drops.clear()
+            self.last_player_move_pkt_time = 0.0
+            self.player_move_pkt_count = 0
             self.npc_dialog["open"] = False
             self.npc_dialog["type"] = "closed"
             self.npc_dialog["options"] = []
@@ -955,7 +958,9 @@ class World:
             self.npc_dialog["last_ts"] = now_perf
             self.npc_dialog["last_update"] = time.monotonic()
         elif opcode == 0x0087:
-            self.last_player_move_pkt_time = time.monotonic()
+            now_m = time.monotonic()
+            self.last_player_move_pkt_time = now_m
+            self.player_move_pkt_count += 1
             if len(data) >= 12:
                 b = data[6:12]
                 x0 = (b[0] << 2) | (b[1] >> 6)
@@ -1145,14 +1150,22 @@ class World:
                         by_others = (gid in self.mobs_damaged_by_others or real_gid in self.mobs_damaged_by_others) and (
                             now - self.mobs_damaged_by_others.get(real_gid, self.mobs_damaged_by_others.get(gid, 0)) < 15.0
                         )
+                        # Verifica proximidade: <= 12 células do jogador ou era alvo do jogador
+                        px_k, py_k = self.player.cell(now) if self.player else (None, None)
+                        near_player = (
+                            px_k is not None and
+                            math.hypot(mob_cell[0] - px_k, mob_cell[1] - py_k) <= 12.0
+                        ) or by_me
                         self.recent_dead_mobs.append({
                             "gid": real_gid,
                             "catalog_id": mob.catalog_id if mob else 0,
+                            "job_id": mob.catalog_id if mob else 0,
                             "cell": mob_cell,
                             "by_me": by_me,
                             "by_others": by_others,
+                            "near_player": near_player,
                             "time": now,
-                            "kill_ts": time.strftime("%H:%M:%S"),  # ← adicionar este campo
+                            "kill_ts": time.strftime("%H:%M:%S"),
                         })
                         if len(self.recent_dead_mobs) > 40:
                             self.recent_dead_mobs.pop(0)
@@ -1160,6 +1173,22 @@ class World:
                     self.other_players.pop(real_gid, None)
                     self.players.pop(gid, None)
                     self.players.pop(real_gid, None)
+                elif opcode == 0x00A1:
+                    # 0x00A1 ZC_ITEM_DISAPPEAR: registra posição do drop antes de removê-lo
+                    # para permitir cruzamento com 0x00A0 (item coletado a <= 2.5 células)
+                    now_a1 = time.monotonic()
+                    drop_ent = self.entities.get(("drop", real_gid)) or self.entities.get(("drop", gid))
+                    if drop_ent:
+                        self.recent_seen_drops.append({
+                            "aid": real_gid,
+                            "item_id": drop_ent.catalog_id,
+                            "count": drop_ent.amount,
+                            "cell": drop_ent.track.target,
+                            "time": now_a1,
+                            "removed_at": now_a1,  # marcador para cruzamento com 0x00A0
+                        })
+                        if len(self.recent_seen_drops) > 40:
+                            self.recent_seen_drops.pop(0)
                 self.vending_aids.discard(gid)
                 self.vending_aids.discard(real_gid)
                 for k in ("mob", "npc", "warp", "drop"):

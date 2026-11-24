@@ -255,6 +255,8 @@ class Gat:
                     continue
                 if not self.is_walkable(cx, cy):
                     continue
+                if self.count_walkable_neighbors(cx, cy) < 6:
+                    continue
 
                 # Calcula score de exploração (maior distância dos visitados recentes)
                 if recent_visited:
@@ -285,7 +287,7 @@ class Gat:
                     if dx == 0 and dy == 0:
                         continue
                     cand = (px + dx, py + dy)
-                    if self.is_walkable(*cand) and cand not in blocked_set:
+                    if self.is_walkable(*cand) and cand not in blocked_set and self.count_walkable_neighbors(*cand) >= 6:
                         return cand
 
         return None
