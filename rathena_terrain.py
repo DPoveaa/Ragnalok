@@ -260,7 +260,8 @@ class Gat:
                     continue
                 if not self.is_walkable(cx, cy):
                     continue
-                if self.count_walkable_neighbors(cx, cy) < 6:
+                min_neigh = 3 if dist <= 4 else (4 if dist <= 12 else 5)
+                if self.count_walkable_neighbors(cx, cy) < min_neigh:
                     continue
 
                 # Calcula score de exploração (maior distância dos visitados recentes)
@@ -1315,11 +1316,13 @@ def load_item_catalog(grf_path="D:/Jogos/Ragnarok/data.grf", lua_path="D:/Jogos/
 
     # 1. Tenta carregar do itemInfo.lua ou itemInfo.lub
     lua_candidates = [
-        Path(lua_path),
+        Path(lua_path) if lua_path else None,
+        Path("D:/Jogos/Ragnarok/System/itemInfo.lua"),
         Path("D:/Jogos/Ragnarok/System/itemInfo.lub"),
         Path("D:/Jogos/Ragnarok/System/iteminfo_new.lub"),
         Path("./itemInfo.lua"),
     ]
+    lua_candidates = [p for p in lua_candidates if p is not None]
     for lp in lua_candidates:
         if lp.is_file():
             try:
@@ -1329,91 +1332,116 @@ def load_item_catalog(grf_path="D:/Jogos/Ragnarok/data.grf", lua_path="D:/Jogos/
                 except UnicodeDecodeError:
                     text = raw.decode("latin-1", errors="replace")
 
-                for entry in re.split(r"(?=^\s*\[\d+\]\s*=\s*\{)", text, flags=re.M):
-                    m_id = re.search(r"^\s*\[(\d+)\]", entry, flags=re.M)
-                    if not m_id:
+                cur_id = None
+                for line in text.splitlines():
+                    line_s = line.strip()
+                    if not line_s:
                         continue
-                    nid = int(m_id.group(1))
-                    m_name = re.search(r"^\s*identifiedDisplayName\s*=\s*(?:\[=*\[(.*?)(?:\]=*\])|[\"'](.*?)[\"'])", entry, flags=re.M)
-                    if m_name:
-                        dname = (m_name.group(1) if m_name.group(1) is not None else m_name.group(2)) or ""
-                        dname = re.sub(r'\\(\d{1,3})', lambda m: chr(int(m.group(1))), dname)
-                        dname = re.sub(r'\^[0-9A-Fa-f]{6}', '', dname)
-                        dname = " ".join(dname.split())
-                        if dname:
-                            names[nid] = dname
-                    m_slot = re.search(r"^\s*slotCount\s*=\s*(\d+)", entry, flags=re.M)
-                    m_class = re.search(r"^\s*ClassNum\s*=\s*(\d+)", entry, flags=re.M)
-                    if m_slot and int(m_slot.group(1)) > 0:
-                        equips.add(nid)
-                    if m_class and int(m_class.group(1)) > 0:
-                        equips.add(nid)
+                    if line_s.startswith("[") and "]=" in line_s.replace(" ", ""):
+                        bracket_end = line_s.find("]")
+                        if bracket_end != -1:
+                            id_str = line_s[1:bracket_end].strip()
+                            if id_str.isdigit():
+                                cur_id = int(id_str)
+                        continue
+                    if cur_id is None:
+                        continue
+                    if "identifiedDisplayName" in line_s:
+                        eq_idx = line_s.find("=")
+                        if eq_idx != -1:
+                            val = line_s[eq_idx + 1:].strip().rstrip(",")
+                            if val.startswith("[[") and val.endswith("]]"):
+                                dname = val[2:-2]
+                            elif (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                                dname = val[1:-1]
+                            else:
+                                dname = val.strip("\"'[]")
+                            dname = re.sub(r'\\(\d{1,3})', lambda m: chr(int(m.group(1))), dname)
+                            dname = re.sub(r'\^[0-9A-Fa-f]{6}', '', dname)
+                            dname = " ".join(dname.split())
+                            if dname:
+                                names[cur_id] = dname
+                    elif "slotCount" in line_s:
+                        eq_idx = line_s.find("=")
+                        if eq_idx != -1:
+                            val = line_s[eq_idx + 1:].strip().rstrip(",")
+                            if val.isdigit() and int(val) > 0:
+                                equips.add(cur_id)
+                    elif "ClassNum" in line_s:
+                        eq_idx = line_s.find("=")
+                        if eq_idx != -1:
+                            val = line_s[eq_idx + 1:].strip().rstrip(",")
+                            if val.isdigit() and int(val) > 0:
+                                equips.add(cur_id)
+                    elif line_s.startswith("}"):
+                        cur_id = None
                 if names:
                     break
             except Exception as exc:
                 print(f"[Terrain] Aviso itemInfo ({lp}): {exc}", flush=True)
 
-    # 2. Fallback / Enriquecimento via GRF
-    try:
-        from ragx.grf import GrfArchive
-        grf_p = Path(grf_path)
-        if grf_p.is_file():
-            a = GrfArchive(grf_p)
-            for k in a.namelist():
-                kl = k.lower().replace("/", "\\")
-                if "idnum2itemdisplaynametable.txt" in kl and not kl.endswith(".txt.txt"):
-                    try:
-                        raw = a.read(k).decode("cp1252", errors="replace")
-                        for line in raw.splitlines():
-                            parts = line.strip().split("#")
-                            if len(parts) >= 2:
-                                try:
-                                    nid = int(parts[0])
-                                    n = parts[1].replace("_", " ").strip()
-                                    if nid not in names and n:
-                                        names[nid] = n
-                                except ValueError:
-                                    pass
-                    except Exception:
-                        pass
-                elif "cardprefixnametable.txt" in kl and not kl.endswith(".txt.txt"):
-                    try:
-                        raw = a.read(k).decode("cp1252", errors="replace")
-                        for line in raw.splitlines():
-                            parts = line.strip().split("#")
-                            if len(parts) >= 1:
-                                try:
-                                    cards.add(int(parts[0]))
-                                except ValueError:
-                                    pass
-                    except Exception:
-                        pass
-                elif "num2cardillustnametable.txt" in kl:
-                    try:
-                        raw = a.read(k).decode("cp1252", errors="replace")
-                        for line in raw.splitlines():
-                            parts = line.strip().split("#")
-                            if len(parts) >= 1:
-                                try:
-                                    cards.add(int(parts[0]))
-                                except ValueError:
-                                    pass
-                    except Exception:
-                        pass
-                elif "itemslotcounttable.txt" in kl:
-                    try:
-                        raw = a.read(k).decode("cp1252", errors="replace")
-                        for line in raw.splitlines():
-                            parts = line.strip().split("#")
-                            if len(parts) >= 1:
-                                try:
-                                    equips.add(int(parts[0]))
-                                except ValueError:
-                                    pass
-                    except Exception:
-                        pass
-    except Exception as exc:
-        print(f"[Terrain] Aviso tabelas GRF: {exc}", flush=True)
+    # 2. Fallback via GRF somente se itemInfo não carregou nomes
+    if not names:
+        try:
+            from ragx.grf import GrfArchive
+            grf_p = Path(grf_path)
+            if grf_p.is_file():
+                a = GrfArchive(grf_p)
+                for k in a.namelist():
+                    kl = k.lower().replace("/", "\\")
+                    if "idnum2itemdisplaynametable.txt" in kl and not kl.endswith(".txt.txt"):
+                        try:
+                            raw = a.read(k).decode("cp1252", errors="replace")
+                            for line in raw.splitlines():
+                                parts = line.strip().split("#")
+                                if len(parts) >= 2:
+                                    try:
+                                        nid = int(parts[0])
+                                        n = parts[1].replace("_", " ").strip()
+                                        if nid not in names and n:
+                                            names[nid] = n
+                                    except ValueError:
+                                        pass
+                        except Exception:
+                            pass
+                    elif "cardprefixnametable.txt" in kl and not kl.endswith(".txt.txt"):
+                        try:
+                            raw = a.read(k).decode("cp1252", errors="replace")
+                            for line in raw.splitlines():
+                                parts = line.strip().split("#")
+                                if len(parts) >= 1:
+                                    try:
+                                        cards.add(int(parts[0]))
+                                    except ValueError:
+                                        pass
+                        except Exception:
+                            pass
+                    elif "num2cardillustnametable.txt" in kl:
+                        try:
+                            raw = a.read(k).decode("cp1252", errors="replace")
+                            for line in raw.splitlines():
+                                parts = line.strip().split("#")
+                                if len(parts) >= 1:
+                                    try:
+                                        cards.add(int(parts[0]))
+                                    except ValueError:
+                                        pass
+                        except Exception:
+                            pass
+                    elif "itemslotcounttable.txt" in kl:
+                        try:
+                            raw = a.read(k).decode("cp1252", errors="replace")
+                            for line in raw.splitlines():
+                                parts = line.strip().split("#")
+                                if len(parts) >= 1:
+                                    try:
+                                        equips.add(int(parts[0]))
+                                    except ValueError:
+                                        pass
+                        except Exception:
+                            pass
+        except Exception as exc:
+            print(f"[Terrain] Aviso tabelas GRF: {exc}", flush=True)
 
     _ITEM_CATALOG_CACHE = {
         "names": names,

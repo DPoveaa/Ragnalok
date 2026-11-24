@@ -4,7 +4,11 @@ An external JSON producer replaces the snapshot at least every 750 ms.
 """
 
 import argparse
+import atexit
+import datetime
+import faulthandler
 import sys
+import traceback
 import ctypes
 from ctypes import wintypes
 import ipaddress
@@ -24,6 +28,141 @@ from threading import Event, Lock, Thread
 
 import psutil
 from scapy.all import conf
+
+
+# ── Registro da Última Sessão (session.log) ──
+class _SessionLogTee:
+    """Duplica streams de saída gravando no terminal e em session.log simultaneamente."""
+
+    def __init__(self, original_stream, log_file, lock):
+        self._orig = original_stream
+        self._file = log_file
+        self._lock = lock
+
+    def write(self, data):
+        with self._lock:
+            try:
+                self._orig.write(data)
+                self._orig.flush()
+            except Exception:
+                pass
+            try:
+                self._file.write(data)
+                self._file.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        with self._lock:
+            try:
+                self._orig.flush()
+            except Exception:
+                pass
+            try:
+                self._file.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return getattr(self._orig, "isatty", lambda: False)()
+
+    def fileno(self):
+        return self._orig.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+
+_SESSION_LOG_FILE = None
+_SESSION_LOG_LOCK = Lock()
+
+
+def init_session_logging(log_path="session.log"):
+    """Inicia o log da sessão atual. Limpa o arquivo anterior e salva tudo até fechar."""
+    global _SESSION_LOG_FILE
+    if _SESSION_LOG_FILE is not None:
+        return
+    try:
+        log_file = open(log_path, "w", buffering=1, encoding="utf-8", errors="backslashreplace")
+        _SESSION_LOG_FILE = log_file
+    except Exception as exc:
+        print(f"[Aviso] Não foi possível criar '{log_path}': {exc}", flush=True)
+        return
+
+    try:
+        faulthandler.enable(log_file)
+    except Exception:
+        pass
+
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header = (
+        "=" * 80 + "\n"
+        f" Ragnalok Overlay — Log da Última Sessão\n"
+        f" Início: {now_str} | PID: {os.getpid()} | Python: {sys.version.split()[0]} on {sys.platform}\n"
+        f" Comando: {' '.join(sys.argv)}\n"
+        + "=" * 80 + "\n\n"
+    )
+    log_file.write(header)
+    log_file.flush()
+
+    sys.stdout = _SessionLogTee(sys.stdout, log_file, _SESSION_LOG_LOCK)
+    sys.stderr = _SessionLogTee(sys.stderr, log_file, _SESSION_LOG_LOCK)
+
+    orig_excepthook = sys.excepthook
+
+    def _unhandled_exception_hook(exc_type, exc_val, exc_tb):
+        err = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"\n[CRASH - MAIN THREAD] {ts}\n{err}\n"
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+        try:
+            log_file.write(msg)
+            log_file.flush()
+        except Exception:
+            pass
+        if orig_excepthook:
+            try:
+                orig_excepthook(exc_type, exc_val, exc_tb)
+            except Exception:
+                pass
+
+    sys.excepthook = _unhandled_exception_hook
+
+    if hasattr(threading, "excepthook"):
+        orig_thread_excepthook = threading.excepthook
+
+        def _thread_exception_hook(args):
+            err = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            tname = getattr(args.thread, "name", str(args.thread))
+            msg = f"\n[CRASH - THREAD: {tname}] {ts}\n{err}\n"
+            sys.stderr.write(msg)
+            sys.stderr.flush()
+            try:
+                log_file.write(msg)
+                log_file.flush()
+            except Exception:
+                pass
+            if orig_thread_excepthook:
+                try:
+                    orig_thread_excepthook(args)
+                except Exception:
+                    pass
+
+        threading.excepthook = _thread_exception_hook
+
+    def _session_exit():
+        try:
+            end_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_file.write(f"\n" + "=" * 80 + f"\n Sessão encerrada: {end_str}\n" + "=" * 80 + "\n")
+            log_file.flush()
+            log_file.close()
+        except Exception:
+            pass
+
+    atexit.register(_session_exit)
+
 
 import win32_input
 from win32_input import (
@@ -943,7 +1082,7 @@ class CameraTracker:
         in_viewport = (left <= pt.x < left + width and top <= pt.y < top + height)
 
         rmb = bool(u32.GetAsyncKeyState(0x02) & 0x8000)
-        lmb = (is_focused and not win32_input.is_bot_clicking(0.85)
+        lmb = (is_focused and not win32_input.is_bot_clicking(0.65)
                and bool(u32.GetAsyncKeyState(0x01) & 0x8000))
         shift = bool(u32.GetAsyncKeyState(0x10) & 0x8000)
         ctrl = bool(u32.GetAsyncKeyState(0x11) & 0x8000)
@@ -1501,6 +1640,7 @@ class Overlay:
         self.center_popup_until = 0.0
         self._last_handled_invite_ts = 0.0
         self._engagement = None
+        self._engage_state = None
         self._engagement_zone = None
         self._last_kill_event = 0.0
         self.post_kill_wait_until = 0.0
@@ -2363,7 +2503,7 @@ class Overlay:
         self._save_hud_setting("hud_hotkeys", self._hud_hotkeys)
 
     def _manual_mouse_button_pressed(self):
-        if win32_input.is_bot_clicking(0.85) or self._is_hud_foreground():
+        if win32_input.is_bot_clicking(0.65) or self._is_hud_foreground():
             return False
         pt = wintypes.POINT()
         if u32.GetCursorPos(ctypes.byref(pt)) and self._is_point_in_hud(pt.x, pt.y, margin=0):
@@ -2378,10 +2518,12 @@ class Overlay:
         if self._is_hud_foreground(fg) or not self._is_game_focused(fg):
             return
         clicked_at = time.monotonic()
-        if win32_input.is_bot_clicking(0.85):
+        if win32_input.is_bot_clicking(0.65):
             return
         start, end = self._hud_click_grace
         if left_button and start <= clicked_at <= end:
+            return
+        if self._is_point_in_hud(sx, sy, margin=0):
             return
         # O hook do mouse lê os retângulos publicados pelo HUD sem chamar Tk.
         for hud in (self._hud_panel, self._hud_drawer):
@@ -2395,7 +2537,7 @@ class Overlay:
         viewport = self.current_viewport
         while self._hud_manual_clicks:
             sx, sy, left_button, clicked_at = self._hud_manual_clicks.popleft()
-            if self._click_in_progress or win32_input.is_bot_clicking(0.85):
+            if self._click_in_progress or win32_input.is_bot_clicking(0.65):
                 continue
             start, end = self._hud_click_grace
             if left_button and start <= clicked_at <= end:
@@ -3948,6 +4090,18 @@ class Overlay:
     def refresh(self):
         try:
             self._refresh_frame()
+        except Exception:
+            err = traceback.format_exc()
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            msg = f"\n[CRASH PREVENTED - REFRESH] {ts}\n{err}\n"
+            sys.stderr.write(msg)
+            sys.stderr.flush()
+            if _SESSION_LOG_FILE:
+                try:
+                    _SESSION_LOG_FILE.write(msg)
+                    _SESSION_LOG_FILE.flush()
+                except Exception:
+                    pass
         finally:
             self.window.after(16 if self._hud_render_foreground else 40, self.refresh)
 
@@ -4021,9 +4175,22 @@ class Overlay:
                     self.last = None
             else:
                 self._hud_snapshot_missing_since = None
-                if self.draw(snapshot, stats):
-                    self.last = snapshot
-                    self.last_stats = stats
+                try:
+                    if self.draw(snapshot, stats):
+                        self.last = snapshot
+                        self.last_stats = stats
+                except Exception:
+                    err = traceback.format_exc()
+                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    msg = f"\n[CRASH PREVENTED - DRAW] {ts}\n{err}\n"
+                    sys.stderr.write(msg)
+                    sys.stderr.flush()
+                    if _SESSION_LOG_FILE:
+                        try:
+                            _SESSION_LOG_FILE.write(msg)
+                            _SESSION_LOG_FILE.flush()
+                        except Exception:
+                            pass
         finally:
             self._sync_hud_windows(hud_viewport, True, self._hud_render_anchor)
         self._poll_hud_input()
@@ -4043,6 +4210,18 @@ class Overlay:
             self._action_click_used = False
             try:
                 self._handle_actions(snapshot)
+            except Exception:
+                err = traceback.format_exc()
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                msg = f"\n[CRASH PREVENTED - _HANDLE_ACTIONS] {ts}\n{err}\n"
+                sys.stderr.write(msg)
+                sys.stderr.flush()
+                if _SESSION_LOG_FILE:
+                    try:
+                        _SESSION_LOG_FILE.write(msg)
+                        _SESSION_LOG_FILE.flush()
+                    except Exception:
+                        pass
             finally:
                 self._action_click_used = None
             if self._hud_can_run() and (self.auto_farm or self.auto_patrol or self._has_hud_travel()):
@@ -4085,6 +4264,7 @@ class Overlay:
         self.locked_combat_mob_gid = None
         self.locked_drop_gid = None
         self._engagement = None
+        self._engage_state = None
         self.post_kill_wait_until = 0.0
         self.last_kill_pos = None
 
@@ -4508,10 +4688,25 @@ class Overlay:
                 self._reset_patrol(px, py)
                 return
 
-        self._engagement = None
-        self.locked_drop_gid = None
+        # Preserva self._engage_state entre ticks se o alvo ainda existir e estiver acessível
+        if self._engage_state:
+            curr_target = world.entities.get((self._engage_state["kind"], self._engage_state["gid"]))
+            if not curr_target or curr_target.unreachable_until > now or world.map != snapshot.map:
+                self._engage_state = None
+                self._engagement = None
+                self.locked_mob_gid = None
+                self.locked_drop_gid = None
+        else:
+            self._engagement = None
+            self.locked_drop_gid = None
+
         if self.auto_patrol and px is not None:
-            self._try_auto_patrol(snapshot, px, py)
+            try:
+                self._try_auto_patrol(snapshot, px, py)
+            except Exception:
+                err = traceback.format_exc()
+                print(f"[Overlay CRASH try_auto_patrol]:\n{err}", flush=True)
+                log_click_file(f"[Overlay CRASH try_auto_patrol]:\n{err}")
 
     def _update_post_kill(self, world, current_map):
         with world.lock:
@@ -4520,12 +4715,18 @@ class Overlay:
         if self._engagement_zone != zone:
             self._engagement_zone = zone
             self._engagement = None
+            self._engage_state = None
             self.post_kill_wait_until = 0.0
             self.last_kill_pos = None
         for dead in deaths:
             if dead["time"] <= self._last_kill_event:
                 continue
             self._last_kill_event = dead["time"]
+            d_gid = dead.get("gid")
+            d_aid = dead.get("aid")
+            if self._engage_state and self._engage_state.get("kind") == "mob" and self._engage_state.get("gid") in (d_gid, d_aid):
+                self._engage_state = None
+                self._engagement = None
             if (dead["near_player"] or dead["was_target"]
                     or self.locked_mob_gid in (dead["gid"], dead["aid"])):
                 self.post_kill_wait_until = dead["time"] + 0.35
@@ -4568,6 +4769,8 @@ class Overlay:
             return
 
         now = time.monotonic()
+        if now < getattr(self, "_patrol_no_wp_cooldown", 0.0):
+            return
         cur_cell = (int(round(px)), int(round(py)))
 
         # Registra células visitadas recentemente
@@ -4911,6 +5114,8 @@ class Overlay:
                     self.active_nav_color = "#38BDF8"  # Ciano = Auto-Patrol
                 self.stuck_count = 0
             else:
+                self.visited_cells.clear()
+                self._patrol_no_wp_cooldown = now + 0.45
                 self._click_debug("PATROL: Nenhum waypoint caminhável disponível.")
                 return
 
@@ -5498,19 +5703,23 @@ class Overlay:
         selected = {gid for _, _, gid, _ in drops}
         if self.locked_drop_gid not in selected:
             self.locked_drop_gid = None
-            if self._engagement and self._engagement["key"][0] == "drop":
+            if self._engage_state and self._engage_state.get("kind") == "drop":
+                self._engage_state = None
+            if self._engagement and self._engagement.get("key", (None,))[0] == "drop":
                 self._engagement = None
         if not drops:
             return False
         if stand_first:
             return True
-        if self.locked_drop_gid is not None:
-            drops = sorted(drops, key=lambda entry: (entry[0] != 1, entry[2] != self.locked_drop_gid))
+        preferred_drop = self._engage_state["gid"] if (self._engage_state and self._engage_state.get("kind") == "drop") else self.locked_drop_gid
+        if preferred_drop is not None:
+            drops = sorted(drops, key=lambda entry: (entry[0] != 1, entry[2] != preferred_drop))
         for _, _, gid, drop in drops:
             self.locked_drop_gid = gid
             if self._smart_engage_target((gid, drop), "drop", snapshot, position, direct_only=direct_only):
                 return True
-        self.locked_drop_gid = None
+        if not (self._engage_state and self._engage_state.get("kind") == "drop"):
+            self.locked_drop_gid = None
         return False
 
     @staticmethod
@@ -5567,15 +5776,32 @@ class Overlay:
         distance = math.dist(position, cell)
         close = distance <= (2.5 if kind == "mob" else 2.2)
         walking = world._is_player_walking()
-        state = self._engagement
-        if state is None or state["key"] != key:
-            state = self._engagement = {
-                "key": key, "phase": None, "ring_failures": 0, "micro_steps": 0,
-                "ring_required": False, "ring_goal": None, "micro_cell": None, "failed_steps": set(),
+
+        # Persistência de engajamento entre ticks
+        state = self._engage_state
+        if state is None or state.get("gid") != gid or state.get("kind") != kind:
+            state = self._engage_state = {
+                "gid": gid,
+                "kind": kind,
+                "phase": "direct",
+                "attempts": 0,
+                "last_click_ts": 0.0,
+                "start_xy": position,
+                "deadline": 0.0,
+                "ring_failures": 0,
+                "micro_steps": 0,
+                "ring_goal": None,
+                "micro_cell": None,
+                "failed_steps": set(),
+                "click_point": None,
             }
+        self._engagement = {"key": key, "phase": state["phase"]}
 
         if kind == "mob" and now - world.mobs_damaged_by_me.get(gid, 0.0) < 1.2:
-            state.update(phase=None, ring_required=False, ring_goal=None, micro_steps=0, ring_failures=0)
+            state["phase"] = "direct"
+            state["attempts"] = 0
+            state["ring_failures"] = 0
+            state["micro_steps"] = 0
             state["failed_steps"].clear()
             self.active_nav_path = None
             return True
@@ -5587,26 +5813,20 @@ class Overlay:
                     current.unreachable_until = now + seconds
                     if kind == "mob" and world.locked_combat_mob_gid == gid:
                         world.locked_combat_mob_gid = None
+            self._engage_state = None
             self._engagement = None
             self.active_nav_path = None
             return False
 
-        def ring_failed(step=None):
-            state["ring_failures"] += 1
-            if step:
-                state["failed_steps"].add(step)
-            state["ring_goal"] = None
-            if state["ring_failures"] >= 2:
-                return pause_target(10.0)
-            return True
-
-        def click(point, phase, delay):
+        def click(point, phase_label, delay):
             clicked_at = time.monotonic()
             if not self.patrol_move_and_click(*point, hwnd=hwnd):
-                return True
-            state.update(phase=phase, deadline=clicked_at + delay, origin=position,
-                         click_point=point, clicked_at=clicked_at)
-            self._click_debug(f"{kind.upper()} #{gid}: {phase} em ({point[0]}, {point[1]})")
+                return False
+            state["last_click_ts"] = clicked_at
+            state["deadline"] = clicked_at + delay
+            state["click_point"] = point
+            self._engagement["phase"] = state["phase"]
+            log_click_file(f"{kind.upper()} #{gid}: {phase_label} (tentativa {state['attempts']}) em ({point[0]}, {point[1]})")
             if kind == "drop":
                 self.last_loot_click = clicked_at
             else:
@@ -5627,26 +5847,31 @@ class Overlay:
             u, v, _, _ = self._project_ground_cell(snapshot, *ground)
             return screen_point(u, v) if u is not None else None
 
-        phase = state["phase"]
-        need_micro = False
-        if phase and self._touch_click_aborted(state["click_point"], state["clicked_at"]):
-            state["phase"] = phase = None
-        if phase:
+        if state["last_click_ts"] > 0:
+            if self._touch_click_aborted(state["click_point"], state["last_click_ts"]):
+                state["deadline"] = 0.0
             if now < state["deadline"]:
                 return True
             if walking:
                 return True
-            moved = math.dist(position, state["origin"]) >= 0.3
-            state["phase"] = None
-            if phase == "direct_far" and not moved:
-                state["ring_required"] = True
-            elif phase == "ring" and not moved:
-                return ring_failed(state["ring_step"])
-            elif phase == "direct_close":
-                # Atacar um mob adjacente não exige deslocamento do personagem.
-                need_micro = kind == "drop"
-            elif phase == "micro" and not moved:
-                need_micro = True
+            moved = math.dist(position, state["start_xy"]) >= 0.3
+            if moved:
+                state["start_xy"] = position
+                if close:
+                    state["phase"] = "direct"
+                    state["attempts"] = 0
+            else:
+                if state["phase"] == "direct":
+                    if state["attempts"] >= 2:
+                        state["phase"] = "ring"
+                        state["attempts"] = 0
+                elif state["phase"] == "ring":
+                    if state["attempts"] >= 2:
+                        state["phase"] = "micro"
+                        state["attempts"] = 0
+                elif state["phase"] == "micro":
+                    if state["attempts"] >= 2:
+                        return pause_target(4.0 if kind == "drop" else 6.0)
 
         point = None
         if close or direct_only or gat is None:
@@ -5659,20 +5884,68 @@ class Overlay:
         portals = self._get_portal_blocked_cells(radius=0, allow_current_goal=False)
         if target_cell in portals:
             point = None
-        if state["ring_goal"] is not None and close:
-            state.update(ring_goal=None, ring_required=False)
+
         direct_line = self._has_walkable_line(position, cell, gat)
         if gat and direct_line:
             direct_line = abs(gat.get_elevation(*position) - gat.get_elevation(*cell)) <= 14
         if kind == "mob" and close and point and gid == world.locked_combat_mob_gid:
             direct_line = True
-            state["ring_required"] = False
+
         if direct_only:
-            if not point or not direct_line or distance > (2.2 if kind == "drop" else 2.5) or need_micro:
+            if not point or not direct_line or distance > (2.2 if kind == "drop" else 2.5):
                 return False
-        elif need_micro or (close and not point and not state["ring_required"]):
-            if state["micro_steps"] >= 3:
-                return pause_target(4.0)
+            state["phase"] = "direct"
+
+        if state["phase"] == "direct":
+            if point and direct_line:
+                self.active_nav_path = None
+                if kind == "drop":
+                    with world.lock:
+                        current = world.entities.get(key)
+                        if not current or current.ownership == "LOCKED" or current.created_at != live.created_at:
+                            return False
+                        world.pending_pickup = (gid, now)
+                state["attempts"] += 1
+                delay = (0.38 if kind == "drop" else 0.45) if close else 0.42
+                return click(point, "direct_close" if close else "direct_far", delay)
+            elif not direct_only:
+                state["phase"] = "ring"
+                state["attempts"] = 0
+
+        if walking:
+            return True
+
+        if state["phase"] == "ring":
+            blocked = self._get_all_blocked_cells() | portals | {target_cell} | state["failed_steps"]
+            goal = state["ring_goal"]
+            if goal and (not 1 <= math.dist(goal, target_cell) <= 2.2 or goal in blocked):
+                goal = None
+            path = gat.find_path(start, goal, blocked_cells=blocked) if gat and goal else []
+            if not path or path[-1] != goal:
+                path = self._approach_path(
+                    gat, start, target_cell, blocked, ring=True,
+                    ground_allowed=lambda ground: math.dist(start, ground) > 6 or ground_point(ground),
+                )
+            if len(path) >= 2:
+                state["ring_goal"] = path[-1]
+                self.active_nav_path = path
+                self.active_nav_color = "#F87171" if kind == "mob" else "#FBBF24"
+                dx, dy = path[1][0] - start[0], path[1][1] - start[1]
+                segment = []
+                for index, ground in enumerate(path[1:7], start=1):
+                    if ground != (start[0] + dx * index, start[1] + dy * index):
+                        break
+                    segment.append(ground)
+                for ground in reversed(segment):
+                    screen = ground_point(ground)
+                    if screen:
+                        state["attempts"] += 1
+                        return click(screen, "ring", 0.42)
+            # Escala para micro se ring não tem rota viável
+            state["phase"] = "micro"
+            state["attempts"] = 0
+
+        if state["phase"] == "micro":
             blocked = self._get_all_blocked_cells() | portals | {target_cell}
             with world.lock:
                 occupied = {tuple(round(coord) for coord in other.track.cell())
@@ -5685,56 +5958,15 @@ class Overlay:
                         continue
                     screen = ground_point(ground)
                     if screen:
-                        options.append((ground == state["micro_cell"], abs(math.dist(ground, cell) - distance), ground, screen))
+                        options.append((ground in state["failed_steps"], abs(math.dist(ground, cell) - distance), ground, screen))
             if options:
                 _, _, ground, screen = min(options)
-                state["micro_cell"] = ground
-                state["micro_steps"] += 1
+                state["failed_steps"].add(ground)
+                state["attempts"] += 1
                 return click(screen, "micro", 0.42)
-            state["ring_required"] = True
+            return pause_target(4.0 if kind == "drop" else 6.0)
 
-        if point and direct_line and (direct_only or not state["ring_required"]):
-            self.active_nav_path = None
-            if kind == "drop":
-                with world.lock:
-                    current = world.entities.get(key)
-                    if not current or current.ownership == "LOCKED" or current.created_at != live.created_at:
-                        return False
-                    world.pending_pickup = (gid, now)
-            delay = (0.38 if kind == "drop" else 0.45) if close else 0.42
-            return click(point, "direct_close" if close else "direct_far", delay)
-
-        if walking:
-            return True
-        state["ring_required"] = True
-        blocked = self._get_all_blocked_cells() | portals | {target_cell} | state["failed_steps"]
-        goal = state["ring_goal"]
-        if goal and (not 1 <= math.dist(goal, target_cell) <= 2.2 or goal in blocked):
-            goal = None
-        path = gat.find_path(start, goal, blocked_cells=blocked) if gat and goal else []
-        if not path or path[-1] != goal:
-            path = self._approach_path(
-                gat, start, target_cell, blocked, ring=True,
-                ground_allowed=lambda ground: math.dist(start, ground) > 6 or ground_point(ground),
-            )
-        if len(path) < 2:
-            return ring_failed()
-
-        state["ring_goal"] = path[-1]
-        self.active_nav_path = path
-        self.active_nav_color = "#F87171" if kind == "mob" else "#FBBF24"
-        dx, dy = path[1][0] - start[0], path[1][1] - start[1]
-        segment = []
-        for index, ground in enumerate(path[1:7], start=1):
-            if ground != (start[0] + dx * index, start[1] + dy * index):
-                break
-            segment.append(ground)
-        for ground in reversed(segment):
-            screen = ground_point(ground)
-            if screen:
-                state["ring_step"] = path[1]
-                return click(screen, "ring", 0.42)
-        return ring_failed(path[1])
+        return False
 
     def get_game_hwnd(self, hwnd=None):
         """Retorna o handle válido do jogo ou redetecta automaticamente se IsWindow retornar 0."""
@@ -5920,6 +6152,10 @@ class Overlay:
         """Compatibilidade: navega pelo menu delegando para _send_menu_selection."""
         self._send_menu_selection(option_index)
 
+    def touch_postmsg(self, sx, sy, game_hwnd=None, *, test_mode=False):
+        """Dispara clique via touch_postmsg (pipeline funcional de 9e1ac16)."""
+        return self._dispatch_game_click(game_hwnd, sx, sy, method="touch_postmsg", test_mode=test_mode)
+
     def patrol_move_and_click(self, sx, sy, *, hwnd=None):
         """Agenda o movimento e clique usados pelo Patrol em coordenadas de tela."""
         return self._dispatch_game_click(hwnd, sx, sy, method="touch_postmsg")
@@ -5933,7 +6169,7 @@ class Overlay:
         # ── Proteção de Concorrência: previne cliques sobrepostos entre ticks ──
         if not test_mode and getattr(self, "_click_in_progress", False):
             self._click_debug(f"CLIQUE IGNORADO (concorrência): ({int(screen_x)},{int(screen_y)})")
-            return
+            return False
 
         sx = int(screen_x)
         sy = int(screen_y)
@@ -5943,17 +6179,17 @@ class Overlay:
         sh = getattr(self, "_screen_h", 1080)
         if not (0 <= sx < sw and 0 <= sy < sh):
             self._click_debug(f"CLIQUE BLOQUEADO: ({sx},{sy}) fora da tela ({sw}x{sh})")
-            return
+            return False
 
         # Zona Proibida do Retângulo do HUD (com margem de 10px): nunca clique ali
         if not test_mode and self._is_point_in_hud(sx, sy, margin=10):
             self._click_debug(f"CLIQUE BLOQUEADO: ({sx},{sy}) está dentro do HUD (zona proibida)")
-            return
+            return False
 
         # Zona Proibida da Interface Nativa do Jogo (chat, status, minimapa)
         if not test_mode and self._is_point_in_game_ui(sx, sy):
             self._click_debug(f"CLIQUE BLOQUEADO: ({sx},{sy}) está sobre a UI nativa do Ragnarok")
-            return
+            return False
 
         if not test_mode and self._action_click_used is not None:
             if self._action_click_used:
@@ -6298,11 +6534,15 @@ class Overlay:
 
         if not candidates:
             if not defense:
-                self.locked_mob_gid = None
+                if not (self._engage_state and self._engage_state.get("kind") == "mob"):
+                    self.locked_mob_gid = None
             return False
 
         if not defense:
-            for locked_gid in dict.fromkeys((combat_gid, self.locked_mob_gid)):
+            preferred_gid = self._engage_state["gid"] if (self._engage_state and self._engage_state.get("kind") == "mob") else self.locked_mob_gid
+            for locked_gid in dict.fromkeys((combat_gid, preferred_gid, self.locked_mob_gid)):
+                if not locked_gid:
+                    continue
                 locked = next((mob for gid, mob, _, _, _ in candidates if gid == locked_gid), None)
                 if locked is not None:
                     self.locked_mob_gid = locked_gid
@@ -6334,7 +6574,8 @@ class Overlay:
             if self._smart_engage_target((gid, mob), "mob", snapshot, position, direct_only=direct_only):
                 return True
         if not defense:
-            self.locked_mob_gid = None
+            if not (self._engage_state and self._engage_state.get("kind") == "mob"):
+                self.locked_mob_gid = None
         return False
 
     def _position_render_window(self, viewport):
@@ -6402,7 +6643,7 @@ class Overlay:
         if not travelling and (self.auto_farm or self.auto_loot):
             world = getattr(self.feed, "world", None)
             combat_gid = getattr(world, "locked_combat_mob_gid", None) or self.locked_combat_mob_gid
-            focused = self._engagement["key"] if self._engagement else None
+            focused = (self._engage_state["kind"], self._engage_state["gid"]) if self._engage_state else (self._engagement["key"] if self._engagement else None)
             for key in (focused, ("drop", self.locked_drop_gid), ("mob", combat_gid), ("mob", self.locked_mob_gid)):
                 if key:
                     item = objects.get(f"{key[0]}:{key[1]}")
@@ -7111,6 +7352,7 @@ def tcp_port(value):
 
 
 def main():
+    init_session_logging()
     parser = argparse.ArgumentParser(description="Overlay Windows para rAthena e snapshots JSON.")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--live", action="store_true", help="Captura passiva do servidor de mapas rAthena.")
@@ -7206,6 +7448,21 @@ def main():
         args.port = 5121
 
     root = tk.Tk()
+
+    def _tk_report_callback_exception(exc, val, tb):
+        err = "".join(traceback.format_exception(exc, val, tb))
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"\n[CRASH - TKINTER CALLBACK] {ts}\n{err}\n"
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+        if _SESSION_LOG_FILE:
+            try:
+                _SESSION_LOG_FILE.write(msg)
+                _SESSION_LOG_FILE.flush()
+            except Exception:
+                pass
+
+    root.report_callback_exception = _tk_report_callback_exception
     root.configure(bg=BG_KEY, highlightthickness=0, bd=0)
     root.withdraw()
     names = read_catalogs(args.catalog)
@@ -7244,4 +7501,5 @@ def main():
 
 
 if __name__ == "__main__":
+    init_session_logging()
     main()
