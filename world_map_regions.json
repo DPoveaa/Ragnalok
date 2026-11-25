@@ -1,0 +1,1744 @@
+{
+  "version": 1,
+  "regions": {
+    "rune_midgarts": "Rune-Midgarts",
+    "schwartzvalt": "Schwartzvalt",
+    "arunafeltz": "Arunafeltz",
+    "dungeons_submaps": "Dungeons / Submapas"
+  },
+  "maps": [
+    {
+      "map_name": "abbey01",
+      "label": "Monastério da Ilha Esquecida 1F",
+      "aliases": [
+        "abbey01"
+      ],
+      "region": "arunafeltz",
+      "layer": "dungeon",
+      "rx": 0.22,
+      "ry": 0.76,
+      "radius": 0.055,
+      "mobs": "Banshee, Necromancer"
+    },
+    {
+      "map_name": "ice_dun01",
+      "label": "Caverna de Gelo 1F",
+      "aliases": [
+        "ice_dun01",
+        "caverna de gelo"
+      ],
+      "region": "arunafeltz",
+      "layer": "dungeon",
+      "rx": 0.44,
+      "ry": 0.2,
+      "radius": 0.055,
+      "mobs": "Siroma, Snowier"
+    },
+    {
+      "map_name": "nameless_n",
+      "label": "Ilha Esquecida (Nameless)",
+      "aliases": [
+        "nameless",
+        "nameless_n"
+      ],
+      "region": "arunafeltz",
+      "layer": "dungeon",
+      "rx": 0.22,
+      "ry": 0.76,
+      "radius": 0.055,
+      "mobs": "Ragged Zombie, Banshee"
+    },
+    {
+      "map_name": "ra_fild01",
+      "label": "Pradaria Audhumbla (ra_fild01)",
+      "aliases": [
+        "ra_fild01"
+      ],
+      "region": "arunafeltz",
+      "layer": "field",
+      "rx": 0.44,
+      "ry": 0.27,
+      "radius": 0.055,
+      "mobs": "Siroma, Galion"
+    },
+    {
+      "map_name": "ra_fild12",
+      "label": "Planície Ida (ra_fild12)",
+      "aliases": [
+        "ra_fild12"
+      ],
+      "region": "arunafeltz",
+      "layer": "field",
+      "rx": 0.44,
+      "ry": 0.5,
+      "radius": 0.055,
+      "mobs": "Roween, Anopheles"
+    },
+    {
+      "map_name": "ra_san01",
+      "label": "Santuário de Rachel 1F",
+      "aliases": [
+        "ra_san01",
+        "santuario"
+      ],
+      "region": "arunafeltz",
+      "layer": "dungeon",
+      "rx": 0.44,
+      "ry": 0.38,
+      "radius": 0.055,
+      "mobs": "Vanberk, Isilla"
+    },
+    {
+      "map_name": "rachel",
+      "label": "Rachel",
+      "aliases": [
+        "ra",
+        "rachel"
+      ],
+      "region": "arunafeltz",
+      "layer": "city",
+      "rx": 0.44,
+      "ry": 0.38,
+      "radius": 0.065,
+      "mobs": "Drosera, Muscipular"
+    },
+    {
+      "map_name": "thor_v01",
+      "label": "Vulcão de Thor 1F",
+      "aliases": [
+        "thor",
+        "thor_v01",
+        "vulcao de thor"
+      ],
+      "region": "arunafeltz",
+      "layer": "dungeon",
+      "rx": 0.52,
+      "ry": 0.7,
+      "radius": 0.055,
+      "mobs": "Kasa, Imp"
+    },
+    {
+      "map_name": "ve_fild07",
+      "label": "Campo de Veins 07",
+      "aliases": [
+        "ve_fild07"
+      ],
+      "region": "arunafeltz",
+      "layer": "field",
+      "rx": 0.36,
+      "ry": 0.82,
+      "radius": 0.055,
+      "mobs": "Stapo, Magmaring"
+    },
+    {
+      "map_name": "veins",
+      "label": "Veins",
+      "aliases": [
+        "ve",
+        "veins"
+      ],
+      "region": "arunafeltz",
+      "layer": "city",
+      "rx": 0.36,
+      "ry": 0.72,
+      "radius": 0.065,
+      "mobs": "Magmaring, Stapo"
+    },
+    {
+      "map_name": "aldeba_in",
+      "label": "aldeba_in",
+      "aliases": [],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "anthell01",
+      "label": "Formigueiro Infernal 1F",
+      "aliases": [
+        "anthell",
+        "anthell01"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.38,
+      "ry": 0.89,
+      "radius": 0.055,
+      "mobs": "Andre, Piere, Deniro"
+    },
+    {
+      "map_name": "icas_in",
+      "label": "icas_in",
+      "aliases": [],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "in_orcs01",
+      "label": "Interior dos Orcs (in_orcs01)",
+      "aliases": [
+        "in_orcs01"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.22,
+      "ry": 0.54,
+      "radius": 0.05,
+      "mobs": ""
+    },
+    {
+      "map_name": "iz_dun00",
+      "label": "Ilha Byalan 1F",
+      "aliases": [
+        "byalan",
+        "iz_dun00"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.79,
+      "ry": 0.42,
+      "radius": 0.055,
+      "mobs": "Plankton, Kukre, Hydra"
+    },
+    {
+      "map_name": "izlu2dun",
+      "label": "Ilha Byalan (Superfície)",
+      "aliases": [
+        "izlu2dun"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.79,
+      "ry": 0.42,
+      "radius": 0.05,
+      "mobs": "Marina, Plankton"
+    },
+    {
+      "map_name": "moc_para01",
+      "label": "Grupo Éden (moc_para01)",
+      "aliases": [
+        "eden",
+        "moc_para01"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.47,
+      "ry": 0.41,
+      "radius": 0.05,
+      "mobs": ""
+    },
+    {
+      "map_name": "moc_para0a",
+      "label": "moc_para0a",
+      "aliases": [],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.22,
+      "ry": 0.54,
+      "radius": 0.048,
+      "mobs": ""
+    },
+    {
+      "map_name": "moc_para0b",
+      "label": "moc_para0b",
+      "aliases": [],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.44,
+      "ry": 0.38,
+      "radius": 0.048,
+      "mobs": ""
+    },
+    {
+      "map_name": "moc_para0c",
+      "label": "moc_para0c",
+      "aliases": [],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.66,
+      "ry": 0.23,
+      "radius": 0.048,
+      "mobs": ""
+    },
+    {
+      "map_name": "moc_pryd01",
+      "label": "Pirâmide de Morocc 1F",
+      "aliases": [
+        "piramide",
+        "pirâmide",
+        "moc_pryd01"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.34,
+      "ry": 0.7,
+      "radius": 0.055,
+      "mobs": "Múmia, Ísis, Familiar"
+    },
+    {
+      "map_name": "moc_ruins",
+      "label": "Ruínas de Morocc",
+      "aliases": [
+        "moc_ruins"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.34,
+      "ry": 0.7,
+      "radius": 0.05,
+      "mobs": ""
+    },
+    {
+      "map_name": "orcsdun01",
+      "label": "Calabouço dos Orcs 1F",
+      "aliases": [
+        "orcsdun01",
+        "orc dungeon"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.22,
+      "ry": 0.54,
+      "radius": 0.055,
+      "mobs": "Orc Zumbi, Orc Esqueleto"
+    },
+    {
+      "map_name": "orcsdun01_c",
+      "label": "orcsdun01_c",
+      "aliases": [],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.22,
+      "ry": 0.54,
+      "radius": 0.055,
+      "mobs": ""
+    },
+    {
+      "map_name": "orcsdun02",
+      "label": "Calabouço dos Orcs 2F",
+      "aliases": [
+        "orcsdun02"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.22,
+      "ry": 0.54,
+      "radius": 0.055,
+      "mobs": "Zenorc, Orc Arqueiro"
+    },
+    {
+      "map_name": "pay_arche",
+      "label": "Vila dos Arqueiros (pay_arche)",
+      "aliases": [
+        "pay_arche",
+        "arqueiros"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.67,
+      "ry": 0.52,
+      "radius": 0.05,
+      "mobs": "Esqueleto, Zumbi"
+    },
+    {
+      "map_name": "pay_dun00",
+      "label": "Caverna de Payon 1F",
+      "aliases": [
+        "zumbi",
+        "esqueleto",
+        "caverna de payon",
+        "pay_dun00"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.62,
+      "ry": 0.48,
+      "radius": 0.055,
+      "mobs": "Zumbi, Esqueleto, Faminto"
+    },
+    {
+      "map_name": "pay_dun01",
+      "label": "Caverna de Payon 2F",
+      "aliases": [
+        "pay_dun01"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.62,
+      "ry": 0.48,
+      "radius": 0.055,
+      "mobs": "Esqueleto Soldado, Esqueleto Arqueiro"
+    },
+    {
+      "map_name": "pay_dun02",
+      "label": "Caverna de Payon 3F",
+      "aliases": [
+        "pay_dun02"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.62,
+      "ry": 0.48,
+      "radius": 0.055,
+      "mobs": "Munak, Bongun"
+    },
+    {
+      "map_name": "prt_sewb1",
+      "label": "Esgoto de Prontera 1F",
+      "aliases": [
+        "esgoto",
+        "prt_sewb1"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.375,
+      "ry": 0.41,
+      "radius": 0.05,
+      "mobs": "Besouro-Ladrão, Tarou"
+    },
+    {
+      "map_name": "prt_sewb2",
+      "label": "Esgoto de Prontera 2F",
+      "aliases": [
+        "prt_sewb2"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.375,
+      "ry": 0.41,
+      "radius": 0.05,
+      "mobs": "Besouro-Ladrão Fêmea"
+    },
+    {
+      "map_name": "valkyrie",
+      "label": "Salão das Valquírias",
+      "aliases": [
+        "valkyrie"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.66,
+      "ry": 0.23,
+      "radius": 0.05,
+      "mobs": ""
+    },
+    {
+      "map_name": "xmas_dun01",
+      "label": "Fábrica de Brinquedos 1F",
+      "aliases": [
+        "xmas_dun01",
+        "fabrica de brinquedos"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.62,
+      "ry": 0.11,
+      "radius": 0.055,
+      "mobs": "Cookie, Myst Case"
+    },
+    {
+      "map_name": "xmas_dun02",
+      "label": "Fábrica de Brinquedos 2F",
+      "aliases": [
+        "xmas_dun02"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "dungeon",
+      "rx": 0.62,
+      "ry": 0.11,
+      "radius": 0.055,
+      "mobs": "Cruiser, Stormy Knight"
+    },
+    {
+      "map_name": "xmas_in",
+      "label": "Interior de Lutie",
+      "aliases": [
+        "xmas_in"
+      ],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.62,
+      "ry": 0.11,
+      "radius": 0.05,
+      "mobs": ""
+    },
+    {
+      "map_name": "alberta",
+      "label": "Alberta",
+      "aliases": [
+        "alb",
+        "alberta"
+      ],
+      "region": "rune_midgarts",
+      "layer": "city",
+      "rx": 0.87,
+      "ry": 0.77,
+      "radius": 0.065,
+      "mobs": "Picky, Marin"
+    },
+    {
+      "map_name": "aldebaran",
+      "label": "Al De Baran",
+      "aliases": [
+        "alde",
+        "aldebaran"
+      ],
+      "region": "rune_midgarts",
+      "layer": "city",
+      "rx": 0.425,
+      "ry": 0.15,
+      "radius": 0.065,
+      "mobs": "Clock, Punk"
+    },
+    {
+      "map_name": "amatsu",
+      "label": "amatsu",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "ayothaya",
+      "label": "ayothaya",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "brasilis",
+      "label": "brasilis",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "cmd_fild01",
+      "label": "Floresta Papuchica (cmd_fild01)",
+      "aliases": [
+        "cmd_fild01"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.24,
+      "ry": 0.82,
+      "radius": 0.05,
+      "mobs": "Jacaré, Grove"
+    },
+    {
+      "map_name": "cmd_fild02",
+      "label": "Praia Kokomo (cmd_fild02)",
+      "aliases": [
+        "cmd_fild02"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.12,
+      "ry": 0.86,
+      "radius": 0.05,
+      "mobs": "Foca, Galapago"
+    },
+    {
+      "map_name": "cmd_fild07",
+      "label": "Ilha Pharos (cmd_fild07)",
+      "aliases": [
+        "cmd_fild07"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.21,
+      "ry": 0.9,
+      "radius": 0.05,
+      "mobs": "Foca, Esponja"
+    },
+    {
+      "map_name": "comodo",
+      "label": "Comodo",
+      "aliases": [
+        "cmd",
+        "comodo"
+      ],
+      "region": "rune_midgarts",
+      "layer": "city",
+      "rx": 0.17,
+      "ry": 0.82,
+      "radius": 0.06,
+      "mobs": "Foca, Lontra"
+    },
+    {
+      "map_name": "dewata",
+      "label": "dewata",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "dicastes01",
+      "label": "dicastes01",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "eclage",
+      "label": "eclage",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "gef_f10",
+      "label": "gef_f10",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.22,
+      "ry": 0.54,
+      "radius": 0.058,
+      "mobs": ""
+    },
+    {
+      "map_name": "gef_f10_a",
+      "label": "gef_f10_a",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.22,
+      "ry": 0.54,
+      "radius": 0.058,
+      "mobs": ""
+    },
+    {
+      "map_name": "gef_f10_b",
+      "label": "gef_f10_b",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.22,
+      "ry": 0.54,
+      "radius": 0.058,
+      "mobs": ""
+    },
+    {
+      "map_name": "gef_f10_c",
+      "label": "gef_f10_c",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.22,
+      "ry": 0.54,
+      "radius": 0.058,
+      "mobs": ""
+    },
+    {
+      "map_name": "gef_fild00",
+      "label": "Campo de Geffen 00",
+      "aliases": [
+        "gef_fild00"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.32,
+      "ry": 0.39,
+      "radius": 0.048,
+      "mobs": "Chonchon, Salgueiro, Poring"
+    },
+    {
+      "map_name": "gef_fild01",
+      "label": "Campo de Geffen 01",
+      "aliases": [
+        "gef_fild01"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.295,
+      "ry": 0.46,
+      "radius": 0.048,
+      "mobs": "Sapo de Roda, Sapo-Cururu"
+    },
+    {
+      "map_name": "gef_fild03",
+      "label": "Campo de Geffen 03",
+      "aliases": [
+        "gef_fild03"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.265,
+      "ry": 0.505,
+      "radius": 0.048,
+      "mobs": "Orc Guerreiro, Senhora Orc"
+    },
+    {
+      "map_name": "gef_fild04",
+      "label": "Campo de Geffen 04",
+      "aliases": [
+        "gef_fild04"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.265,
+      "ry": 0.31,
+      "radius": 0.048,
+      "mobs": "Mandrágora, Poring"
+    },
+    {
+      "map_name": "gef_fild07",
+      "label": "Campo de Geffen 07",
+      "aliases": [
+        "gef_fild07"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.2,
+      "ry": 0.39,
+      "radius": 0.048,
+      "mobs": "Poporing, Fumacento, Creamy"
+    },
+    {
+      "map_name": "gef_fild09",
+      "label": "Campo de Geffen 09",
+      "aliases": [
+        "gef_fild09"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.245,
+      "ry": 0.455,
+      "radius": 0.048,
+      "mobs": "Coco, Yoyo"
+    },
+    {
+      "map_name": "gef_fild10",
+      "label": "Vila dos Orcs (gef_fild10)",
+      "aliases": [
+        "orc",
+        "vila dos orcs",
+        "orc warrior",
+        "gef_f10"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.22,
+      "ry": 0.54,
+      "radius": 0.058,
+      "mobs": "Orc Guerreiro, Orc Fêmea"
+    },
+    {
+      "map_name": "gef_fild11",
+      "label": "Campo de Geffen 11",
+      "aliases": [
+        "gef_fild11"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.22,
+      "ry": 0.605,
+      "radius": 0.048,
+      "mobs": "Goblin, Kobold"
+    },
+    {
+      "map_name": "gef_fild13",
+      "label": "Campo de Geffen 13",
+      "aliases": [
+        "gef_fild13"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.175,
+      "ry": 0.46,
+      "radius": 0.048,
+      "mobs": "Britoniah, Goblin"
+    },
+    {
+      "map_name": "geffen",
+      "label": "Geffen",
+      "aliases": [
+        "gef",
+        "geffen"
+      ],
+      "region": "rune_midgarts",
+      "layer": "city",
+      "rx": 0.265,
+      "ry": 0.38,
+      "radius": 0.065,
+      "mobs": "Esporo Venenoso, Kobold"
+    },
+    {
+      "map_name": "glast_01",
+      "label": "Glast Heim",
+      "aliases": [
+        "gh",
+        "glast"
+      ],
+      "region": "rune_midgarts",
+      "layer": "city",
+      "rx": 0.11,
+      "ry": 0.34,
+      "radius": 0.06,
+      "mobs": "Raydric, Cavaleiro do Abismo"
+    },
+    {
+      "map_name": "gonryun",
+      "label": "gonryun",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "harboro1",
+      "label": "harboro1",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "izlude",
+      "label": "Izlude",
+      "aliases": [
+        "izl",
+        "izlude"
+      ],
+      "region": "rune_midgarts",
+      "layer": "city",
+      "rx": 0.75,
+      "ry": 0.45,
+      "radius": 0.06,
+      "mobs": "Marin, Poring"
+    },
+    {
+      "map_name": "jawaii",
+      "label": "jawaii",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "jor_tail",
+      "label": "jor_tail",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "lasagna",
+      "label": "lasagna",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "louyang",
+      "label": "louyang",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "malangdo",
+      "label": "malangdo",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "malaya",
+      "label": "malaya",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "manuk",
+      "label": "manuk",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "mid_camp",
+      "label": "mid_camp",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "mjolnir_02",
+      "label": "Monte Mjolnir 02",
+      "aliases": [
+        "mjolnir_02"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.35,
+      "ry": 0.24,
+      "radius": 0.05,
+      "mobs": "Louva-a-Deus, Flora"
+    },
+    {
+      "map_name": "mjolnir_12",
+      "label": "Monte Mjolnir 12",
+      "aliases": [
+        "mjolnir_12"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.425,
+      "ry": 0.23,
+      "radius": 0.05,
+      "mobs": "Poção, Planta Carnívora"
+    },
+    {
+      "map_name": "moc_fild07",
+      "label": "Deserto de Sograt 07",
+      "aliases": [
+        "moc_fild07"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.39,
+      "ry": 0.65,
+      "radius": 0.05,
+      "mobs": "PecoPeco, Muka"
+    },
+    {
+      "map_name": "moc_fild11",
+      "label": "Deserto de Sograt 11",
+      "aliases": [
+        "moc_fild11"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.48,
+      "ry": 0.74,
+      "radius": 0.05,
+      "mobs": "Lobo do Deserto, Golem"
+    },
+    {
+      "map_name": "moc_fild12",
+      "label": "Deserto de Sograt 12",
+      "aliases": [
+        "moc_fild12"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.39,
+      "ry": 0.815,
+      "radius": 0.05,
+      "mobs": "Pick, Condor"
+    },
+    {
+      "map_name": "moc_fild17",
+      "label": "Deserto de Sograt 17",
+      "aliases": [
+        "moc_fild17"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.48,
+      "ry": 0.82,
+      "radius": 0.05,
+      "mobs": "Hode, Arenoso"
+    },
+    {
+      "map_name": "moc_fild18",
+      "label": "Campo de Morroc 18 (Escorpiões)",
+      "aliases": [
+        "escorpiao",
+        "escorpião",
+        "scorpion",
+        "moc_fild18"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.38,
+      "ry": 0.89,
+      "radius": 0.055,
+      "mobs": "Escorpião"
+    },
+    {
+      "map_name": "moc_fild19",
+      "label": "Deserto de Sograt 19",
+      "aliases": [
+        "moc_fild19"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.31,
+      "ry": 0.74,
+      "radius": 0.048,
+      "mobs": "Esfinge, Múmia"
+    },
+    {
+      "map_name": "mora",
+      "label": "mora",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "morocc",
+      "label": "Morocc",
+      "aliases": [
+        "moc",
+        "morroc",
+        "morocc"
+      ],
+      "region": "rune_midgarts",
+      "layer": "city",
+      "rx": 0.39,
+      "ry": 0.74,
+      "radius": 0.065,
+      "mobs": "Lobo do Deserto"
+    },
+    {
+      "map_name": "moscovia",
+      "label": "moscovia",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "niflheim",
+      "label": "niflheim",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "pay_fild01",
+      "label": "Campo de Payon 01",
+      "aliases": [
+        "pay_fild01"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.65,
+      "ry": 0.665,
+      "radius": 0.048,
+      "mobs": "Salgueiro, Esporo"
+    },
+    {
+      "map_name": "pay_fild02",
+      "label": "Campo de Payon 02 (Lobos)",
+      "aliases": [
+        "lobo",
+        "wolf",
+        "pay_fild02"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.6,
+      "ry": 0.59,
+      "radius": 0.05,
+      "mobs": "Lobo"
+    },
+    {
+      "map_name": "pay_fild03",
+      "label": "Campo de Payon 03",
+      "aliases": [
+        "pay_fild03"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.8,
+      "ry": 0.72,
+      "radius": 0.05,
+      "mobs": "Esporo, Jibóia"
+    },
+    {
+      "map_name": "pay_fild07",
+      "label": "Campo de Payon 07 (Pé Grande)",
+      "aliases": [
+        "pe grande",
+        "pé grande",
+        "big foot",
+        "pay_fild07"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.75,
+      "ry": 0.73,
+      "radius": 0.055,
+      "mobs": "Pé Grande"
+    },
+    {
+      "map_name": "pay_fild08",
+      "label": "Campo de Payon 08 (Salgueiro Ancião)",
+      "aliases": [
+        "salgueiro anciao",
+        "salgueiro ancião",
+        "elder willow",
+        "esporo",
+        "spore"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.78,
+      "ry": 0.59,
+      "radius": 0.055,
+      "mobs": "Salgueiro Ancião, Esporo"
+    },
+    {
+      "map_name": "pay_fild09",
+      "label": "Campo de Payon 09",
+      "aliases": [
+        "pay_fild09"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.84,
+      "ry": 0.6,
+      "radius": 0.048,
+      "mobs": "Horong, Dokebi"
+    },
+    {
+      "map_name": "pay_fild10",
+      "label": "Campo de Payon 10",
+      "aliases": [
+        "pay_fild10"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.84,
+      "ry": 0.68,
+      "radius": 0.048,
+      "mobs": "Nove Caudas, Gato de Folha"
+    },
+    {
+      "map_name": "payon",
+      "label": "Payon",
+      "aliases": [
+        "pay",
+        "payon"
+      ],
+      "region": "rune_midgarts",
+      "layer": "city",
+      "rx": 0.67,
+      "ry": 0.59,
+      "radius": 0.06,
+      "mobs": "Esporo, Salgueiro"
+    },
+    {
+      "map_name": "prontera",
+      "label": "Prontera",
+      "aliases": [
+        "prt",
+        "capital",
+        "prontera"
+      ],
+      "region": "rune_midgarts",
+      "layer": "city",
+      "rx": 0.47,
+      "ry": 0.41,
+      "radius": 0.065,
+      "mobs": "Poring, Lunático, Fabre"
+    },
+    {
+      "map_name": "prt_fild01",
+      "label": "Campo de Prontera 01",
+      "aliases": [
+        "prt_fild01"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.285,
+      "radius": 0.05,
+      "mobs": "Lunático, Poring, Fabre"
+    },
+    {
+      "map_name": "prt_fild05",
+      "label": "Campo de Prontera 05",
+      "aliases": [
+        "prt_fild05"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.375,
+      "ry": 0.41,
+      "radius": 0.05,
+      "mobs": "Rocker, Zangão, Besouro-Ladrão"
+    },
+    {
+      "map_name": "prt_fild07",
+      "label": "Campo de Prontera 07",
+      "aliases": [
+        "prt_fild07"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.375,
+      "ry": 0.495,
+      "radius": 0.05,
+      "mobs": "Rocker, Poporing, Creamy"
+    },
+    {
+      "map_name": "prt_fild08",
+      "label": "Campo de Prontera 08",
+      "aliases": [
+        "prt_fild08",
+        "poring",
+        "fabre",
+        "pupa",
+        "lunatico",
+        "lunático"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.62,
+      "ry": 0.43,
+      "radius": 0.055,
+      "mobs": "Poring, Fabre, Pupa"
+    },
+    {
+      "map_name": "prt_fild08_s",
+      "label": "prt_fild08_s",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.62,
+      "ry": 0.43,
+      "radius": 0.055,
+      "mobs": ""
+    },
+    {
+      "map_name": "prt_fild11",
+      "label": "Campo de Prontera 11",
+      "aliases": [
+        "prt_fild11"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.3,
+      "ry": 0.5,
+      "radius": 0.05,
+      "mobs": "Goblin, Guerreiro Orc"
+    },
+    {
+      "map_name": "splendide",
+      "label": "splendide",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "umbala",
+      "label": "Umbala",
+      "aliases": [
+        "um"
+      ],
+      "region": "rune_midgarts",
+      "layer": "city",
+      "rx": 0.11,
+      "ry": 0.68,
+      "radius": 0.055,
+      "mobs": "Dríade, Wootan"
+    },
+    {
+      "map_name": "verus04",
+      "label": "verus04",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
+      "map_name": "xmas",
+      "label": "Lutie (xmas)",
+      "aliases": [
+        "lutie",
+        "xmas"
+      ],
+      "region": "rune_midgarts",
+      "layer": "city",
+      "rx": 0.62,
+      "ry": 0.11,
+      "radius": 0.055,
+      "mobs": "Presente, Cookie"
+    },
+    {
+      "map_name": "xmas_fild01",
+      "label": "Campo de Lutie (xmas_fild01)",
+      "aliases": [
+        "xmas_fild01"
+      ],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.62,
+      "ry": 0.19,
+      "radius": 0.05,
+      "mobs": "Marin, Sasquatch"
+    },
+    {
+      "map_name": "abyss_01",
+      "label": "Caverna do Lago do Abismo 1F",
+      "aliases": [
+        "abyss_01"
+      ],
+      "region": "schwartzvalt",
+      "layer": "dungeon",
+      "rx": 0.76,
+      "ry": 0.33,
+      "radius": 0.055,
+      "mobs": "Ferus, Acidus"
+    },
+    {
+      "map_name": "ein_dun01",
+      "label": "Mina de Einbech 1F",
+      "aliases": [
+        "ein_dun01",
+        "mina einbech"
+      ],
+      "region": "schwartzvalt",
+      "layer": "factory_lab",
+      "rx": 0.56,
+      "ry": 0.46,
+      "radius": 0.055,
+      "mobs": "Porcellio, Mineral, Pitman"
+    },
+    {
+      "map_name": "ein_dun02",
+      "label": "Mina de Einbech 2F",
+      "aliases": [
+        "ein_dun02"
+      ],
+      "region": "schwartzvalt",
+      "layer": "factory_lab",
+      "rx": 0.56,
+      "ry": 0.46,
+      "radius": 0.055,
+      "mobs": "Obsidiana, Ursinho"
+    },
+    {
+      "map_name": "ein_fild08",
+      "label": "Campo de Einbroch 08",
+      "aliases": [
+        "ein_fild08"
+      ],
+      "region": "schwartzvalt",
+      "layer": "field",
+      "rx": 0.52,
+      "ry": 0.52,
+      "radius": 0.05,
+      "mobs": "Metaling, Porcellio"
+    },
+    {
+      "map_name": "einbech",
+      "label": "Einbech",
+      "aliases": [
+        "einbech"
+      ],
+      "region": "schwartzvalt",
+      "layer": "city",
+      "rx": 0.56,
+      "ry": 0.46,
+      "radius": 0.06,
+      "mobs": "Porcellio, Mineral"
+    },
+    {
+      "map_name": "einbroch",
+      "label": "Einbroch",
+      "aliases": [
+        "ein",
+        "einbroch"
+      ],
+      "region": "schwartzvalt",
+      "layer": "city",
+      "rx": 0.44,
+      "ry": 0.52,
+      "radius": 0.065,
+      "mobs": "Nuvem Tóxica, Metaling"
+    },
+    {
+      "map_name": "hu_fild05",
+      "label": "Campo de Hugel 05 (Lago do Abismo)",
+      "aliases": [
+        "hu_fild05",
+        "abyss"
+      ],
+      "region": "schwartzvalt",
+      "layer": "field",
+      "rx": 0.76,
+      "ry": 0.33,
+      "radius": 0.05,
+      "mobs": "Novus, Hydro"
+    },
+    {
+      "map_name": "hu_fild06",
+      "label": "Campo de Hugel 06",
+      "aliases": [
+        "hu_fild06"
+      ],
+      "region": "schwartzvalt",
+      "layer": "field",
+      "rx": 0.75,
+      "ry": 0.24,
+      "radius": 0.05,
+      "mobs": "Breeze, Plankton"
+    },
+    {
+      "map_name": "hugel",
+      "label": "Hugel",
+      "aliases": [
+        "hu",
+        "hugel"
+      ],
+      "region": "schwartzvalt",
+      "layer": "city",
+      "rx": 0.82,
+      "ry": 0.24,
+      "radius": 0.06,
+      "mobs": "Novus, Dragão"
+    },
+    {
+      "map_name": "juperos_01",
+      "label": "Ruínas de Juperos 1F",
+      "aliases": [
+        "juperos",
+        "juperos_01"
+      ],
+      "region": "schwartzvalt",
+      "layer": "factory_lab",
+      "rx": 0.58,
+      "ry": 0.62,
+      "radius": 0.055,
+      "mobs": "Venatu, Dimik"
+    },
+    {
+      "map_name": "juperos_02",
+      "label": "Ruínas de Juperos 2F",
+      "aliases": [
+        "juperos_02"
+      ],
+      "region": "schwartzvalt",
+      "layer": "factory_lab",
+      "rx": 0.58,
+      "ry": 0.62,
+      "radius": 0.055,
+      "mobs": "Venatu, Arquedam"
+    },
+    {
+      "map_name": "kh_dun01",
+      "label": "Fábrica de Robôs 1F (Kiel Hyre)",
+      "aliases": [
+        "kh_dun01",
+        "kiel",
+        "fabrica de robos"
+      ],
+      "region": "schwartzvalt",
+      "layer": "factory_lab",
+      "rx": 0.72,
+      "ry": 0.38,
+      "radius": 0.055,
+      "mobs": "Aliza, Alicel, Constant"
+    },
+    {
+      "map_name": "kh_dun02",
+      "label": "Fábrica de Robôs 2F (Kiel Hyre)",
+      "aliases": [
+        "kh_dun02"
+      ],
+      "region": "schwartzvalt",
+      "layer": "factory_lab",
+      "rx": 0.72,
+      "ry": 0.38,
+      "radius": 0.055,
+      "mobs": "Aliza, Aliot, Kiel"
+    },
+    {
+      "map_name": "lhz_cube",
+      "label": "Cubo de Lighthalzen",
+      "aliases": [
+        "lhz_cube"
+      ],
+      "region": "schwartzvalt",
+      "layer": "factory_lab",
+      "rx": 0.28,
+      "ry": 0.68,
+      "radius": 0.055,
+      "mobs": "Laboratório"
+    },
+    {
+      "map_name": "lhz_dun01",
+      "label": "Lab. de Somatologia 1F (Biolab)",
+      "aliases": [
+        "biolab 1",
+        "lhz_dun01",
+        "laboratorio",
+        "fabrica"
+      ],
+      "region": "schwartzvalt",
+      "layer": "factory_lab",
+      "rx": 0.28,
+      "ry": 0.68,
+      "radius": 0.06,
+      "mobs": "Remover, Wickebine, Egnigem"
+    },
+    {
+      "map_name": "lhz_dun02",
+      "label": "Lab. de Somatologia 2F (Biolab)",
+      "aliases": [
+        "biolab 2",
+        "lhz_dun02"
+      ],
+      "region": "schwartzvalt",
+      "layer": "factory_lab",
+      "rx": 0.28,
+      "ry": 0.68,
+      "radius": 0.06,
+      "mobs": "Armeyer, Errende, Laurell"
+    },
+    {
+      "map_name": "lhz_dun03",
+      "label": "Lab. de Somatologia 3F (Biolab)",
+      "aliases": [
+        "biolab 3",
+        "lhz_dun03"
+      ],
+      "region": "schwartzvalt",
+      "layer": "factory_lab",
+      "rx": 0.28,
+      "ry": 0.68,
+      "radius": 0.06,
+      "mobs": "Seyren, Cecil, Howard, Kathryne"
+    },
+    {
+      "map_name": "lhz_fild01",
+      "label": "Campo de Lighthalzen 01",
+      "aliases": [
+        "lhz_fild01"
+      ],
+      "region": "schwartzvalt",
+      "layer": "field",
+      "rx": 0.28,
+      "ry": 0.58,
+      "radius": 0.05,
+      "mobs": "Rafflesia, Metalings"
+    },
+    {
+      "map_name": "lhz_fild02",
+      "label": "Campo de Lighthalzen 02",
+      "aliases": [
+        "lhz_fild02"
+      ],
+      "region": "schwartzvalt",
+      "layer": "field",
+      "rx": 0.36,
+      "ry": 0.68,
+      "radius": 0.05,
+      "mobs": "Rafflesia, Vento da Colina"
+    },
+    {
+      "map_name": "lhz_fild03",
+      "label": "Campo de Lighthalzen 03",
+      "aliases": [
+        "lhz_fild03"
+      ],
+      "region": "schwartzvalt",
+      "layer": "field",
+      "rx": 0.28,
+      "ry": 0.77,
+      "radius": 0.05,
+      "mobs": "Remover, Vento da Colina"
+    },
+    {
+      "map_name": "lhz_in01",
+      "label": "Rekenber Corp. (lhz_in01)",
+      "aliases": [
+        "lhz_in01",
+        "rekenber"
+      ],
+      "region": "schwartzvalt",
+      "layer": "factory_lab",
+      "rx": 0.28,
+      "ry": 0.68,
+      "radius": 0.055,
+      "mobs": "Fábrica/Rekenber"
+    },
+    {
+      "map_name": "lighthalzen",
+      "label": "Lighthalzen",
+      "aliases": [
+        "lhz",
+        "lighthalzen"
+      ],
+      "region": "schwartzvalt",
+      "layer": "city",
+      "rx": 0.28,
+      "ry": 0.68,
+      "radius": 0.065,
+      "mobs": "Rafflesia, Vento da Colina"
+    },
+    {
+      "map_name": "odin_tem01",
+      "label": "Templo de Odin 1F",
+      "aliases": [
+        "odin",
+        "odin_tem01"
+      ],
+      "region": "schwartzvalt",
+      "layer": "dungeon",
+      "rx": 0.88,
+      "ry": 0.28,
+      "radius": 0.055,
+      "mobs": "Frus, Skeggiold"
+    },
+    {
+      "map_name": "tha_t01",
+      "label": "Torre de Thanatos 1F",
+      "aliases": [
+        "thanatos",
+        "tha_t01"
+      ],
+      "region": "schwartzvalt",
+      "layer": "dungeon",
+      "rx": 0.66,
+      "ry": 0.42,
+      "radius": 0.055,
+      "mobs": "Mímico Antigo, Eldest"
+    },
+    {
+      "map_name": "yuno",
+      "label": "Juno (Yuno)",
+      "aliases": [
+        "juno",
+        "yuno"
+      ],
+      "region": "schwartzvalt",
+      "layer": "city",
+      "rx": 0.66,
+      "ry": 0.23,
+      "radius": 0.065,
+      "mobs": "Bode, Harpia"
+    },
+    {
+      "map_name": "yuno_fild01",
+      "label": "Campo de Juno 01",
+      "aliases": [
+        "yuno_fild01"
+      ],
+      "region": "schwartzvalt",
+      "layer": "field",
+      "rx": 0.66,
+      "ry": 0.34,
+      "radius": 0.05,
+      "mobs": "Bode, Planta Carnívora"
+    },
+    {
+      "map_name": "yuno_fild04",
+      "label": "Campo de Juno 04",
+      "aliases": [
+        "yuno_fild04"
+      ],
+      "region": "schwartzvalt",
+      "layer": "field",
+      "rx": 0.58,
+      "ry": 0.25,
+      "radius": 0.05,
+      "mobs": "Harpia, Grand Peco"
+    },
+    {
+      "map_name": "yuno_in02",
+      "label": "Interior de Juno 02",
+      "aliases": [
+        "yuno_in02"
+      ],
+      "region": "schwartzvalt",
+      "layer": "submap",
+      "rx": 0.66,
+      "ry": 0.23,
+      "radius": 0.05,
+      "mobs": "Sábios"
+    }
+  ]
+}

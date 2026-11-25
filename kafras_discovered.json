@@ -40,5 +40,53 @@
     "y": 35,
     "name": "Oficial do Éden",
     "job": 952
+  },
+  "moc_para0b": {
+    "x": 27,
+    "y": 35,
+    "name": "Oficial do Éden",
+    "job": 952
+  },
+  "rachel": {
+    "x": 116,
+    "y": 139,
+    "name": "Kafra",
+    "job": 10242
+  },
+  "geffen": {
+    "x": 115,
+    "y": 66,
+    "name": "Kafra",
+    "job": 10242
+  },
+  "aldebaran": {
+    "x": 136,
+    "y": 122,
+    "name": "Kafra",
+    "job": 10242
+  },
+  "yuno": {
+    "x": 152,
+    "y": 187,
+    "name": "Kafra",
+    "job": 860
+  },
+  "moc_para0c": {
+    "x": 27,
+    "y": 35,
+    "name": "Oficial do Éden",
+    "job": 952
+  },
+  "payon": {
+    "x": 181,
+    "y": 104,
+    "name": "Kafra",
+    "job": 113
+  },
+  "xmas": {
+    "x": 148,
+    "y": 134,
+    "name": "Kafra",
+    "job": 115
   }
 }

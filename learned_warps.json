@@ -24,8 +24,8 @@
     11
   ],
   "prontera->payon": [
-    156,
-    34
+    147,
+    82
   ],
   "pay_fild08->pay_fild09": [
     261,
@@ -53,15 +53,15 @@
   ],
   "prontera->prt_fild08": [
     156,
-    26
+    27
   ],
   "prt_fild08->prontera": [
     169,
-    376
+    375
   ],
   "prontera->gef_fild10": [
     145,
-    36
+    84
   ],
   "in_orcs01->gef_f10_b": [
     32,
@@ -80,12 +80,12 @@
     156
   ],
   "gef_fild10->moc_para0b": [
-    76,
-    331
+    53,
+    328
   ],
   "moc_para0b->prontera": [
-    29,
-    11
+    30,
+    10
   ],
   "pay_fild09->moc_para0a": [
     252,
@@ -168,40 +168,40 @@
     278
   ],
   "rachel->moc_para0a": [
-    116,
-    116
+    115,
+    130
   ],
   "orcsdun01->moc_para01": [
     143,
     109
   ],
   "prontera->morocc": [
-    148,
-    91
+    145,
+    82
   ],
   "morocc->moc_fild12": [
-    159,
+    160,
     19
   ],
   "moc_fild12->moc_fild11": [
     287,
-    169
+    168
   ],
   "moc_fild11->moc_fild17": [
-    214,
+    215,
     31
   ],
   "moc_fild17->rachel": [
-    106,
-    236
+    74,
+    292
   ],
   "rachel->moc_para0c": [
     116,
     118
   ],
   "moc_para0c->prontera": [
-    29,
-    11
+    31,
+    10
   ],
   "moc_fild17->moc_para0a": [
     124,
@@ -214,5 +214,118 @@
   "prt_fild07->prt_fild08": [
     382,
     186
-  ]
+  ],
+  "prontera->geffen": [
+    144,
+    82
+  ],
+  "geffen->aldebaran": [
+    126,
+    59
+  ],
+  "aldebaran->yuno": [
+    143,
+    115
+  ],
+  "yuno->yuno_in02": [
+    87,
+    320
+  ],
+  "yuno_in02->valkyrie": [
+    93,
+    203
+  ],
+  "valkyrie->moc_para0c": [
+    48,
+    45
+  ],
+  "payon->prontera": [
+    168,
+    97
+  ],
+  "gef_fild10->moc_para01": [
+    100,
+    272
+  ],
+  "portal_guard": {
+    "pay_fild07": {
+      "168,280": null
+    },
+    "moc_para0b": {
+      "30,11": [
+        30,
+        10
+      ]
+    },
+    "prontera": {
+      "149,88": null
+    },
+    "geffen": {
+      "127,62": [
+        119,
+        55
+      ]
+    },
+    "aldebaran": {
+      "165,167": null,
+      "139,243": [
+        140,
+        243
+      ],
+      "170,166": null
+    },
+    "xmas_fild01": {
+      "84,50": [
+        84,
+        48
+      ],
+      "73,250": [
+        69,
+        252
+      ]
+    },
+    "yuno_fild01": {
+      "208,19": [
+        208,
+        18
+      ]
+    },
+    "xmas": {
+      "149,238": [
+        149,
+        239
+      ],
+      "144,313": [
+        143,
+        314
+      ]
+    },
+    "xmas_in": {
+      "105,84": [
+        104,
+        83
+      ]
+    },
+    "xmas_dun01": {
+      "128,129": [
+        129,
+        130
+      ]
+    },
+    "xmas_dun02": {
+      "25,93": null
+    },
+    "moc_para01": {
+      "30,11": [
+        30,
+        10
+      ]
+    },
+    "prt_fild08": {
+      "171,376": [
+        170,
+        378
+      ]
+    }
+  }
 }

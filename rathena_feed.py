@@ -160,6 +160,15 @@ KNOWN_PACKET_SIZES = {
     0x00D8: 6,
     0x00A0: 33,  # ZC_ITEM_PICKUP_ACK
     0x011C: 68,  # ZC_WARPLIST
+    0x0438: 10,  # CZ_USE_SKILL
+    0x010F: -1,  # ZC_SKILLINFO_LIST
+    0x011A: 15,  # ZC_USE_SKILL
+    0x09CB: 17,  # ZC_USE_SKILL (variante)
+    0x0110: 10,  # ZC_ACK_TOUSESKILL
+    0x019B: 10,  # ZC_NOTIFY_EFFECT / cancelamento
+    0x0196: 9,   # ZC_MSG_STATE_CHANGE
+    0x043F: 25,  # ZC_MSG_STATE_CHANGE (com RemainMS)
+    0x0983: 29,  # ZC_MSG_STATE_CHANGE (com total/left)
 }
 NPC_DIALOG_TEXT_OPCODES = (0x00B4, 0x00B7)
 CLIENT_DIALOG_SIZES = {0x00B8: 7, 0x00B9: 6}
@@ -218,10 +227,19 @@ def _decode_npc_dialog_text(data, *, prefer_utf8=False):
 
 
 def _translate_kafra_menu_option(option):
-    if re.fullmatch(r"[A-Za-z0-9+/]{6}", option):
-        token_id = int.from_bytes(base64.b64decode(option + "=="), "little")
-        return _KAFRA_MENU_LABELS_BY_ID.get(token_id, option)
-    return option
+    cleaned = (option or "").replace("\x00", "").strip()
+    if not cleaned:
+        return cleaned
+    if cleaned in KAFRA_MENU_TOKENS:
+        return KAFRA_MENU_TOKENS[cleaned]
+    if re.fullmatch(r"[A-Za-z0-9+/]{6}", cleaned):
+        try:
+            token_id = int.from_bytes(base64.b64decode(cleaned + "=="), "little")
+            if token_id in _KAFRA_MENU_LABELS_BY_ID:
+                return _KAFRA_MENU_LABELS_BY_ID[token_id]
+        except Exception:
+            pass
+    return cleaned
 
 
 def position(data, offset):
@@ -432,7 +450,7 @@ class _OutboundOpcodes:
                 return
             if len(self.buffer) - offset < size:
                 break
-            if opcode in (0x0437, 0x035F):
+            if opcode in (0x0437, 0x035F, 0x0438):
                 self.on_combat_packet(opcode, self.buffer[offset:offset + size])
             elif opcode in CLIENT_DIALOG_SIZES:
                 self._record_dialog((sequence + offset) & MASK, opcode, self.buffer[offset:offset + size])
@@ -1070,6 +1088,12 @@ class World:
                 "storage_open": self.storage_open,
                 "server": self.active_server,
                 "port": self.active_port,
+                "last_used_skill": dict(self.last_used_skill) if self.last_used_skill else None,
+                "skill_info": dict(self.skill_info),
+                "learned_skill_sp_cost": dict(self.learned_skill_sp_cost),
+                "steal_confirmed_targets": set(self.steal_confirmed_targets),
+                "last_skill_fail": dict(self.last_skill_fail) if self.last_skill_fail else None,
+                "active_status_ids": set(self.active_status_ids),
             }
 
     def _is_player_walking(self):
@@ -1117,6 +1141,14 @@ class World:
                 self.last_map_warp_ts = 0.0
                 self.last_map_warp = None
                 self.last_map_arrival = None
+                self.skill_info = {}
+                self.learned_skill_sp_cost = {}
+                self.active_status_ids = set()
+            self.last_used_skill = None
+            self.last_skill_fail = None
+            self.steal_confirmed_targets = set()
+            self._pending_skill_sp_sample = None
+            self._last_steal_cast = None
             self.map = self.next_map or self.initial_map
             self.current_map = f"{self.map}.gat" if self.map else None
             self.player = None
@@ -1305,6 +1337,17 @@ class World:
         with self.lock:
             return self.last_attack_target_id, self.last_attack_action, self.last_attack_ts, self.last_move_ts
 
+    def skill_snapshot(self):
+        with self.lock:
+            return {
+                "last_used_skill": dict(self.last_used_skill) if self.last_used_skill else None,
+                "skill_info": dict(self.skill_info),
+                "learned_skill_sp_cost": dict(self.learned_skill_sp_cost),
+                "steal_confirmed_targets": set(self.steal_confirmed_targets),
+                "last_skill_fail": dict(self.last_skill_fail) if self.last_skill_fail else None,
+                "active_status_ids": set(self.active_status_ids),
+            }
+
     def record_client_combat_packet(self, opcode, data):
         now = time.monotonic()
         with self.lock:
@@ -1319,6 +1362,21 @@ class World:
                     if self.entity("mob", target) is not None:
                         self.last_mob_attack = (target, self.last_attack_action, now)
                         self.locked_combat_mob_gid = target
+            elif opcode == 0x0438 and len(data) >= 10:
+                skill_lv = u16(data, 2)
+                skill_id = u16(data, 4)
+                raw_target = u32(data, 6)
+                target_id = self.aid_to_gid.get(raw_target, raw_target)
+                self.last_used_skill = {
+                    "skill_id": skill_id,
+                    "skill_lv": skill_lv,
+                    "target_id": target_id,
+                    "ts": time.time(),
+                }
+                if self.player_max_sp > 0:
+                    self._pending_skill_sp_sample = (skill_id, self.player_sp, now)
+                if skill_id == 50:
+                    self._last_steal_cast = (target_id, raw_target, now)
             elif opcode == 0x035F and len(data) >= 5:
                 self.last_move_ts = now
                 self._map_loading_until = 0.0
@@ -1357,7 +1415,8 @@ class World:
                 text = f"{dialog['text']}\n{text}" if text else dialog["text"]
             dialog.update(text=text, text_ts=now, text_npc_gid=npc_id)
         if opcode == 0x00B7:
-            raw_options = [option.strip() for option in _decode_npc_dialog_text(data, prefer_utf8=True).split(":")]
+            decoded_text = _decode_npc_dialog_text(data, prefer_utf8=True)
+            raw_options = [option.replace("\x00", "").strip() for option in decoded_text.split(":")]
             while raw_options and not raw_options[-1]:
                 raw_options.pop()
             self.dialog_menu_raw_options = raw_options
@@ -1656,7 +1715,16 @@ class World:
                     self.player_max_hp = int(value)
                     self._sync_player_status()
                 elif var_id == 7:
-                    self.player_sp = int(value)
+                    old_sp = self.player_sp
+                    new_sp = int(value)
+                    self.player_sp = new_sp
+                    if new_sp < old_sp and self._pending_skill_sp_sample is not None:
+                        sample_id, sp_before, sample_ts = self._pending_skill_sp_sample
+                        if time.monotonic() - sample_ts <= 1.5 and sp_before >= new_sp:
+                            cost = sp_before - new_sp
+                            if cost > 0:
+                                self.learned_skill_sp_cost[sample_id] = cost
+                            self._pending_skill_sp_sample = None
                 elif var_id == 8:
                     self.player_max_sp = int(value)
                 elif var_id == 11:
@@ -1761,6 +1829,10 @@ class World:
                         pass
 
                 if is_src_player:
+                    if opcode == 0x07FB and len(data) >= 25:
+                        skill_id = u16(data, 14)
+                        if skill_id == 50 and data[24] != 0:
+                            self.steal_confirmed_targets.add(real_dst)
                     if mob_ent is not None or opcode == 0x01DE:
                         self.last_player_attack_ts = now
                     if dealt_damage:
@@ -1839,6 +1911,12 @@ class World:
                 self.storage_capacity = (u16(data, 2), u16(data, 4))
                 self.storage_open = True
             now_mono = time.monotonic()
+            if (opcode == 0x0B18 and not self.storage_open and not self.pending_pickup
+                    and self._last_steal_cast is not None):
+                steal_target, _, steal_ts = self._last_steal_cast
+                if now_mono - steal_ts <= 0.8:
+                    self.steal_confirmed_targets.add(steal_target)
+                    self._last_steal_cast = None
             self.npc_dialog_active = True
             self.npc_dialog_last_ts = now_mono
             self.npc_dialog_opcode = opcode
@@ -2017,6 +2095,19 @@ class World:
                         self.inventory[index] = (nameid, count, tab, False)
                     self.inventory_slots[index] = self.inventory[index][1]
                     self.highest_inv_index = max(self.highest_inv_index, index)
+                    if not self.pending_pickup and self._last_steal_cast is not None:
+                        steal_target, _, steal_ts = self._last_steal_cast
+                        now_steal = time.monotonic()
+                        if now_steal - steal_ts <= 0.8:
+                            p_cell = self.player.cell() if self.player else None
+                            near_drop = any(
+                                d.get("item_id") == nameid and now_steal - d.get("removed_at", 0.0) <= 0.8
+                                and (p_cell is None or math.dist(p_cell, d["cell"]) <= 2.5)
+                                for d in self.recent_seen_drops
+                            )
+                            if not near_drop:
+                                self.steal_confirmed_targets.add(steal_target)
+                                self._last_steal_cast = None
                 elif fail in (2, 4):  # Sobrepeso ou ausência de slot, se a prevenção não disparou.
                     self.inventory_pickup_blocked = True
                 now = time.monotonic()
@@ -2059,6 +2150,74 @@ class World:
                     "options": map_names,
                     "last_update": time.monotonic(),
                 }
+        elif opcode == 0x010F:  # ZC_SKILLINFO_LIST
+            if len(data) >= 41 and (len(data) - 4) % 37 == 0:
+                for pos in range(4, len(data), 37):
+                    skill_id = u16(data, pos)
+                    level = u16(data, pos + 6)
+                    sp_cost = u16(data, pos + 8)
+                    if skill_id:
+                        self.skill_info[skill_id] = {
+                            "skill_id": skill_id,
+                            "level": level,
+                            "sp_cost": sp_cost,
+                        }
+                        if sp_cost > 0:
+                            self.learned_skill_sp_cost[skill_id] = sp_cost
+        elif opcode in (0x011A, 0x09CB):  # ZC_USE_SKILL
+            if opcode == 0x011A and len(data) >= 15:
+                skill_id = u16(data, 2)
+                dst_id = u32(data, 6)
+                src_id = u32(data, 10)
+                result = data[14]
+            elif opcode == 0x09CB and len(data) >= 17:
+                skill_id = u16(data, 2)
+                dst_id = u32(data, 8)
+                src_id = u32(data, 12)
+                result = data[16]
+            else:
+                return
+            real_src = self.aid_to_gid.get(src_id, src_id)
+            real_dst = self.aid_to_gid.get(dst_id, dst_id)
+            if self.is_self_entity(src_id, real_src):
+                if skill_id == 50 and result != 0:
+                    self.steal_confirmed_targets.add(real_dst)
+                    self._last_steal_cast = None
+        elif opcode == 0x0110:  # ZC_ACK_TOUSESKILL (falha de uso/cooldown/SP)
+            if len(data) >= 10:
+                skill_id = u16(data, 2)
+                fail = data[8]
+                cause = data[9]
+                if fail == 0:
+                    self.last_skill_fail = {
+                        "skill_id": skill_id,
+                        "reason": cause,
+                        "ts": time.time(),
+                    }
+                    self._pending_skill_sp_sample = None
+        elif opcode in (0x019B, 0x0B1A):  # Cancelamento de cast / efeito
+            if len(data) >= 6:
+                aid = u32(data, 2)
+                real_aid = self.aid_to_gid.get(aid, aid)
+                if self.is_self_entity(aid, real_aid):
+                    skill_id = self.last_used_skill["skill_id"] if self.last_used_skill else 0
+                    self.last_skill_fail = {
+                        "skill_id": skill_id,
+                        "reason": f"cancel_0x{opcode:04X}",
+                        "ts": time.time(),
+                    }
+                    self._pending_skill_sp_sample = None
+        elif opcode in (0x0196, 0x043F, 0x0983):  # ZC_MSG_STATE_CHANGE
+            if len(data) >= 9:
+                status_id = u16(data, 2)
+                aid = u32(data, 4)
+                state = data[8]
+                real_aid = self.aid_to_gid.get(aid, aid)
+                if self.is_self_entity(aid, real_aid):
+                    if state:
+                        self.active_status_ids.add(status_id)
+                    else:
+                        self.active_status_ids.discard(status_id)
         elif opcode in FLOOR:
             self._drop(opcode, data)
         elif opcode in UNIT:

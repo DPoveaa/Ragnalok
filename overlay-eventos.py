@@ -248,28 +248,35 @@ def _kafra_destination_index(options, raw_options, destination, entry):
         "mjolnir_02": ("mina abandonada", "mjolnir"),
         "cmd_fild07": ("farol de pharos", "pharos"),
     }
-    opaque_count = 0
+    # 1. Caso venha em texto puro, casa pelo nome da cidade destino
     for idx, (option, raw) in enumerate(zip(options, raw_options)):
         normalized = _normalize_menu_text(option)
-        if option == raw and re.fullmatch(r"[A-Za-z0-9+/]{4}AQ", raw):
-            opaque_count += 1
-        elif normalized != "cancelar" and (matches_city(normalized, target)
-                                           or any(label in normalized for label in aliases.get(target, ()))):
+        if normalized == "cancelar" or raw == "1Wa0AQ":
+            continue
+        if matches_city(normalized, target) or any(label in normalized for label in aliases.get(target, ())):
             return idx
 
-    if not entry or not opaque_count or len(options) != len(raw_options):
+    # 2. Caso venha em tokens Base64 desconhecidos, use a posição da cidade na lista ordenada
+    # cadastrada para aquela Kafra no arquivo de Kafras do projeto (desconsiderando "Cancelar"/"1Wa0AQ")
+    if not entry or not options:
         return None
-    cancel_at_end = raw_options[-1] == "1Wa0AQ" or _normalize_menu_text(options[-1]) == "cancelar"
-    menu_count = len(options) - 1 if cancel_at_end else len(options)
     destinations = [name for name in entry.get("teleports", {})
                     if name != "1Wa0AQ" and _normalize_menu_text(name) != "cancelar"]
-    # O índice só é confiável quando todos os destinos chegaram em tokens e a lista confere.
-    if opaque_count != menu_count or len(destinations) != menu_count:
-        return None
+    target_pos = None
     for idx, name in enumerate(destinations):
-        if travel_map_group(name) == target:
-            return idx
-    return next((idx for idx, name in enumerate(destinations) if matches_city(target, name)), None)
+        if travel_map_group(name) == target or matches_city(target, name) or name == destination:
+            target_pos = idx
+            break
+    if target_pos is None:
+        return None
+
+    valid_indices = [
+        idx for idx, (opt, raw) in enumerate(zip(options, raw_options))
+        if raw != "1Wa0AQ" and _normalize_menu_text(opt) != "cancelar"
+    ]
+    if 0 <= target_pos < len(valid_indices):
+        return valid_indices[target_pos]
+    return None
 
 
 def normalize_dialog_option(text: str) -> str:
@@ -460,6 +467,8 @@ def load_filters_config() -> dict:
         "kafra_pin": "",
         "keep_in_bag": ["Asa de Mosca", "Asa de Borboleta"],
         "restock_items": {},
+        "hud_x": None,
+        "hud_y": None,
         **{key: default for key, _, default, _, _ in SURVIVAL_NUMBERS},
     }
     if not cfg_path.exists():
@@ -469,6 +478,10 @@ def load_filters_config() -> dict:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         merged = {**default_cfg, **cfg}
+        for key in ("hud_x", "hud_y"):
+            val = merged.get(key)
+            if val is not None and type(val) is not int:
+                merged[key] = None
         for key in ("kafra_trigger_weight_pct", "kafra_trigger_slots"):
             value = merged[key]
             if type(value) is not int or not 1 <= value <= 100:
@@ -511,6 +524,116 @@ def save_filters_config(cfg: dict):
                 pass
 
 
+SKILL_MODES = (
+    "Ofensiva em Alvo (Unitária / Splash 3x3)",
+    "Repetir até Confirmar no Alvo",
+    "Auto-Buff / Postura",
+)
+SKILL_HOTKEYS = tuple(f"F{i}" for i in range(1, 10)) + tuple(str(i) for i in range(1, 10))
+SKILL_HOTKEY_TO_VK = {
+    **{f"F{i}": 0x6F + i for i in range(1, 10)},
+    **{str(i): 0x30 + i for i in range(1, 10)},
+}
+
+
+def normalize_skill_slot(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+    hotkey = str(raw.get("hotkey", "F1")).strip().upper()
+    if hotkey not in SKILL_HOTKEY_TO_VK:
+        hotkey = "F1"
+    mode = str(raw.get("mode", SKILL_MODES[0])).strip()
+    if mode not in SKILL_MODES:
+        mode = SKILL_MODES[0]
+    try:
+        skill_id = max(0, int(raw.get("skill_id", 0) or 0))
+    except (TypeError, ValueError):
+        skill_id = 0
+    try:
+        status_id = max(0, int(raw.get("status_id", 0) or 0))
+    except (TypeError, ValueError):
+        status_id = 0
+    try:
+        cooldown_sec = min(300.0, max(0.5, float(raw.get("cooldown_sec", 1.0) or 1.0)))
+    except (TypeError, ValueError):
+        cooldown_sec = 1.0
+    try:
+        cast_time_sec = min(30.0, max(0.0, float(raw.get("cast_time_sec", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        cast_time_sec = 0.0
+    try:
+        min_sp_pct = min(100, max(0, int(float(raw.get("min_sp_pct", 10) or 0))))
+    except (TypeError, ValueError):
+        min_sp_pct = 10
+    try:
+        min_mobs_3x3 = min(20, max(1, int(raw.get("min_mobs_3x3", 1) or 1)))
+    except (TypeError, ValueError):
+        min_mobs_3x3 = 1
+    try:
+        max_attempts = min(20, max(1, int(raw.get("max_attempts", 5) or 5)))
+    except (TypeError, ValueError):
+        max_attempts = 5
+    try:
+        max_range = min(15.0, max(1.0, float(raw.get("max_range", 9.0) or 9.0)))
+    except (TypeError, ValueError):
+        max_range = 9.0
+    wl_raw = raw.get("whitelist", [])
+    bl_raw = raw.get("blacklist", [])
+    whitelist = [str(x).strip().lower() for x in wl_raw if str(x).strip()] if isinstance(wl_raw, list) else []
+    blacklist = [str(x).strip().lower() for x in bl_raw if str(x).strip()] if isinstance(bl_raw, list) else []
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "name": str(raw.get("name", "")).strip()[:40],
+        "hotkey": hotkey,
+        "mode": mode,
+        "skill_id": skill_id,
+        "status_id": status_id,
+        "cooldown_sec": cooldown_sec,
+        "cast_time_sec": cast_time_sec,
+        "min_sp_pct": min_sp_pct,
+        "min_mobs_3x3": min_mobs_3x3,
+        "max_attempts": max_attempts,
+        "max_range": max_range,
+        "whitelist": whitelist,
+        "blacklist": blacklist,
+    }
+
+
+def load_skills_config() -> list[dict]:
+    cfg_path = _resolve_resource("skills_config.json")
+    if not cfg_path.exists():
+        save_skills_config([])
+        return []
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+        return [normalize_skill_slot(item) for item in data]
+    except Exception:
+        return []
+
+
+def save_skills_config(slots: list[dict]):
+    cfg_path = _get_base_dir() / "skills_config.json"
+    normalized = [normalize_skill_slot(item) for item in slots]
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cfg_path.parent,
+                                         prefix=".skills_config-", suffix=".tmp", delete=False) as f:
+            temporary = Path(f.name)
+            json.dump(normalized, f, indent=2, ensure_ascii=False)
+        temporary.replace(cfg_path)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"[Config] Falha ao salvar {cfg_path.name}: {type(exc).__name__}.", flush=True)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def load_world_routes() -> dict:
     routes_path = _resolve_resource("world_routes.json")
     if routes_path.exists():
@@ -520,6 +643,202 @@ def load_world_routes() -> dict:
         except Exception:
             pass
     return {"cities": {}, "portals": [], "aliases": {}, "world_map_grid": []}
+
+
+WORLD_MAP_REGION_LABELS = {
+    "all": "Todas",
+    "rune_midgarts": "Rune-Midgarts",
+    "schwartzvalt": "Schwartzvalt",
+    "arunafeltz": "Arunafeltz",
+    "dungeons_submaps": "Dungeons/Submapas",
+}
+
+
+def _infer_world_map_region_layer(map_name: str) -> tuple[str, str]:
+    name = str(map_name or "").strip().lower()
+    if any(name.startswith(p) for p in ("lhz_dun", "lhz_cube", "lhz_in", "ein_dun", "ein_in", "juperos", "jupe_", "kh_dun")):
+        return "schwartzvalt", "factory_lab"
+    if any(name.startswith(p) for p in ("yuno_in",)):
+        return "schwartzvalt", "submap"
+    if any(name.startswith(p) for p in ("odin_tem", "abyss_", "tha_t")):
+        return "schwartzvalt", "dungeon"
+    if any(name.startswith(p) for p in ("yuno", "ein", "lhz", "hu_")) or name in ("yuno", "einbroch", "einbech", "lighthalzen", "hugel"):
+        layer = "city" if name in ("yuno", "einbroch", "einbech", "lighthalzen", "hugel") else "field"
+        return "schwartzvalt", layer
+    if any(name.startswith(p) for p in ("ra_san", "ra_temin", "thor_v", "ice_dun", "nameless", "abbey")):
+        return "arunafeltz", "dungeon"
+    if any(name.startswith(p) for p in ("ra_", "ve_")) or name in ("rachel", "veins"):
+        layer = "city" if name in ("rachel", "veins") else "field"
+        return "arunafeltz", layer
+    if ("_dun" in name or "_in" in name or name.startswith(("in_", "orcs", "anthell", "prt_sewb", "moc_pryd", "moc_para", "gl_", "c_tower", "mag_dun", "tur_dun", "beach_dun"))
+            or name in ("pay_arche", "moc_ruins", "izlu2dun", "valkyrie", "xmas_in")):
+        layer = "submap" if ("_in" in name or name.startswith(("in_", "moc_para")) or name in ("pay_arche", "moc_ruins", "izlu2dun", "valkyrie", "xmas_in")) else "dungeon"
+        return "dungeons_submaps", layer
+    if name in CITY_NAMES or name in ("comodo", "umbala", "xmas", "glast_01"):
+        return "rune_midgarts", "city"
+    return "rune_midgarts", "field"
+
+
+def load_world_map_regions(routes_data: dict | None = None) -> dict:
+    """Carrega world_map_regions.json e mescla automaticamente mapas de .gat, portais e Kafras."""
+    regions_path = _resolve_resource("world_map_regions.json")
+    data = {"version": 1, "regions": dict(WORLD_MAP_REGION_LABELS), "maps": []}
+    if regions_path.exists():
+        try:
+            loaded = json.loads(regions_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data.update(loaded)
+        except Exception:
+            pass
+
+    entries_by_map = {}
+    for item in data.get("maps", []):
+        if isinstance(item, dict) and item.get("map_name"):
+            key = str(item["map_name"]).strip().lower()
+            entries_by_map[key] = item
+
+    routes = routes_data or {}
+    # Indexar aliases e mobs de world_routes.json
+    aliases_by_map = collections.defaultdict(list)
+    for alias, target in routes.get("aliases", {}).items():
+        t_key = str(target).strip().lower()
+        if t_key and alias not in aliases_by_map[t_key]:
+            aliases_by_map[t_key].append(alias)
+    for key, label in CITY_NAMES.items():
+        t_key = "yuno" if key == "juno" else key
+        if key not in aliases_by_map[t_key]:
+            aliases_by_map[t_key].append(key)
+
+    grid_by_map = {}
+    for g in routes.get("world_map_grid", ()):
+        m = str(g.get("map", "")).strip().lower()
+        if m:
+            grid_by_map[m] = g
+
+    # Coletar todos os mapas conhecidos do projeto (.gat_cache, portais, Kafras)
+    discovered_maps = set(entries_by_map.keys())
+    gat_dir = _get_base_dir() / ".gat_cache"
+    if gat_dir.is_dir():
+        for gat_file in gat_dir.glob("*.gat"):
+            discovered_maps.add(gat_file.stem.strip().lower())
+    for src, dst in MAP_PORTALS:
+        discovered_maps.add(src.strip().lower())
+        discovered_maps.add(dst.strip().lower())
+    for portal in routes.get("portals", ()):
+        discovered_maps.add(str(portal.get("from_map", "")).strip().lower())
+        discovered_maps.add(str(portal.get("to_map", "")).strip().lower())
+    for portal in routes.get("reference_portals", ()):
+        if len(portal) >= 2:
+            discovered_maps.add(str(portal[0]).strip().lower())
+            discovered_maps.add(str(portal[1]).strip().lower())
+    for link in load_learned_warps():
+        if "->" in link:
+            src, dst = link.split("->", 1)
+            discovered_maps.add(src.strip().lower())
+            discovered_maps.add(dst.strip().lower())
+    for city_key in CITY_KAFRA:
+        discovered_maps.add("yuno" if city_key == "juno" else city_key)
+    for kafra_file in ("kafra_network.json", "kafras_discovered.json"):
+        kf_path = _resolve_resource(kafra_file)
+        if kf_path.exists():
+            try:
+                kf_data = json.loads(kf_path.read_text(encoding="utf-8"))
+                kf_map = kf_data.get("kafras", kf_data) if isinstance(kf_data, dict) else {}
+                if isinstance(kf_map, dict):
+                    for m_name in kf_map:
+                        discovered_maps.add(str(m_name).strip().lower())
+            except Exception:
+                pass
+    discovered_maps.discard("")
+
+    # Construir grafo de adjacência para herdar (rx, ry) de mapas vizinhos sem calibração manual
+    adj = collections.defaultdict(set)
+    for src, dst in MAP_PORTALS:
+        s, d = src.strip().lower(), dst.strip().lower()
+        adj[s].add(d)
+        adj[d].add(s)
+    for portal in routes.get("portals", ()):
+        s = str(portal.get("from_map", "")).strip().lower()
+        d = str(portal.get("to_map", "")).strip().lower()
+        if s and d:
+            adj[s].add(d)
+            adj[d].add(s)
+    for link in load_learned_warps():
+        if "->" in link:
+            s, d = (part.strip().lower() for part in link.split("->", 1))
+            if s and d:
+                adj[s].add(d)
+                adj[d].add(s)
+
+    def _infer_coords(m_name: str) -> tuple[float, float, float]:
+        if m_name in grid_by_map:
+            g = grid_by_map[m_name]
+            rx = (g["u_min"] + g["u_max"]) / 2.0
+            ry = (g["v_min"] + g["v_max"]) / 2.0
+            rad = max(0.045, min(0.075, math.hypot(g["u_max"] - g["u_min"], g["v_max"] - g["v_min"]) * 0.5))
+            return round(rx, 3), round(ry, 3), round(rad, 3)
+        # Tentar variante base (ex.: gef_f10_a -> gef_fild10, orcsdun01_c -> orcsdun01)
+        base = travel_map_group(m_name)
+        if base != m_name and base in entries_by_map:
+            b = entries_by_map[base]
+            return b["rx"], b["ry"], b.get("radius", 0.050)
+        # BFS no grafo de portais até um mapa já posicionado
+        visited = {m_name}
+        queue = collections.deque([m_name])
+        while queue:
+            cur = queue.popleft()
+            if cur in entries_by_map:
+                ref = entries_by_map[cur]
+                return ref["rx"], ref["ry"], 0.048
+            for nxt in adj.get(cur, ()):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
+        # Fallback por prefixo regional
+        reg, _ = _infer_world_map_region_layer(m_name)
+        if reg == "schwartzvalt":
+            return 0.500, 0.500, 0.045
+        if reg == "arunafeltz":
+            return 0.420, 0.500, 0.045
+        return 0.470, 0.450, 0.045
+
+    changed = False
+    for m_name in sorted(discovered_maps):
+        if m_name not in entries_by_map:
+            region, layer = _infer_world_map_region_layer(m_name)
+            rx, ry, radius = _infer_coords(m_name)
+            g = grid_by_map.get(m_name, {})
+            label = g.get("name") or CITY_NAMES.get(m_name) or m_name
+            entries_by_map[m_name] = {
+                "map_name": m_name,
+                "label": label,
+                "aliases": list(aliases_by_map.get(m_name, [])),
+                "region": region,
+                "layer": layer,
+                "rx": rx,
+                "ry": ry,
+                "radius": radius,
+                "mobs": g.get("mobs", ""),
+            }
+            changed = True
+        else:
+            entry = entries_by_map[m_name]
+            existing_aliases = entry.setdefault("aliases", [])
+            for a in aliases_by_map.get(m_name, []):
+                if a not in existing_aliases:
+                    existing_aliases.append(a)
+                    changed = True
+
+    data["maps"] = sorted(entries_by_map.values(), key=lambda e: (e.get("region", ""), e.get("map_name", "")))
+    if changed or not regions_path.exists():
+        save_path = _get_base_dir() / "world_map_regions.json"
+        try:
+            tmp = save_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(save_path)
+        except OSError:
+            pass
+    return data
 
 
 def travel_map_group(name):
@@ -2458,6 +2777,11 @@ class Overlay:
         self.last = None
         self.last_stats = None
         self.active_nav_path = None
+        self._active_nav_path = []
+        self._active_nav_idx = 0
+        self._active_nav_goal = None
+        self._active_nav_wp_dist = float("inf")
+        self._active_nav_wp_ts = 0.0
         self.active_nav_color = "#38BDF8"
         self.auto_loot = False
         self.auto_farm = False
@@ -2497,6 +2821,7 @@ class Overlay:
         self._patrol_sector_visit_ts = {}
         self._patrol_heading = (0.0, 0.0)
         self._patrol_frontier_retry_at = 0.0
+        self._patrol_no_wp_cooldown = 0.0
         self._patrol_finished_ts = {}
         self._patrol_unreachable_until = {}
         self._patrol_scan_zone = None
@@ -2516,13 +2841,27 @@ class Overlay:
         self._travel_allowed_portal = None
         self._world_map_open = False
         self._world_map_popup = None
+        self._world_map_region = "all"
+        self._world_map_candidates = []
+        self._world_map_notice = None
         self.filters_config = load_filters_config()
+        self.skills_config = load_skills_config()
+        self._skill_cooldowns = {}
+        self._skill_target_attempts = {}
+        self._skill_cast_until = 0.0
+        self._skill_cast_started_at = 0.0
+        self._skill_cast_target_gid = None
+        self._skill_cast_max_range = 9.0
+        self._skill_cast_skill_id = 0
+        self._active_splash_gid = None
+        self._active_splash_until = 0.0
         self.tier1_items = self.filters_config.get("tier1_items", [])
         self.tier3_items = self.filters_config.get("tier3_items", [])
         if isinstance(feed, LiveFeed):
             feed.world.drop_is_priority = self._is_priority_drop
         self.tier3_max_weight_pct = self.filters_config.get("tier3_max_weight_pct", 55)
         self.world_routes_data = load_world_routes()
+        self.world_map_regions_data = load_world_map_regions(self.world_routes_data)
         self._learned_warps = load_learned_warps()
         self._navigation_kafras = load_kafra_network()
         self._last_warp_seen = 0.0
@@ -2589,12 +2928,21 @@ class Overlay:
         self._hud_hotkeys = self._load_hud_hotkeys()
         self._hud_panel = None
         self._hud_drawer = None
+        self._hud_submenu = None
         self._hud_panel_visible = True
         self._hud_active_drawer = None
+        self._hud_active_submenu = None
         self._hud_drawer_paused = False
         self._hud_drawer_walk_since = None
         self._hud_drawer_frames = {}
         self._hud_drawer_buttons = {}
+        self._hud_submenu_frames = {}
+        self._hud_submenu_buttons = {}
+        self._hud_pos = (self.filters_config.get("hud_x"), self.filters_config.get("hud_y"))
+        self._hud_drawer_pos = None
+        self._hud_submenu_pos = None
+        self._hud_dragging = False
+        self._hud_drag_state = None
         self._hud_tray = None
         self._hud_tray_restore = Event()
         self._hud_update_after = None
@@ -2846,30 +3194,262 @@ class Overlay:
 
         dock = self._hud_panel = window("Ragnalok Top Dock")
         drawer = self._hud_drawer = window("Ragnalok Gavetas")
-        drawer.geometry("420x340")
+        drawer.geometry("430x370")
+        drawer_header = tk.Frame(drawer, bg="#181b28", padx=8, pady=3, cursor="fleur")
+        drawer_header.pack(fill="x")
+        drawer_grip = tk.Label(drawer_header, text="⠿ Painel (arrastar)", bg="#181b28", fg=purple,
+                               font=("Segoe UI", 8, "bold"), cursor="fleur")
+        drawer_grip.pack(side="left")
+        drawer_close = tk.Label(drawer_header, text="✕", bg="#181b28", fg="#94a3b8",
+                                font=("Segoe UI", 9, "bold"), cursor="hand2", padx=4)
+        drawer_close.pack(side="right")
+        drawer_close.bind("<Button-1>", guard(lambda _e: self._close_hud_drawer()))
+        drawer_body = tk.Frame(drawer, bg=bg)
+        drawer_body.pack(fill="both", expand=True)
+        self._hud_drawer_body = drawer_body
+
+        submenu = self._hud_submenu = window("Ragnalok Submenu")
+        submenu.configure(highlightthickness=1, highlightbackground=purple)
+        submenu_header = tk.Frame(submenu, bg="#181b28", padx=6, pady=2, cursor="fleur")
+        submenu_header.pack(fill="x")
+        submenu_grip = tk.Label(submenu_header, text="⠿ Submenu", bg="#181b28", fg=purple,
+                                font=("Segoe UI", 8, "bold"), cursor="fleur")
+        submenu_grip.pack(side="left")
+        submenu_close = tk.Label(submenu_header, text="✕", bg="#181b28", fg="#94a3b8",
+                                 font=("Segoe UI", 8, "bold"), cursor="hand2", padx=2)
+        submenu_close.pack(side="right")
+        submenu_close.bind("<Button-1>", guard(lambda _e: self._close_hud_submenu()))
+        self._hud_submenu_body = tk.Frame(submenu, bg=bg, padx=4, pady=4)
+        self._hud_submenu_body.pack(fill="both", expand=True)
+
         strip = tk.Frame(dock, bg=bg, padx=4)
         strip.pack(fill="both", expand=True)
+        drag_handle = tk.Label(strip, text="⠿", bg=bg, fg=purple, font=("Segoe UI", 10, "bold"),
+                               cursor="fleur", padx=4)
+        drag_handle.pack(side="left")
         self._hud_status = tk.StringVar(value="Mapa —  |  Peso —  |  Slots: —/100  |  00:00:00")
-        tk.Label(strip, textvariable=self._hud_status, bg=bg, fg=blue, width=52,
-                 font=("Segoe UI", 9, "bold"), anchor="w").pack(side="left")
+        status_label = tk.Label(strip, textvariable=self._hud_status, bg=bg, fg=blue, width=38,
+                                font=("Segoe UI", 9, "bold"), anchor="w", cursor="fleur")
+        status_label.pack(side="left")
         self._hud_play_button = button(strip, "▶ Play", self._toggle_hud_run)
-        self._hud_play_button.configure(width=17)
+        self._hud_play_button.configure(width=14)
         self._set_hud_running(False)
-        for title, attr, action in (
-            ("Farm", "auto_farm", self._toggle_auto_farm),
-            ("Loot", "auto_loot", self._toggle_auto_loot),
-            ("Patrulha livre", "auto_patrol", self._toggle_auto_patrol),
-        ):
-            self._hud_btns[attr] = button(strip, title, action)
-        button(strip, "Guardar na Kafra", self._request_kafra_storage)
-        self._hud_btns["minimap_nav"] = button(strip, "Minimapa Nav", self._toggle_minimap_nav)
-        button(strip, "Parar", self._stop_hud_actions)
 
-        def add_drawer(title):
-            frame = tk.Frame(drawer, bg=bg, padx=10, pady=7)
-            self._hud_drawer_frames[title] = frame
-            self._hud_drawer_buttons[title] = button(strip, title, lambda: self._toggle_hud_drawer(title))
+        for target_kind, widgets in (
+            ("panel", (strip, drag_handle, status_label)),
+            ("drawer", (drawer_header, drawer_grip)),
+            ("submenu", (submenu_header, submenu_grip)),
+        ):
+            for w in widgets:
+                w.bind("<ButtonPress-1>", guard(lambda e, k=target_kind: self._begin_hud_drag(e, k)), add="+")
+                w.bind("<B1-Motion>", guard(lambda e, k=target_kind: self._drag_hud(e, k)), add="+")
+                w.bind("<ButtonRelease-1>", guard(lambda e, k=target_kind: self._end_hud_drag(e, k)), add="+")
+
+        def add_submenu(title):
+            frame = tk.Frame(self._hud_submenu_body, bg=bg)
+            self._hud_submenu_frames[title] = frame
+            self._hud_submenu_buttons[title] = button(strip, f"{title} ▾", lambda t=title: self._toggle_hud_submenu(t))
             return frame
+
+        def sub_button(parent, text, command):
+            def wrapped():
+                self._mark_hud_control_click()
+                now = time.monotonic()
+                self._hud_click_grace = (now, now + 0.8)
+                self._hud_manual_clicks.clear()
+                self._focus_hud_game()
+                return command()
+            w = tk.Button(parent, text=text, command=guard(wrapped), anchor="w", width=18, **button_style)
+            w.pack(fill="x", pady=1)
+            return w
+
+        sub_mov = add_submenu("Movimento/Rota")
+        self._hud_btns["auto_patrol"] = sub_button(sub_mov, "Patrulha livre", self._toggle_auto_patrol)
+        self._hud_btns["minimap_nav"] = sub_button(sub_mov, "Minimapa Nav", self._toggle_minimap_nav)
+        self._hud_drawer_buttons["Mapas"] = sub_button(
+            sub_mov, "Mapas", lambda: (self._close_hud_submenu(), self._toggle_hud_drawer("Mapas")))
+        sub_button(sub_mov, "Parar", lambda: (self._close_hud_submenu(), self._stop_hud_actions()))
+
+        sub_comb = add_submenu("Combate/Coleta")
+        self._hud_btns["auto_farm"] = sub_button(sub_comb, "Farm", self._toggle_auto_farm)
+        self._hud_btns["auto_loot"] = sub_button(sub_comb, "Loot", self._toggle_auto_loot)
+        self._hud_drawer_buttons["Skills"] = sub_button(
+            sub_comb, "Skills", lambda: (self._close_hud_submenu(), self._toggle_hud_drawer("Skills")))
+
+        sub_info = add_submenu("Info/Listas")
+        for title in ("Mobs W/B", "Itens W/B", "NPCs", "Resumo"):
+            self._hud_drawer_buttons[title] = sub_button(
+                sub_info, title, lambda t=title: (self._close_hud_submenu(), self._toggle_hud_drawer(t)))
+        sub_button(sub_info, "Guardar na Kafra", lambda: (self._close_hud_submenu(), self._request_kafra_storage()))
+
+        def add_drawer(title, create_button=False):
+            frame = tk.Frame(drawer_body, bg=bg, padx=10, pady=6)
+            self._hud_drawer_frames[title] = frame
+            if create_button:
+                self._hud_drawer_buttons[title] = button(strip, title, lambda t=title: self._toggle_hud_drawer(t))
+            return frame
+
+        skills_page = add_drawer("Skills")
+        tk.Label(skills_page, text="Skills do Auto-Farm", bg=bg, fg=fg,
+                 font=("Segoe UI", 12, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
+        self._skills_listbox = tk.Listbox(skills_page, bg=surface, fg=fg, selectbackground=purple,
+                                          selectforeground=fg, bd=0, highlightthickness=0, height=4,
+                                          font=font, exportselection=False)
+        self._skills_listbox.pack(fill="x", pady=(0, 4))
+        skills_btn_row = row(skills_page)
+        self._skill_selected_idx = 0 if self.skills_config else None
+
+        skill_vars = {
+            "enabled": tk.BooleanVar(value=True),
+            "name": tk.StringVar(value=""),
+            "hotkey": tk.StringVar(value="F1"),
+            "mode": tk.StringVar(value=SKILL_MODES[0]),
+            "cooldown_sec": tk.StringVar(value="1.0"),
+            "cast_time_sec": tk.StringVar(value="0.0"),
+            "min_sp_pct": tk.StringVar(value="10"),
+            "min_mobs_3x3": tk.StringVar(value="1"),
+            "max_attempts": tk.StringVar(value="5"),
+            "max_range": tk.StringVar(value="9"),
+            "skill_id": tk.StringVar(value="0"),
+            "status_id": tk.StringVar(value="0"),
+            "whitelist": tk.StringVar(value=""),
+            "blacklist": tk.StringVar(value=""),
+        }
+
+        def refresh_skills_list():
+            self._skills_listbox.delete(0, tk.END)
+            for idx, slot in enumerate(self.skills_config):
+                flag = "ON" if slot["enabled"] else "OFF"
+                tag = slot["name"] or f"Skill #{idx + 1}"
+                self._skills_listbox.insert(tk.END, f"[{flag}] {slot['hotkey']} • {tag} ({slot['mode'][:12]})")
+            if self.skills_config and self._skill_selected_idx is not None and 0 <= self._skill_selected_idx < len(self.skills_config):
+                self._skills_listbox.selection_set(self._skill_selected_idx)
+
+        def load_slot_into_form(idx):
+            if idx is None or not (0 <= idx < len(self.skills_config)):
+                return
+            slot = self.skills_config[idx]
+            skill_vars["enabled"].set(slot["enabled"])
+            skill_vars["name"].set(slot["name"])
+            skill_vars["hotkey"].set(slot["hotkey"])
+            skill_vars["mode"].set(slot["mode"])
+            skill_vars["cooldown_sec"].set(str(slot["cooldown_sec"]))
+            skill_vars["cast_time_sec"].set(str(slot["cast_time_sec"]))
+            skill_vars["min_sp_pct"].set(str(slot["min_sp_pct"]))
+            skill_vars["min_mobs_3x3"].set(str(slot["min_mobs_3x3"]))
+            skill_vars["max_attempts"].set(str(slot["max_attempts"]))
+            skill_vars["max_range"].set(str(slot["max_range"]))
+            skill_vars["skill_id"].set(str(slot["skill_id"]))
+            skill_vars["status_id"].set(str(slot["status_id"]))
+            skill_vars["whitelist"].set(", ".join(slot["whitelist"]))
+            skill_vars["blacklist"].set(", ".join(slot["blacklist"]))
+
+        def on_skill_select(_evt=None):
+            sel = self._skills_listbox.curselection()
+            if sel:
+                self._skill_selected_idx = sel[0]
+                load_slot_into_form(self._skill_selected_idx)
+
+        self._skills_listbox.bind("<<ListboxSelect>>", guard(on_skill_select))
+
+        def add_skill_slot():
+            new_slot = normalize_skill_slot({"name": f"Skill {len(self.skills_config) + 1}", "hotkey": "F1"})
+            self.skills_config.append(new_slot)
+            self._skill_selected_idx = len(self.skills_config) - 1
+            save_skills_config(self.skills_config)
+            refresh_skills_list()
+            load_slot_into_form(self._skill_selected_idx)
+
+        def remove_skill_slot():
+            idx = self._skill_selected_idx
+            if idx is not None and 0 <= idx < len(self.skills_config):
+                self.skills_config.pop(idx)
+                self._skill_cooldowns.clear()
+                self._skill_selected_idx = (min(idx, len(self.skills_config) - 1) if self.skills_config else None)
+                save_skills_config(self.skills_config)
+                refresh_skills_list()
+                if self._skill_selected_idx is not None:
+                    load_slot_into_form(self._skill_selected_idx)
+
+        def save_skill_slot():
+            idx = self._skill_selected_idx
+            raw = {
+                "enabled": skill_vars["enabled"].get(),
+                "name": skill_vars["name"].get(),
+                "hotkey": skill_vars["hotkey"].get(),
+                "mode": skill_vars["mode"].get(),
+                "cooldown_sec": skill_vars["cooldown_sec"].get(),
+                "cast_time_sec": skill_vars["cast_time_sec"].get(),
+                "min_sp_pct": skill_vars["min_sp_pct"].get(),
+                "min_mobs_3x3": skill_vars["min_mobs_3x3"].get(),
+                "max_attempts": skill_vars["max_attempts"].get(),
+                "max_range": skill_vars["max_range"].get(),
+                "skill_id": skill_vars["skill_id"].get(),
+                "status_id": skill_vars["status_id"].get(),
+                "whitelist": [s.strip() for s in skill_vars["whitelist"].get().split(",") if s.strip()],
+                "blacklist": [s.strip() for s in skill_vars["blacklist"].get().split(",") if s.strip()],
+            }
+            slot = normalize_skill_slot(raw)
+            if idx is not None and 0 <= idx < len(self.skills_config):
+                self.skills_config[idx] = slot
+            else:
+                self.skills_config.append(slot)
+                self._skill_selected_idx = len(self.skills_config) - 1
+            save_skills_config(self.skills_config)
+            refresh_skills_list()
+            load_slot_into_form(self._skill_selected_idx)
+            self._skills_status.configure(text=f"Skill '{slot['name'] or slot['hotkey']}' salva.")
+
+        button(skills_btn_row, "+ Nova", add_skill_slot)
+        button(skills_btn_row, "Remover", remove_skill_slot)
+        button(skills_btn_row, "Salvar", save_skill_slot)
+
+        tk.Checkbutton(skills_page, text="Skill ativa no Auto-Farm", variable=skill_vars["enabled"],
+                       bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
+                       selectcolor=surface, font=font, bd=0, highlightthickness=0,
+                       anchor="w", takefocus=False).pack(anchor="w")
+
+        r1 = row(skills_page)
+        label(r1, "Nome").pack(side="left")
+        tk.Entry(r1, textvariable=skill_vars["name"], width=16, bg=surface, fg=fg,
+                 insertbackground=fg, relief="flat", font=font).pack(side="left", padx=(4, 8))
+        label(r1, "Tecla").pack(side="left")
+        hk_menu = tk.OptionMenu(r1, skill_vars["hotkey"], *SKILL_HOTKEYS)
+        hk_menu.configure(bg=surface, fg=fg, activebackground=purple, activeforeground=fg,
+                          highlightthickness=0, bd=0, font=font, takefocus=False)
+        hk_menu["menu"].configure(bg=surface, fg=fg, activebackground=purple, activeforeground=fg, font=font)
+        hk_menu.pack(side="left", padx=(4, 0))
+
+        r2 = row(skills_page)
+        label(r2, "Modo").pack(side="left")
+        mode_menu = tk.OptionMenu(r2, skill_vars["mode"], *SKILL_MODES)
+        mode_menu.configure(bg=surface, fg=fg, activebackground=purple, activeforeground=fg,
+                            highlightthickness=0, bd=0, font=font, takefocus=False, width=32)
+        mode_menu["menu"].configure(bg=surface, fg=fg, activebackground=purple, activeforeground=fg, font=font)
+        mode_menu.pack(side="left", padx=(4, 0))
+
+        for pairs in (
+            (("cooldown_sec", "CD(s)", 6), ("cast_time_sec", "Cast(s)", 6), ("min_sp_pct", "Min SP%", 5)),
+            (("min_mobs_3x3", "Mobs 3x3", 5), ("max_attempts", "Tent.", 5), ("max_range", "Alcance", 5)),
+            (("skill_id", "Skill ID", 6), ("status_id", "Status ID", 6)),
+        ):
+            r_num = row(skills_page)
+            for key, title, w in pairs:
+                label(r_num, title).pack(side="left")
+                tk.Entry(r_num, textvariable=skill_vars[key], width=w, bg=surface, fg=fg,
+                         insertbackground=fg, relief="flat", font=font).pack(side="left", padx=(3, 8))
+
+        for key, title in (("whitelist", "Whitelist"), ("blacklist", "Blacklist")):
+            r_flt = row(skills_page)
+            label(r_flt, title).pack(side="left")
+            tk.Entry(r_flt, textvariable=skill_vars[key], width=30, bg=surface, fg=fg,
+                     insertbackground=fg, relief="flat", font=font).pack(side="right", fill="x", expand=True, padx=(6, 0))
+
+        self._skills_status = label(skills_page, "Use vírgulas nas listas (ex: poring, #1002).", purple)
+        self._skills_status.pack(fill="x", pady=(2, 0))
+        refresh_skills_list()
+        if self._skill_selected_idx is not None:
+            load_slot_into_form(self._skill_selected_idx)
 
         maps = add_drawer("Mapas")
         label(maps, "Viagem usa Play/Pause e independe da patrulha livre.").pack(anchor="w")
@@ -2900,8 +3480,20 @@ class Overlay:
                         for portal in self.world_routes_data.get("portals", ()):
                             known_maps.update((portal["from_map"], portal["to_map"]))
                         known_maps.update(self.world_routes_data.get("aliases", {}).values())
-                        rows.extend((name, name) for name in sorted(known_maps)
-                                    if query.casefold() in name.casefold())
+                        region_entries = {
+                            e["map_name"]: e for e in self.world_map_regions_data.get("maps", ())
+                            if isinstance(e, dict) and e.get("map_name")
+                        }
+                        known_maps.update(region_entries.keys())
+                        q_low = query.casefold()
+                        for name in sorted(known_maps):
+                            entry = region_entries.get(name, {})
+                            label_txt = entry.get("label") or name
+                            aliases_txt = " ".join(entry.get("aliases", ()))
+                            if (q_low in name.casefold() or q_low in label_txt.casefold()
+                                    or q_low in aliases_txt.casefold()):
+                                disp = f"{label_txt} ({name})" if label_txt != name else name
+                                rows.append((name, disp))
                     for mob in search_mob_catalog(query, base_level=level):
                         matched = mob.get("matched_drop")
                         suffix = f" · {matched['item_name']} ({matched['rate']:.2f}%)" if matched else ""
@@ -2961,32 +3553,113 @@ class Overlay:
         command._hud_submit = lambda: self._hud_navi(command.get())
         button(navi, "Ir (/navi)", lambda: self._hud_navi(command.get()))
 
-        world_map = tk.Frame(drawer, bg=bg, padx=10, pady=7)
+        world_map = tk.Frame(drawer_body, bg=bg, padx=10, pady=6)
         button(row(maps), "Mapa Mundi", lambda: self._show_hud_world_map(maps, world_map))
         map_controls = row(world_map)
         button(map_controls, "Voltar", lambda: self._show_hud_world_map(world_map, maps))
+        region_bar = row(world_map)
+        region_buttons = {}
         map_target = tk.StringVar(value="")
-        canvas = tk.Canvas(world_map, bg=surface, highlightthickness=0, width=396, height=245)
+        map_notice = tk.StringVar(value="Clique em um mapa ou use Ctrl+Clique no Mapa-Múndi do jogo.")
+        self._world_map_hud_target_var = map_target
+        self._world_map_hud_notice_var = map_notice
+        canvas = tk.Canvas(world_map, bg=surface, highlightthickness=0, width=406, height=195)
         canvas.pack(fill="both", expand=True)
-        tk.Label(world_map, textvariable=map_target, bg=bg, fg=fg, font=font).pack(anchor="w")
+        tk.Label(world_map, textvariable=map_notice, bg=bg, fg="#cbd5e1", font=("Segoe UI", 8),
+                 anchor="w").pack(fill="x", pady=(2, 0))
+
+        cand_row = row(world_map)
+        label(cand_row, "Candidato:").pack(side="left")
+        self._world_map_cand_var = tk.StringVar(value="—")
+        cand_frame = tk.Frame(cand_row, bg=bg)
+        cand_frame.pack(side="left", fill="x", expand=True)
+
+        def refresh_candidates_ui():
+            for w in cand_frame.winfo_children():
+                w.destroy()
+            cands = self._world_map_candidates[:5]
+            if not cands:
+                tk.Label(cand_frame, text="—", bg=bg, fg="#94a3b8", font=("Segoe UI", 8)).pack(side="left", padx=4)
+                return
+            for cand in cands:
+                m_id = cand["map_name"]
+                lbl = cand.get("label") or m_id
+                short = lbl if len(lbl) <= 14 else m_id
+                btn_bg = purple if map_target.get() == m_id else surface
+                tk.Button(
+                    cand_frame, text=short, bg=btn_bg, fg=fg, relief="flat", bd=0,
+                    font=("Segoe UI", 7), padx=4, pady=1, cursor="hand2",
+                    command=guard(lambda m=m_id, c=cand: (
+                        map_target.set(m),
+                        map_notice.set(f"{c.get('label', m)} [{c.get('region', '')}]"),
+                        refresh_candidates_ui(),
+                    ))
+                ).pack(side="left", padx=1)
+
+        self._refresh_world_map_candidates_ui = refresh_candidates_ui
+
+        def draw_world_map(_event=None):
+            canvas.delete("all")
+            w = max(1, canvas.winfo_width())
+            h = max(1, canvas.winfo_height())
+            entries = self._get_world_map_region_entries(self._world_map_region)
+            if not entries:
+                canvas.create_text(w // 2, h // 2, text="Sem mapas nesta região", fill=fg, font=font)
+                return
+            layer_colors = {
+                "city": ("#3b2f63", "#8b5cf6"),
+                "field": ("#1f2937", "#3b82f6"),
+                "factory_lab": ("#3b2430", "#f43f5e"),
+                "dungeon": ("#2d223b", "#a855f7"),
+                "submap": ("#1e3a3a", "#14b8a6"),
+            }
+            for entry in entries:
+                rx = entry.get("rx", 0.5)
+                ry = entry.get("ry", 0.5)
+                rad = entry.get("radius", 0.05)
+                x1, x2 = (rx - rad * 0.7) * w, (rx + rad * 0.7) * w
+                y1, y2 = (ry - rad * 0.7) * h, (ry + rad * 0.7) * h
+                fill_c, out_c = layer_colors.get(entry.get("layer", "field"), ("#2b2543", purple))
+                canvas.create_oval(x1, y1, x2, y2, fill=fill_c, outline=out_c, width=1)
+                canvas.create_text(rx * w, ry * h, fill=fg,
+                                   text=entry.get("label") or entry["map_name"], font=("Segoe UI", 7))
+
+        def set_region(reg_key):
+            self._world_map_region = reg_key
+            for k, btn in region_buttons.items():
+                btn.configure(bg=purple if k == reg_key else surface)
+            draw_world_map()
+
+        for reg_key, reg_label in WORLD_MAP_REGION_LABELS.items():
+            short_lbl = {"all": "Todas", "rune_midgarts": "Midgarts", "schwartzvalt": "Schwartz.",
+                         "arunafeltz": "Arunaf.", "dungeons_submaps": "Dungeons"}.get(reg_key, reg_label)
+            region_buttons[reg_key] = tk.Button(
+                region_bar, text=short_lbl, bg=purple if reg_key == self._world_map_region else surface,
+                fg=fg, activebackground=blue, activeforeground="#ffffff", relief="flat", bd=0,
+                font=("Segoe UI", 8), padx=4, pady=1, cursor="hand2",
+                command=guard(lambda k=reg_key: set_region(k))
+            )
+            region_buttons[reg_key].pack(side="left", padx=1)
 
         def select_map(event):
-            selected = self._get_world_map_entry(event.x / canvas.winfo_width(),
-                                                 event.y / canvas.winfo_height())
-            if selected:
-                map_target.set(selected["map"])
-
-        def draw_world_map(event):
-            canvas.delete("all")
-            if not self.world_routes_data.get("world_map_grid"):
-                canvas.create_text(event.width // 2, event.height // 2,
-                                   text="Mapa Mundi indisponível", fill=fg, font=font)
-            for region in self.world_routes_data.get("world_map_grid", ()):
-                x1, x2 = (region[key] * event.width for key in ("u_min", "u_max"))
-                y1, y2 = (region[key] * event.height for key in ("v_min", "v_max"))
-                canvas.create_rectangle(x1, y1, x2, y2, fill="#2b2543", outline=purple)
-                canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, fill=fg,
-                                   text=region.get("name") or region["map"], font=("Segoe UI", 7))
+            w = max(1, canvas.winfo_width())
+            h = max(1, canvas.winfo_height())
+            rx = max(0.0, min(1.0, event.x / w))
+            ry = max(0.0, min(1.0, event.y / h))
+            cands = self._get_world_map_candidates(rx, ry, region_filter=self._world_map_region)
+            if not cands:
+                msg = f"Nenhum mapa mapeado em ({rx:.3f}, {ry:.3f})"
+                print(f"[WorldMap] {msg}", flush=True)
+                map_notice.set(msg)
+                self._world_map_candidates = []
+                refresh_candidates_ui()
+                return
+            self._world_map_candidates = cands
+            best = cands[0]
+            map_target.set(best["map_name"])
+            extra = f" (+{len(cands) - 1} próximos)" if len(cands) > 1 else ""
+            map_notice.set(f"{best.get('label', best['map_name'])} [{best.get('region', '')}]{extra}")
+            refresh_candidates_ui()
 
         canvas.bind("<Configure>", guard(draw_world_map))
         canvas.bind("<Button-1>", guard(select_map))
@@ -3045,7 +3718,7 @@ class Overlay:
         quick_filters(row(summary), self._hud_items_list, self.drop_whitelist, self.drop_blacklist,
                       on_add=set_drop_mode)
 
-        settings = add_drawer("⚙")
+        settings = add_drawer("⚙", create_button=True)
         tk.Label(settings, text="Configurações", bg=bg, fg=fg,
                  font=("Segoe UI", 12, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
         tabs = row(settings)
@@ -3237,7 +3910,7 @@ class Overlay:
         had_focus = restore_focus and self._is_hud_foreground()
         self._finish_hud_edit()
         self._dismiss_hud_choice()
-        for child in self._hud_drawer.pack_slaves():
+        for child in self._hud_drawer_body.pack_slaves():
             child.pack_forget()
         if hide_window:
             self._hide_hud_window(self._hud_drawer)
@@ -3247,6 +3920,82 @@ class Overlay:
         self._hud_drawer_walk_since = None
         if had_focus:
             self._focus_hud_game()
+
+    def _toggle_hud_submenu(self, title):
+        active = self._hud_active_submenu
+        self._close_hud_submenu(hide_window=title == active)
+        if title == active:
+            return
+        self._hud_active_submenu = title
+        self._hud_submenu_pos = None
+        for child in self._hud_submenu_body.pack_slaves():
+            child.pack_forget()
+        self._hud_submenu_frames[title].pack(fill="both", expand=True)
+        self._hud_submenu.update_idletasks()
+        self._sync_hud_windows(self.current_viewport, True)
+
+    def _close_hud_submenu(self, *, hide_window=True):
+        if self._hud_active_submenu is None:
+            return
+        for child in self._hud_submenu_body.pack_slaves():
+            child.pack_forget()
+        if hide_window and self._hud_submenu is not None:
+            self._hide_hud_window(self._hud_submenu)
+        self._hud_active_submenu = None
+        self._hud_submenu_pos = None
+
+    def _clamp_hud_pos(self, x, y, width, height):
+        max_x = max(0, (self._screen_w or 1920) - max(40, width))
+        max_y = max(0, (self._screen_h or 1080) - max(30, height))
+        return max(0, min(int(x), max_x)), max(0, min(int(y), max_y))
+
+    def _begin_hud_drag(self, event, kind):
+        self._mark_hud_control_click()
+        window_map = {"panel": self._hud_panel, "drawer": self._hud_drawer, "submenu": self._hud_submenu}
+        win = window_map.get(kind)
+        if not win:
+            return
+        layout = getattr(win, "_hud_layout", None)
+        if layout:
+            ox, oy = layout[0], layout[1]
+        else:
+            ox, oy = win.winfo_rootx(), win.winfo_rooty()
+        self._hud_dragging = True
+        self._hud_drag_state = (kind, event.x_root, event.y_root, ox, oy)
+
+    def _drag_hud(self, event, kind):
+        state = self._hud_drag_state
+        if not state or state[0] != kind:
+            return
+        _, sx0, sy0, ox, oy = state
+        nx, ny = ox + (event.x_root - sx0), oy + (event.y_root - sy0)
+        window_map = {"panel": self._hud_panel, "drawer": self._hud_drawer, "submenu": self._hud_submenu}
+        win = window_map.get(kind)
+        if not win:
+            return
+        layout = getattr(win, "_hud_layout", None)
+        w = layout[2] if layout else max(120, win.winfo_width())
+        h = layout[3] if layout else max(30, win.winfo_height())
+        cx, cy = self._clamp_hud_pos(nx, ny, w, h)
+        if kind == "panel":
+            self._hud_pos = (cx, cy)
+            self._hud_submenu_pos = None
+        elif kind == "drawer":
+            self._hud_drawer_pos = (cx, cy)
+        elif kind == "submenu":
+            self._hud_submenu_pos = (cx, cy)
+        self._mark_hud_control_click()
+        self._sync_hud_windows(self.current_viewport, True)
+
+    def _end_hud_drag(self, _event, kind):
+        if self._hud_dragging and kind == "panel" and self._hud_pos and None not in self._hud_pos:
+            self.filters_config["hud_x"] = int(self._hud_pos[0])
+            self.filters_config["hud_y"] = int(self._hud_pos[1])
+            save_filters_config(self.filters_config)
+        self._hud_dragging = False
+        self._hud_drag_state = None
+        self._mark_hud_control_click()
+        self._focus_hud_game()
 
     @staticmethod
     def _show_hud_world_map(current, target):
@@ -3435,7 +4184,7 @@ class Overlay:
             return
         if self._is_point_in_hud(sx, sy, margin=0):
             return
-        for hud in (self._hud_panel, self._hud_drawer):
+        for hud in (self._hud_panel, self._hud_drawer, self._hud_submenu):
             if layout := getattr(hud, "_hud_layout", None):
                 left, top, width, height, visible = layout
                 if visible and left <= sx < left + width and top <= sy < top + height:
@@ -3457,6 +4206,7 @@ class Overlay:
                         and not self._is_point_in_hud(sx, sy, margin=0)):
                     self._finish_hud_edit()
                     self._dismiss_hud_choice()
+                    self._close_hud_submenu()
                     if self._automation_running and self._hud_mouse_pause_var.get():
                         self._set_hud_running(False)
                         print("[Automação] Pausada por clique manual. Use Play para retomar.", flush=True)
@@ -3480,6 +4230,8 @@ class Overlay:
 
         settings = self._hud_hotkeys
         if 0x1B in new_keys or settings["drawer"] in new_keys:
+            if self._hud_active_submenu:
+                self._close_hud_submenu()
             if self._hud_active_drawer:
                 self._close_hud_drawer()
             elif settings["drawer"] in new_keys and not self._hud_panel_visible:
@@ -3556,18 +4308,46 @@ class Overlay:
         if not self._hud_panel:
             return
         self._update_hud_play()
-        windows = (
-            (self._hud_panel, self._hud_panel_visible, self._hud_dock_width, 30, 0),
-            (self._hud_drawer, self._hud_panel_visible and self._hud_active_drawer, 420, 340, 30),
-        )
         anchor = game_hwnd or self._hud_render_anchor
-        for window, visible, width, height, offset_y in windows:
+        panel_w, panel_h = self._hud_dock_width, 30
+        if viewport:
+            left, top, vw, _ = viewport
+            if self._hud_pos and self._hud_pos[0] is not None and self._hud_pos[1] is not None:
+                px, py = self._clamp_hud_pos(self._hud_pos[0], self._hud_pos[1], panel_w, panel_h)
+            else:
+                px, py = self._clamp_hud_pos(left + (vw - panel_w) // 2, top, panel_w, panel_h)
+        else:
+            px, py = 0, 0
+
+        sub_w = max(165, self._hud_submenu.winfo_reqwidth() if self._hud_submenu else 165)
+        sub_h = max(60, self._hud_submenu.winfo_reqheight() if self._hud_submenu else 90)
+        if self._hud_submenu_pos is not None:
+            sx, sy = self._clamp_hud_pos(*self._hud_submenu_pos, sub_w, sub_h)
+        else:
+            btn = self._hud_submenu_buttons.get(self._hud_active_submenu)
+            if btn is not None and self._hud_panel.winfo_ismapped():
+                bx = px + max(0, btn.winfo_x())
+            else:
+                bx = px + (panel_w - sub_w) // 2
+            sx, sy = self._clamp_hud_pos(bx, py + panel_h + 2, sub_w, sub_h)
+
+        drw_w, drw_h = 430, 370
+        if self._hud_drawer_pos is not None:
+            dx, dy = self._clamp_hud_pos(*self._hud_drawer_pos, drw_w, drw_h)
+        else:
+            dx, dy = self._clamp_hud_pos(px + (panel_w - drw_w) // 2, py + panel_h + 2, drw_w, drw_h)
+
+        windows = (
+            (self._hud_panel, self._hud_panel_visible, panel_w, panel_h, px, py),
+            (self._hud_submenu, self._hud_panel_visible and self._hud_active_submenu, sub_w, sub_h, sx, sy),
+            (self._hud_drawer, self._hud_panel_visible and self._hud_active_drawer, drw_w, drw_h, dx, dy),
+        )
+        for window, visible, width, height, x, y in windows:
+            if not window:
+                continue
             if not (foreground and viewport and visible):
                 self._hide_hud_window(window)
                 continue
-            left, top, vw, _ = viewport
-            x = left + (vw - width) // 2
-            y = top + offset_y
             layout = (x, y, width, height, True)
             previous = getattr(window, "_hud_layout", None)
             hwnd = getattr(window, "_hud_hwnd", None)
@@ -3606,6 +4386,7 @@ class Overlay:
             except Exception:
                 self._hud_tray_status.configure(text="Bandeja do sistema indisponível.")
                 return
+        self._close_hud_submenu()
         self._close_hud_drawer()
         self._hud_panel_visible = False
         self._hide_hud_window(self._hud_panel)
@@ -3737,14 +4518,24 @@ class Overlay:
         coords = f"({int(pos[0])}, {int(pos[1])})" if pos and None not in pos else "(—, —)"
         weight = stats.get("weight_ratio", getattr(snapshot, "weight_ratio", 0.0))
         slots = stats.get("estimated_slots_used", 0)
-        status = self._travel_caption(self.travel_plan) if self.travel_plan else (
-            f"{map_name} {coords}  |  Peso {weight:.0%}  |  Slots: {slots}/100  |  {self._hud_elapsed()}"
-        )
+        if self._world_map_notice and now < self._world_map_notice[1]:
+            status = f"[WorldMap] {self._world_map_notice[0]}"
+        elif self._world_map_notice and now >= self._world_map_notice[1]:
+            self._world_map_notice = None
+            status = self._travel_caption(self.travel_plan) if self.travel_plan else (
+                f"{map_name} {coords}  |  Peso {weight:.0%}  |  Slots: {slots}/100  |  {self._hud_elapsed()}"
+            )
+        else:
+            status = self._travel_caption(self.travel_plan) if self.travel_plan else (
+                f"{map_name} {coords}  |  Peso {weight:.0%}  |  Slots: {slots}/100  |  {self._hud_elapsed()}"
+            )
         self._hud_status.set(status)
         for attr, button in self._hud_btns.items():
             button.configure(bg="#3b82f6" if getattr(self, attr) else "#222638")
         for title, button in self._hud_drawer_buttons.items():
             button.configure(bg="#8b5cf6" if title == self._hud_active_drawer else "#222638")
+        for title, button in self._hud_submenu_buttons.items():
+            button.configure(bg="#8b5cf6" if title == self._hud_active_submenu else "#222638")
         self._refresh_hud_drawer(now)
         self._hud_update_after = self.root.after(200, self._update_hud)
 
@@ -4006,7 +4797,7 @@ class Overlay:
                 if selecting_service:
                     normalized = [_normalize_menu_text(option) for option in options]
                     index = self._kafra_keyword_index(normalized, ("teleporte", "teleport", "warp"),
-                                                      raw=raw, token="0ma0AQ")
+                                                      raw=raw, token="0ma0AQ", skip_cancel=True)
                 else:
                     index = _kafra_destination_index(options, raw, target_city, entry)
                     if index is None:
@@ -4211,10 +5002,13 @@ class Overlay:
 
     @staticmethod
     def _kafra_keyword_index(normalized, keywords, *, raw=(), token=None, skip_cancel=False):
-        return next((idx for idx, option in enumerate(normalized)
-                     if (not skip_cancel or "cancelar" not in option)
-                     and (any(keyword in option for keyword in keywords)
-                          or (idx < len(raw) and raw[idx] == token))), None)
+        for idx, option in enumerate(normalized):
+            raw_tok = raw[idx] if idx < len(raw) else ""
+            if skip_cancel and ("cancelar" in option or raw_tok == "1Wa0AQ"):
+                continue
+            if any(keyword in option for keyword in keywords) or (token and raw_tok == token):
+                return idx
+        return None
 
     def _kafra_dialog_ready(self, state, dialog, world, leg, now):
         if previous := state.get("next_key"):
@@ -4246,12 +5040,13 @@ class Overlay:
         return True
 
     def _select_kafra_menu(self, state, dialog, options, index, allowed):
+        opt = options[index] if 0 <= index < len(options) else ""
+        print(f"[Kafra] Selecionando índice {index} ('{opt}') via OSK", flush=True)
         action = self._send_menu_selection(index, allowed=allowed)
         if action is None:
             return False
         state.update(menu_action=action, handled_seq=dialog.get("seq"),
                      handled_menu_seq=dialog["dialog_menu_seq"])
-        print(f"[Kafra] Menu={options} -> selecionando [{index}] '{options[index]}'", flush=True)
         return True
 
     def _send_kafra_next(self, state, dialog, allowed):
@@ -4899,7 +5694,7 @@ class Overlay:
         self._travel_allowed_portal = None
         self._reset_patrol(None, None)
         self.nav_goal = self.patrol_target_route = None
-        self.active_nav_path = None
+        self._clear_locked_nav_path()
 
     def _finish_travel_plan(self, plan, reason=None):
         self.travel_plan = None
@@ -5072,17 +5867,29 @@ class Overlay:
         elif not portal and math.dist(position, target) <= 4.0:
             return "approached"
 
-        path_key = target, portal, npc_gid, detour, frozenset(blocked), frozenset(penalties.items())
+        path_target = (target, portal, npc_gid, detour)
         path = leg.get("path")
-        if path and leg.get("path_key") == path_key:
-            closest = min(range(len(path)), key=lambda idx: math.dist(position, path[idx]))
-            if math.dist(position, path[closest]) <= 3.0:
-                path = path[closest:]
-                leg["path"] = path
-            else:
+        if path and leg.get("path_target") == path_target:
+            idx = min(leg.get("nav_idx", 0), len(path) - 1)
+            while idx < len(path) - 1 and math.dist(position, path[idx]) <= 2.5:
+                idx += 1
+                leg["nav_idx"] = idx
+                leg["nav_wp_dist"] = math.dist(position, path[idx])
+                leg["nav_wp_ts"] = now
+            leg["nav_idx"] = idx
+            wp = path[idx]
+            dist_wp = math.dist(position, wp)
+            if dist_wp < leg.get("nav_wp_dist", float("inf")) - 0.1:
+                leg["nav_wp_dist"] = dist_wp
+                leg["nav_wp_ts"] = now
+            ahead = path[idx:min(len(path), idx + 8)]
+            blocked_ahead = any(cell in blocked for cell in ahead if cell != start)
+            stalled_wp = (now - leg.get("nav_wp_ts", now)) > 2.2
+            if blocked_ahead or stalled_wp:
                 path = None
         else:
             path = None
+        path_key = (*path_target, frozenset(blocked), frozenset(penalties.items()))
         if not path:
             job = leg.get("path_job")
             if job and not job["done"]:
@@ -5095,8 +5902,14 @@ class Overlay:
                 closest = min(range(len(path)), key=lambda idx: math.dist(position, path[idx]))
                 if math.dist(position, path[closest]) > 3:
                     return "waiting"
-                path = path[closest:]
-                leg["path"], leg["path_key"] = path, path_key
+                leg["path"] = path
+                leg["path_key"] = path_key
+                leg["path_target"] = path_target
+                leg["nav_idx"] = closest
+                leg["nav_wp_dist"] = math.dist(position, path[closest])
+                leg["nav_wp_ts"] = now
+                self._set_locked_nav_path(path, (snapshot.map, target), position, now)
+                self._active_nav_idx = closest
             else:
                 job = {"key": path_key, "done": False, "path": []}
                 leg["path_job"] = job
@@ -5105,12 +5918,28 @@ class Overlay:
                 def find_path():
                     try:
                         costs = {cell: 30 for cell in avoided} if detour else None
-                        radius = 2 if portal else 3
-                        candidates = sorted(
-                            (cell for cell in self._patrol_cells_in_radius(*target, radius)
-                             if cell != start and cell not in blocked and gat.is_walkable(*cell)),
-                            key=lambda cell: (cell != target if portal else False, math.dist(start, cell)),
-                        )
+                        if portal:
+                            radius = 2
+                            candidates = sorted(
+                                (cell for cell in self._patrol_cells_in_radius(*target, radius)
+                                 if cell != start and cell not in blocked and gat.is_walkable(*cell)),
+                                key=lambda cell: (cell != target, math.dist(start, cell)),
+                            )
+                        else:
+                            # Rotina da Kafra: destino do A* é a célula caminhável livre mais próxima
+                            # do jogador a 2 ou 3 células de (kafra_x, kafra_y) (que não esteja em blocked_cells)
+                            candidates = [
+                                cell for cell in self._patrol_cells_in_radius(*target, 3)
+                                if 2 <= max(abs(cell[0] - target[0]), abs(cell[1] - target[1])) <= 3
+                                and cell != start and cell not in blocked and gat.is_walkable(*cell)
+                            ]
+                            candidates.sort(key=lambda cell: math.dist(start, cell))
+                            if not candidates:
+                                candidates = [
+                                    cell for cell in self._patrol_cells_in_radius(*target, 3)
+                                    if cell != target and cell != start and cell not in blocked and gat.is_walkable(*cell)
+                                ]
+                                candidates.sort(key=lambda cell: math.dist(start, cell))
                         for goal in candidates[:5]:
                             candidate = gat.find_path(
                                 start, goal, blocked_cells=blocked, penalty_cells=penalties, cell_costs=costs,
@@ -5127,20 +5956,25 @@ class Overlay:
                 threading.Thread(target=find_path, daemon=True, name="travel-path").start()
                 return "waiting"
 
-        self.active_nav_path = path
+        nav_idx = min(leg.get("nav_idx", 0), len(path) - 1)
+        self._active_nav_path = list(path)
+        self._active_nav_idx = nav_idx
+        self.active_nav_path = list(path[nav_idx:])
         self.active_nav_color = "#22D3EE"
-        local_path = path[:15]
+        local_path = path[nav_idx:nav_idx + 7]
         if failed := leg.get("failed_walk_step"):
             retry = self._pick_walk_retry(local_path, position, failed[0], ground_point,
                                           previous_point=failed[1], radius=5)
             if retry:
                 return click(*retry)
-        stride = self._pick_walk_stride(local_path, position, blocked, ground_point)
+        stride = self._pick_locked_ahead_step(path, nav_idx, ground_point)
+        if stride is None:
+            stride = self._pick_walk_stride(local_path, position, blocked, ground_point)
         if stride:
             leg["side_steps"] = 0
             return click(*stride)
         if len(path) > 1 and leg.get("side_steps", 0) < 3:
-            next_cell = path[min(len(path) - 1, 5)]
+            next_cell = path[min(len(path) - 1, nav_idx + 5)]
             retry = self._pick_walk_retry(local_path, position, next_cell, ground_point, radius=5)
             if retry:
                 leg["side_steps"] = leg.get("side_steps", 0) + 1
@@ -5193,7 +6027,7 @@ class Overlay:
                 if selecting_service:
                     normalized = [_normalize_menu_text(option) for option in options]
                     index = self._kafra_keyword_index(normalized, ("teleporte", "teleport", "warp"),
-                                                      raw=raw, token="0ma0AQ")
+                                                      raw=raw, token="0ma0AQ", skip_cancel=True)
                 else:
                     _, entry = get_kafra_network_map_entry(snapshot.map)
                     index = _kafra_destination_index(options, raw, step["to_city"], entry)
@@ -5304,12 +6138,27 @@ class Overlay:
         if self._world_map_open:
             rx, ry = (screen_x - vx) / vw, (screen_y - vy) / vh
             if 0.15 <= rx <= 0.85 and 0.12 <= ry <= 0.88:
-                entry = self._get_world_map_entry((rx - 0.15) / 0.70, (ry - 0.12) / 0.76)
-                if entry:
-                    if ctrl:
-                        self._start_world_map_travel(entry["map"], "travel")
-                        return True
-                    self._show_world_map_popup(entry, screen_x, screen_y)
+                u = max(0.0, min(1.0, (rx - 0.15) / 0.70))
+                v = max(0.0, min(1.0, (ry - 0.12) / 0.76))
+                candidates = self._get_world_map_candidates(u, v, region_filter=self._world_map_region)
+                if not candidates:
+                    msg = f"Nenhum mapa mapeado em ({u:.3f}, {v:.3f})"
+                    print(f"[WorldMap] {msg}", flush=True)
+                    self._show_world_map_notice(msg)
+                    return False
+                self._world_map_candidates = candidates
+                entry = candidates[0]
+                if getattr(self, "_world_map_hud_target_var", None) is not None:
+                    self._world_map_hud_target_var.set(entry["map_name"])
+                if getattr(self, "_refresh_world_map_candidates_ui", None) is not None:
+                    self.root.after(0, self._refresh_world_map_candidates_ui)
+                if ctrl:
+                    if len(candidates) > 1:
+                        others = ", ".join(c["map_name"] for c in candidates[1:4])
+                        print(f"[WorldMap] Priorizando {entry['map_name']} (outros próximos: {others})", flush=True)
+                    self._start_world_map_travel(entry["map_name"], "travel")
+                    return True
+                self._show_world_map_popup(entry, screen_x, screen_y, candidates=candidates)
             return False
 
         mm_x1, mm_y1 = vx + vw - 146, vy + 18
@@ -5332,7 +6181,7 @@ class Overlay:
         start = tuple(map(round, player.cell()))
         raw_x, raw_y = int(rx * gat.width), int((1.0 - ry) * gat.height)
         blocked, penalties = self._navigation_obstacles(map_id, gat)
-        goal = gat.find_nearest_walkable(raw_x, raw_y, max_radius=15, blocked_cells=blocked)
+        goal = self._resolve_walkable_cell(gat, raw_x, raw_y, max_radius=15, forbidden_cells=blocked)
         path = self._find_minimap_path(gat, start, goal, blocked, penalties) if goal else []
         if not path:
             self._click_debug(f"PATROL bloqueado: minimapa sem rota caminhável até ({raw_x}, {raw_y}).")
@@ -5347,7 +6196,7 @@ class Overlay:
         self._minimap_goal = self.manual_nav_goal = self.nav_goal = (map_id, *goal)
         self.current_waypoint = goal
         self.current_patrol_path = path
-        self.active_nav_path = list(path)
+        self._set_locked_nav_path(path, (map_id, goal), player.cell(), time.monotonic())
         self.active_nav_color = "#A78BFA"
         self._resume_hud_automation()
         print(f"[Minimapa] {map_id} {start} → {goal}.", flush=True)
@@ -5370,26 +6219,50 @@ class Overlay:
         elif self.travel_plan:
             self._finish_travel_plan(self.travel_plan, "O mapa-múndi não pôde ser fechado.")
 
-    def _get_world_map_entry(self, u, v):
-        routes_data = getattr(self, "world_routes_data", {})
-        grid = routes_data.get("world_map_grid", [])
-        if not grid:
-            return None
-        for entry in grid:
-            if entry["u_min"] <= u <= entry["u_max"] and entry["v_min"] <= v <= entry["v_max"]:
-                return entry
-        best_e = None
-        best_d = 999.0
-        for entry in grid:
-            cu = (entry["u_min"] + entry["u_max"]) / 2.0
-            cv = (entry["v_min"] + entry["v_max"]) / 2.0
-            d = math.hypot(u - cu, v - cv)
-            if d < best_d:
-                best_d = d
-                best_e = entry
-        return best_e
+    def _get_world_map_region_entries(self, region_filter=None):
+        entries = self.world_map_regions_data.get("maps", [])
+        reg = region_filter or getattr(self, "_world_map_region", "all") or "all"
+        if reg == "all":
+            return entries
+        if reg == "dungeons_submaps":
+            return [e for e in entries if e.get("region") == "dungeons_submaps"
+                    or e.get("layer") in ("dungeon", "factory_lab", "submap")]
+        return [e for e in entries if e.get("region") == reg]
 
-    def _show_world_map_popup(self, entry, sx, sy):
+    def _get_world_map_candidates(self, rx, ry, region_filter=None):
+        reg = region_filter or getattr(self, "_world_map_region", "all") or "all"
+        entries = self._get_world_map_region_entries(reg)
+        if not entries:
+            return []
+        rx = max(0.0, min(1.0, float(rx)))
+        ry = max(0.0, min(1.0, float(ry)))
+        matches = []
+        for entry in entries:
+            ex = float(entry.get("rx", 0.5))
+            ey = float(entry.get("ry", 0.5))
+            rad = float(entry.get("radius", 0.05))
+            dist = math.hypot(rx - ex, ry - ey)
+            if dist <= rad:
+                matches.append((dist, entry))
+        if not matches:
+            return []
+        if reg == "dungeons_submaps":
+            layer_rank = {"dungeon": 0, "factory_lab": 1, "submap": 2, "field": 3, "city": 4}
+        else:
+            layer_rank = {"city": 0, "field": 1, "factory_lab": 2, "dungeon": 3, "submap": 4}
+        matches.sort(key=lambda item: (layer_rank.get(item[1].get("layer", "field"), 5), item[0]))
+        return [entry for _, entry in matches]
+
+    def _get_world_map_entry(self, u, v):
+        candidates = self._get_world_map_candidates(u, v, region_filter=getattr(self, "_world_map_region", "all"))
+        return candidates[0] if candidates else None
+
+    def _show_world_map_notice(self, message, duration=3.0):
+        self._world_map_notice = (str(message), time.monotonic() + duration)
+        if getattr(self, "_world_map_hud_notice_var", None) is not None:
+            self._world_map_hud_notice_var.set(str(message))
+
+    def _show_world_map_popup(self, entry, sx, sy, candidates=None):
         self._close_world_map_popup()
         popup = tk.Toplevel(self.root)
         popup.withdraw()
@@ -5397,34 +6270,52 @@ class Overlay:
         popup.attributes("-topmost", True, "-toolwindow", True)
         popup.configure(bg="#0F172A", highlightthickness=1, highlightbackground="#3B82F6")
 
-        px = max(10, min(sx + 12, self.root.winfo_screenwidth() - 240))
-        py = max(10, min(sy + 12, self.root.winfo_screenheight() - 130))
+        px = max(10, min(sx + 12, self.root.winfo_screenwidth() - 250))
+        py = max(10, min(sy + 12, self.root.winfo_screenheight() - 160))
         popup.geometry(f"+{px}+{py}")
 
         pad_f = tk.Frame(popup, bg="#0F172A", padx=8, pady=6)
         pad_f.pack()
 
+        selected_entry = [entry]
+        title_var = tk.StringVar(value=entry.get("label") or entry.get("map_name", ""))
+        mobs_var = tk.StringVar(value=f"Monstros: {entry['mobs']}" if entry.get("mobs") else "")
+
         head_f = tk.Frame(pad_f, bg="#0F172A")
         head_f.pack(fill="x", pady=(0, 2))
-        tk.Label(head_f, text=entry.get("name", entry.get("map", "")),
+        tk.Label(head_f, textvariable=title_var,
                  bg="#0F172A", fg="#F8FAFC", font=("Segoe UI", 8, "bold")).pack(side="left")
         btn_close = tk.Label(head_f, text="✕", bg="#0F172A", fg="#94A3B8", font=("Segoe UI", 8), cursor="hand2")
         btn_close.pack(side="right")
         btn_close.bind("<Button-1>", lambda _e: self._close_world_map_popup())
 
-        mobs_str = entry.get("mobs", "")
-        if mobs_str:
-            tk.Label(pad_f, text=f"Monstros: {mobs_str}", bg="#0F172A", fg="#94A3B8",
-                     font=("Segoe UI", 7), wraplength=210, justify="left").pack(anchor="w", pady=(0, 4))
+        tk.Label(pad_f, textvariable=mobs_var, bg="#0F172A", fg="#94A3B8",
+                 font=("Segoe UI", 7), wraplength=220, justify="left").pack(anchor="w", pady=(0, 4))
+
+        if candidates and len(candidates) > 1:
+            cand_f = tk.Frame(pad_f, bg="#0F172A")
+            cand_f.pack(fill="x", pady=(0, 4))
+            for cand in candidates[:4]:
+                lbl = cand.get("label") or cand["map_name"]
+                short = lbl if len(lbl) <= 14 else cand["map_name"]
+                tk.Button(
+                    cand_f, text=short, bg="#1E293B", fg="#E2E8F0", font=("Segoe UI", 7),
+                    relief="flat", cursor="hand2", padx=4, pady=1,
+                    command=lambda c=cand: (
+                        selected_entry.__setitem__(0, c),
+                        title_var.set(c.get("label") or c.get("map_name", "")),
+                        mobs_var.set(f"Monstros: {c['mobs']}" if c.get("mobs") else ""),
+                    ),
+                ).pack(side="left", padx=(0, 2))
 
         btns_f = tk.Frame(pad_f, bg="#0F172A")
         btns_f.pack(fill="x", pady=2)
 
         def _on_travel():
-            self._start_world_map_travel(entry["map"], "travel")
+            self._start_world_map_travel(selected_entry[0]["map_name"], "travel")
 
         def _on_farm():
-            self._start_world_map_travel(entry["map"], "farm")
+            self._start_world_map_travel(selected_entry[0]["map_name"], "farm")
 
         tk.Button(btns_f, text="Viajar", command=_on_travel,
                   bg="#2563EB", fg="#F8FAFC", font=("Segoe UI", 7, "bold"),
@@ -6252,6 +7143,12 @@ class Overlay:
         if px is not None and self.auto_patrol:
             self._scan_patrol_area(world, curr_m, (px, py), now)
 
+        if px is not None and self.auto_farm:
+            if self._check_skill_cast_lock(world, (px, py), now):
+                return
+            if self._tick_auto_buff_skills(world, now):
+                return
+
         if px is not None and (self.auto_farm or self.auto_loot or self.auto_patrol):
             position = (px, py)
             drops = self._eligible_drops(snapshot, position, entities, now) if self.auto_loot or self.auto_farm else []
@@ -6392,6 +7289,97 @@ class Overlay:
                 return False
         return gat.is_walkable(end_x, end_y)
 
+    def _resolve_walkable_cell(self, gat, target_x, target_y, max_radius=3, forbidden_cells=None):
+        """Valida (target_x, target_y) no .gat e resolve em espiral a célula caminhável válida mais próxima."""
+        cx, cy = int(round(target_x)), int(round(target_y))
+        forbidden = set(forbidden_cells) if forbidden_cells else set()
+        if gat is None:
+            return None if (cx, cy) in forbidden else (cx, cy)
+        if gat.is_walkable(cx, cy) and (cx, cy) not in forbidden:
+            return (cx, cy)
+        best = None
+        best_dist = float("inf")
+        for r in range(1, max_radius + 1):
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if max(abs(dx), abs(dy)) != r:
+                        continue
+                    nx, ny = cx + dx, cy + dy
+                    if (nx, ny) in forbidden:
+                        continue
+                    if gat.is_walkable(nx, ny):
+                        dist = math.hypot(dx, dy)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best = (nx, ny)
+            if best is not None:
+                return best
+        return None
+
+    def _set_locked_nav_path(self, path, goal_key, position, now):
+        """Armazena a rota A* travada em self._active_nav_path sem recalcular a cada tick."""
+        self._active_nav_path = list(path) if path else []
+        self._active_nav_idx = 0
+        self._active_nav_goal = goal_key
+        if self._active_nav_path:
+            self._active_nav_wp_dist = math.dist(position, self._active_nav_path[0])
+            self._active_nav_wp_ts = now
+            self.active_nav_path = list(self._active_nav_path)
+        else:
+            self._active_nav_wp_dist = float("inf")
+            self._active_nav_wp_ts = 0.0
+            self.active_nav_path = None
+
+    def _clear_locked_nav_path(self):
+        self._active_nav_path = []
+        self._active_nav_idx = 0
+        self._active_nav_goal = None
+        self._active_nav_wp_dist = float("inf")
+        self._active_nav_wp_ts = 0.0
+        self.active_nav_path = None
+
+    def _advance_locked_nav_waypoint(self, position, blocked, now, cur_cell):
+        """Avança o índice do waypoint quando dist <= 2.5 e detecta bloqueio ou falta de progresso (> 2.2s)."""
+        path = self._active_nav_path
+        if not path:
+            return False
+        idx = min(self._active_nav_idx, len(path) - 1)
+        while idx < len(path) - 1 and math.dist(position, path[idx]) <= 2.5:
+            idx += 1
+            self._active_nav_idx = idx
+            self._active_nav_wp_dist = math.dist(position, path[idx])
+            self._active_nav_wp_ts = now
+        self._active_nav_idx = idx
+        wp = path[idx]
+        dist_wp = math.dist(position, wp)
+        if dist_wp < self._active_nav_wp_dist - 0.1:
+            self._active_nav_wp_dist = dist_wp
+            self._active_nav_wp_ts = now
+        self.active_nav_path = list(path[idx:])
+        ahead = path[idx:min(len(path), idx + 8)]
+        if any(cell in blocked for cell in ahead if cell != cur_cell):
+            return False
+        if now - self._active_nav_wp_ts > 2.2:
+            return False
+        return True
+
+    @staticmethod
+    def _pick_locked_ahead_step(path, start_idx, ground_point):
+        """Mira 4 a 6 células à frente na rota A* (com checagem de linha de visão no .gat)."""
+        if not path or start_idx >= len(path):
+            return None
+        max_idx = min(len(path) - 1, start_idx + 6)
+        min_idx = min(len(path) - 1, start_idx + 4)
+        for idx in range(max_idx, min_idx - 1, -1):
+            cell = path[idx]
+            if point := ground_point(cell):
+                return cell, point
+        for idx in range(min_idx - 1, start_idx - 1, -1):
+            cell = path[idx]
+            if point := ground_point(cell):
+                return cell, point
+        return None
+
     def _safe_click_resolver(self, snapshot, project, *, allowed_portal=None, allowed_npc=None):
         left, top, width, height = snapshot.viewport
         entities = self._navigation_entities(snapshot.map)
@@ -6424,9 +7412,51 @@ class Overlay:
 
         return resolve
 
+    def _entity_occupied_cells(self, map_name, *, allowed_portal=None, allowed_npc=None):
+        """Retorna células ocupadas por monstros, entidades ou itens no mapa atual."""
+        occupied = set()
+        for (kind, gid), ent in self._navigation_entities(map_name):
+            if kind == "npc" and gid == allowed_npc:
+                continue
+            if ent.is_portal and allowed_portal is not None and tuple(map(round, ent.track.target)) == allowed_portal:
+                continue
+            occupied.add(tuple(map(round, ent.track.cell())))
+            occupied.add(tuple(map(round, ent.track.target)))
+        return occupied
+
+    def _is_empty_walkable_cell(self, map_name, gat, cell, blocked=None, *, allowed_portal=None, allowed_npc=None):
+        """Confirma que a célula é caminhável no .gat, não está bloqueada e não coincide com entidade."""
+        tile = (int(round(cell[0])), int(round(cell[1])))
+        if gat is not None and not gat.is_walkable(*tile):
+            return False
+        if blocked and tile in blocked:
+            return False
+        return tile not in self._entity_occupied_cells(
+            map_name, allowed_portal=allowed_portal, allowed_npc=allowed_npc)
+
     def _navigation_click(self, snapshot, gat, cell, point, *, hwnd=None, target_point=None,
                           retry_key=None, portal=None, npc=None, ground=True):
         world = self.feed.world
+        if ground and gat is not None:
+            blocked_init, _ = self._navigation_obstacles(snapshot.map, gat, portal=portal, npc=npc)
+            occupied_init = self._entity_occupied_cells(snapshot.map, allowed_portal=portal, allowed_npc=npc)
+            resolved_cell = self._resolve_walkable_cell(
+                gat, cell[0], cell[1], max_radius=3, forbidden_cells=blocked_init | occupied_init)
+            if resolved_cell is None:
+                return False
+            if resolved_cell != tuple(map(round, cell)):
+                cell = resolved_cell
+                with world.lock:
+                    pos_init = world.player.cell() if world.player else cell
+                project_init = self.feed.camera.projector(
+                    snapshot.viewport, getattr(self.feed, "_cam", None) or pos_init,
+                    gat.get_elevation if gat else flat_height)
+                resolve_init = self._safe_click_resolver(
+                    snapshot, project_init, allowed_portal=portal, allowed_npc=npc)
+                re_point = resolve_init(cell)
+                if re_point is None:
+                    return False
+                point = re_point
 
         def guarded_aim(lead):
             with world.lock:
@@ -6437,7 +7467,10 @@ class Overlay:
             blocked, _ = self._navigation_obstacles(snapshot.map, gat, portal=portal, npc=npc)
             if self._segment_hits_obstacle(*position, *cell, blocked):
                 return None
-            if ground and (gat is None or not self._has_gat_line_of_sight(*position, *cell, gat)):
+            if ground and (gat is None
+                           or not self._is_empty_walkable_cell(
+                               snapshot.map, gat, cell, blocked, allowed_portal=portal, allowed_npc=npc)
+                           or not self._has_gat_line_of_sight(*position, *cell, gat)):
                 return None
             current_point = target_point(lead) if target_point else point
             if current_point is None:
@@ -6492,29 +7525,79 @@ class Overlay:
                     and math.dist(position, previous) >= 0.8)
         if advanced:
             return "waiting" if world._is_player_walking() else "moved"
+        if world._is_player_walking() and world.last_player_move_pkt_time >= clicked_at:
+            return "waiting"
         if now - self._touch_click_finished_at(point, clicked_at) < 0.85:
             return "waiting"
         return "stalled"
 
     def _walk_ground_point(self, gat, position, cell, blocked, resolve):
+        world = getattr(self.feed, "world", None)
+        map_name = world.map if world else None
         if (cell not in blocked and gat.is_walkable(*cell)
+                and (not map_name or cell not in self._entity_occupied_cells(map_name))
                 and not self._segment_hits_obstacle(*position, *cell, blocked)
                 and self._has_gat_line_of_sight(*position, *cell, gat)
                 and abs(gat.get_elevation(*position) - gat.get_elevation(*cell)) <= 16):
             return resolve(cell)
         return None
 
-    def _pick_walk_stride(self, path, position, blocked, ground_point):
+    def _pick_walk_stride(self, path, position, blocked, ground_point, *, min_dist=0.0):
         start = tuple(map(round, position))
         waypoint = None
         for cell in path:
             if cell == start:
                 continue
-            if math.dist(position, cell) > 14 or self._segment_hits_obstacle(*position, *cell, blocked):
+            dist = math.dist(position, cell)
+            if dist > 14 or self._segment_hits_obstacle(*position, *cell, blocked):
                 break
+            if dist <= min_dist:
+                continue
             if point := ground_point(cell):
                 waypoint = cell, point
         return waypoint
+
+    def _prune_patrol_path(self, path, px, py, cur_cell, *, roaming=False):
+        """Avança a rota apenas para frente, descartando pontos já passados, atrás do sentido ou muito próximos."""
+        if not path:
+            return [], float("inf")
+        closest_idx = 0
+        min_dist_to_path = float("inf")
+        for i, (cx, cy) in enumerate(path):
+            d = math.hypot(px - cx, py - cy)
+            if d < min_dist_to_path:
+                min_dist_to_path = d
+                closest_idx = i
+
+        # Só avança para frente na lista de waypoints quando o jogador acompanha a rota.
+        if closest_idx > 0 and min_dist_to_path <= 4.0:
+            path = path[closest_idx:]
+        else:
+            path = list(path)
+
+        hx, hy = self._patrol_heading
+        has_heading = roaming and (hx != 0.0 or hy != 0.0)
+        while path:
+            c0 = path[0]
+            if c0 == cur_cell:
+                path.pop(0)
+                continue
+            dist0 = math.hypot(px - c0[0], py - c0[1])
+            if roaming and dist0 <= 2.5:
+                path.pop(0)
+                continue
+            if len(path) >= 2 and dist0 <= 4.0:
+                c1 = path[1]
+                seg_x, seg_y = c1[0] - c0[0], c1[1] - c0[1]
+                if (px - c0[0]) * seg_x + (py - c0[1]) * seg_y >= 0.0:
+                    path.pop(0)
+                    continue
+            if has_heading and len(path) >= 2 and dist0 <= 3.5:
+                if (c0[0] - px) * hx + (c0[1] - py) * hy < 0.0:
+                    path.pop(0)
+                    continue
+            break
+        return path, min_dist_to_path
 
     def _pick_walk_retry(self, path, position, target, ground_point, *, previous_point=None, radius=2):
         start = tuple(map(round, position))
@@ -6566,6 +7649,7 @@ class Overlay:
             )
             self._patrol_heading = (0.0, 0.0)
             self._patrol_frontier_retry_at = 0.0
+            self._patrol_no_wp_cooldown = 0.0
             if self.nav_goal is None and not self.patrol_target_route:
                 self._reset_patrol(None, None)
                 self.active_nav_path = None
@@ -6663,7 +7747,7 @@ class Overlay:
             if clearance == 1 and minimum == 2:
                 wall_costs[cell] = 8
             distance = math.dist(position, cell)
-            if not 5.5 < distance <= 48 or not available(cell):
+            if not 10.0 <= distance <= 48 or not available(cell):
                 continue
             sector = self._patrol_sector(cell)
             visited_at = self._patrol_sector_visit_ts.get(sector, -math.inf)
@@ -6748,8 +7832,10 @@ class Overlay:
 
         now = time.monotonic()
         if now < getattr(self, "_patrol_no_wp_cooldown", 0.0):
-            self._click_debug("PATROL bloqueado: aguardando nova busca por waypoint.")
-            return
+            if self.nav_goal is None and not self.patrol_target_route:
+                self._click_debug("PATROL bloqueado: aguardando nova busca por waypoint.")
+                return
+            self._patrol_no_wp_cooldown = 0.0
         cur_cell = (int(round(px)), int(round(py)))
 
         # Registra células visitadas recentemente
@@ -6817,29 +7903,39 @@ class Overlay:
                     self.manual_nav_goal = None
                     self._minimap_goal = None
                     self.nav_goal = None
-                    self.active_nav_path = None
+                    self._clear_locked_nav_path()
                     self._reset_patrol(px, py)
                     return
-                # Usa apenas find_path, nunca pick_next_waypoint
-                goal = (ng_x, ng_y)
-                if goal in blocked:
+                # Valida destino no .gat e usa rota travada em self._active_nav_path sem recalcular a cada tick
+                goal = self._resolve_walkable_cell(
+                    gat, ng_x, ng_y, max_radius=15 if minimap else 3, forbidden_cells=blocked)
+                goal_key = (curr_map, goal) if goal else None
+                need_recalc = (
+                    not goal
+                    or not self._active_nav_path
+                    or self._active_nav_goal != goal_key
+                    or not self._advance_locked_nav_waypoint((px, py), blocked, now, cur_cell)
+                )
+                if not goal:
                     ng_path = []
-                elif minimap:
-                    ng_path = self.current_patrol_path if self.current_waypoint == goal else []
-                    if (not ng_path or min(math.dist((px, py), cell) for cell in ng_path) > 4.5
-                            or any(cell in blocked for cell in ng_path if cell != cur_cell)):
+                elif need_recalc:
+                    if minimap:
                         ng_path = self._find_minimap_path(gat, cur_cell, goal, blocked, penalties)
+                    else:
+                        ng_path = gat.find_path(cur_cell, goal, blocked_cells=blocked, penalty_cells=penalties)
+                    if ng_path:
+                        self._set_locked_nav_path(ng_path, goal_key, (px, py), now)
                 else:
-                    ng_path = gat.find_path(cur_cell, goal, blocked_cells=blocked, penalty_cells=penalties)
+                    ng_path = self._active_nav_path
                 if ng_path:
-                    self.current_patrol_path = ng_path
-                    self.current_waypoint = (ng_x, ng_y)
-                    self.active_nav_path = list(ng_path)
+                    self.current_patrol_path = list(ng_path[self._active_nav_idx:])
+                    self.current_waypoint = goal
+                    self.active_nav_path = list(ng_path[self._active_nav_idx:])
                     self.active_nav_color = "#A78BFA"  # Roxo = nav_goal
                 else:
                     self._reset_patrol(px, py)
-                    self.active_nav_path = None
-                    self._click_debug(f"PATROL bloqueado: A* sem rota até {goal}.")
+                    self._clear_locked_nav_path()
+                    self._click_debug(f"PATROL bloqueado: A* sem rota até {(ng_x, ng_y)}.")
                     return
                 # Depois deixa a lógica de execução do caminho abaixo tomar conta
                 # (não retorna aqui, cai no código de sub-step abaixo)
@@ -6917,124 +8013,200 @@ class Overlay:
             else:
                 self.temp_blocked_cells[failed] = now + 25.0
                 blocked.add(failed)
-                if attempts < 2:
-                    retry = self._pick_walk_retry(
-                        self.current_patrol_path, (px, py), failed, ground_point, previous_point=(sx, sy),
+                if attempts < 2 and self.current_patrol_path:
+                    retry = self._pick_walk_stride(
+                        self.current_patrol_path[:15], (px, py), blocked, ground_point,
+                        min_dist=2.5 if roaming else 0.0,
                     )
-                    if retry:
+                    if retry is None:
+                        retry = self._pick_walk_retry(
+                            self.current_patrol_path, (px, py), failed, ground_point, previous_point=(sx, sy),
+                        )
+                    min_retry_dist = 2.5001 if roaming else 2.0
+                    if retry and math.dist((px, py), retry[0]) >= min_retry_dist:
                         cell, point = retry
                         if click_patrol_ground(cell, point):
                             self._current_patrol_sub_step = cell
                             self._last_patrol_click_target = (now, px, py, *cell, *point, attempts + 1)
                             self._click_debug(f"PATROL: Sem avanço para {failed}. Tentando {cell}.")
                         return
-                if roaming and self.current_waypoint:
-                    self._patrol_unreachable_until[self.current_waypoint] = now + 25.0
-                self._reset_patrol(px, py)
-                self.active_nav_path = None
-                self._click_debug("PATROL: Sem avanço após tentativas. Recalculando a rota.")
+                self._last_patrol_click_target = None
+                self._current_patrol_sub_step = None
+                if self.current_waypoint:
+                    recalc = gat.find_path(cur_cell, self.current_waypoint, blocked_cells=blocked, penalty_cells=penalties)
+                    if recalc and (not roaming or recalc[-1] == self.current_waypoint):
+                        self.current_patrol_path = recalc
+                        self.active_nav_path = list(recalc)
+                        self._click_debug(f"PATROL: Desviando de {failed} mantendo destino {self.current_waypoint}.")
+                    else:
+                        if roaming:
+                            self._patrol_unreachable_until[self.current_waypoint] = now + 25.0
+                        self._reset_patrol(px, py)
+                        self.active_nav_path = None
+                        self._click_debug("PATROL: Sem avanço após tentativas. Recalculando a rota.")
+                else:
+                    self._reset_patrol(px, py)
+                    self.active_nav_path = None
+                    self._click_debug("PATROL: Sem avanço após tentativas. Recalculando a rota.")
 
-        if roaming and world._is_player_walking():
-            self._click_debug("PATROL bloqueado: personagem ainda caminhando.")
-            return
+        if world._is_player_walking():
+            current_sub = getattr(self, "_current_patrol_sub_step", None)
+            if roaming or (current_sub and math.dist((px, py), current_sub) > 1.5):
+                self._click_debug("PATROL bloqueado: personagem ainda caminhando.")
+                return
 
         # ── Planejamento de Waypoint e Rota A* ──
-        arrival_dist = 0.75 if minimap else 2.75 if roaming else 2.0
-        if not self.current_waypoint or math.dist((px, py), self.current_waypoint) <= arrival_dist:
-            if roaming and self.current_waypoint:
-                self._patrol_finished_ts[self.current_waypoint] = now
-                self._reset_patrol(px, py)
-                self.active_nav_path = None
-            next_path = None
-            if route_target:
-                next_wp = (int(self.patrol_target_route[1]), int(self.patrol_target_route[2]))
-            elif getattr(self, "nav_goal", None) is not None:
-                # nav_goal ativo: nunca chama pick_next_waypoint, usa o destino direto
-                ng_map, ng_x, ng_y = self.nav_goal
-                next_wp = (ng_x, ng_y)
-                self.active_nav_color = "#A78BFA"  # Roxo = nav_goal
-            else:
-                next_wp, next_path = self._choose_patrol_waypoint(
-                    curr_map, gat, (px, py), blocked, penalties, now,
-                )
-                self.active_nav_color = "#38BDF8"  # Ciano = Auto-Patrol
-            if next_wp:
-                self.current_waypoint = next_wp
-                if minimap:
-                    next_path = self._find_minimap_path(gat, cur_cell, next_wp, blocked, penalties)
-                elif next_path is None:
-                    next_path = gat.find_path((px, py), next_wp, blocked_cells=blocked, penalty_cells=penalties)
-                self.current_patrol_path = next_path or []
-                self.active_nav_path = list(self.current_patrol_path)
-                # Preserva a cor já definida por nav_goal se aplicável
-                if not hasattr(self, "active_nav_color") or self.active_nav_color != "#A78BFA":
+        arrival_dist = 0.75 if minimap else 6.0 if roaming else 2.0
+        stride = None
+        max_plan_attempts = 2 if roaming else 1
+        for plan_attempt in range(max_plan_attempts):
+            if not self.current_waypoint or math.dist((px, py), self.current_waypoint) <= arrival_dist:
+                if roaming and self.current_waypoint:
+                    self._patrol_finished_ts[self.current_waypoint] = now
+                    self._reset_patrol(px, py)
+                    self.active_nav_path = None
+                next_path = None
+                if route_target:
+                    next_wp = self._resolve_walkable_cell(
+                        gat, self.patrol_target_route[1], self.patrol_target_route[2],
+                        max_radius=3, forbidden_cells=blocked)
+                    if next_wp is None:
+                        next_wp = (int(self.patrol_target_route[1]), int(self.patrol_target_route[2]))
+                elif getattr(self, "nav_goal", None) is not None:
+                    # nav_goal ativo: nunca chama pick_next_waypoint, usa o destino direto
+                    ng_map, ng_x, ng_y = self.nav_goal
+                    next_wp = (ng_x, ng_y)
+                    self.active_nav_color = "#A78BFA"  # Roxo = nav_goal
+                else:
+                    next_wp, next_path = self._choose_patrol_waypoint(
+                        curr_map, gat, (px, py), blocked, penalties, now,
+                    )
                     self.active_nav_color = "#38BDF8"  # Ciano = Auto-Patrol
-                self.stuck_count = 0
-            else:
-                self.visited_cells.clear()
-                self._patrol_no_wp_cooldown = now + 0.45
-                self._click_debug("PATROL bloqueado: nenhum waypoint caminhável disponível.")
+                if next_wp:
+                    self.current_waypoint = next_wp
+                    self._patrol_no_wp_cooldown = 0.0
+                    if minimap:
+                        next_path = self._find_minimap_path(gat, cur_cell, next_wp, blocked, penalties)
+                    elif next_path is None:
+                        next_path = gat.find_path((px, py), next_wp, blocked_cells=blocked, penalty_cells=penalties)
+                    self.current_patrol_path = next_path or []
+                    self.active_nav_path = list(self.current_patrol_path)
+                    # Preserva a cor já definida por nav_goal se aplicável
+                    if not hasattr(self, "active_nav_color") or self.active_nav_color != "#A78BFA":
+                        self.active_nav_color = "#38BDF8"  # Ciano = Auto-Patrol
+                    self.stuck_count = 0
+                else:
+                    self.visited_cells.clear()
+                    self._patrol_no_wp_cooldown = now + 0.35
+                    self._click_debug("PATROL bloqueado: nenhum waypoint caminhável disponível.")
+                    return
+
+            if not (nav is not None and self._active_nav_path):
+                if any(cell in blocked for cell in self.current_patrol_path[:12] if cell != cur_cell):
+                    self.current_patrol_path = []
+                if not self.current_patrol_path:
+                    path = gat.find_path(cur_cell, self.current_waypoint, blocked_cells=blocked, penalty_cells=penalties)
+                    if not path or (roaming and path[-1] != self.current_waypoint):
+                        if roaming:
+                            self._patrol_unreachable_until[self.current_waypoint] = now + 12.0
+                            self._reset_patrol(px, py)
+                            self.active_nav_path = None
+                            if plan_attempt + 1 < max_plan_attempts:
+                                continue
+                            self._patrol_no_wp_cooldown = now + 0.35
+                        else:
+                            self._reset_patrol(px, py)
+                        self._clear_locked_nav_path()
+                        self._click_debug(f"PATROL bloqueado: A* sem rota até {self.current_waypoint}.")
+                        return
+                    self.current_patrol_path = path
+                    self.active_nav_path = list(path)
+
+                # ── Detecção e Poda Precisa de Avanço na Rota ──
+                if self.current_patrol_path:
+                    pruned, min_dist_to_path = self._prune_patrol_path(
+                        self.current_patrol_path, px, py, cur_cell, roaming=roaming,
+                    )
+                    self.current_patrol_path = pruned
+
+                    # Se o personagem se desviou muito da rota (> 4.5 células), recalcula a partir de onde ele está
+                    if min_dist_to_path > 4.5 and self.current_waypoint:
+                        recalc_p = gat.find_path(cur_cell, self.current_waypoint,
+                                                 blocked_cells=blocked, penalty_cells=penalties)
+                        if recalc_p and (not roaming or recalc_p[-1] == self.current_waypoint):
+                            pruned_recalc, _ = self._prune_patrol_path(
+                                recalc_p, px, py, cur_cell, roaming=roaming,
+                            )
+                            self.current_patrol_path = pruned_recalc
+                            self.active_nav_path = list(pruned_recalc)
+                        elif roaming:
+                            self._patrol_unreachable_until[self.current_waypoint] = now + 12.0
+                            self._reset_patrol(px, py)
+                            self.active_nav_path = None
+                            if plan_attempt + 1 < max_plan_attempts:
+                                continue
+                            self._patrol_no_wp_cooldown = now + 0.35
+                            return
+
+            if not self.current_patrol_path:
+                if roaming:
+                    if self.current_waypoint:
+                        self._patrol_finished_ts[self.current_waypoint] = now
+                    self._reset_patrol(px, py)
+                    self.active_nav_path = None
+                    if plan_attempt + 1 < max_plan_attempts:
+                        continue
+                    self._patrol_no_wp_cooldown = now + 0.35
+                    return
+                self.current_waypoint = None
                 return
 
-        if any(cell in blocked for cell in self.current_patrol_path if cell != cur_cell):
-            self.current_patrol_path = []
-        if not self.current_patrol_path:
-            path = gat.find_path(cur_cell, self.current_waypoint, blocked_cells=blocked, penalty_cells=penalties)
-            if not path or (roaming and path[-1] != self.current_waypoint):
-                self._click_debug(f"PATROL bloqueado: A* sem rota até {self.current_waypoint}.")
+            if nav is not None and self._active_nav_path:
+                stride = self._pick_locked_ahead_step(self._active_nav_path, self._active_nav_idx, ground_point)
+                if stride is None:
+                    stride = self._pick_walk_stride(
+                        self._active_nav_path[self._active_nav_idx:self._active_nav_idx + 7],
+                        (px, py), blocked, ground_point)
+            else:
+                stride = self._pick_walk_stride(
+                    self.current_patrol_path[:15], (px, py), blocked, ground_point,
+                    min_dist=2.5 if roaming else 0.0,
+                )
+
+            if roaming and stride and self.current_waypoint:
+                if math.dist((px, py), stride[0]) < 6.0 and math.dist((px, py), self.current_waypoint) <= 8.0:
+                    self._patrol_finished_ts[self.current_waypoint] = now
+                    self._reset_patrol(px, py)
+                    self.active_nav_path = None
+                    stride = None
+                    if plan_attempt + 1 < max_plan_attempts:
+                        continue
+
+            if stride is None:
                 if roaming:
-                    self._patrol_unreachable_until[self.current_waypoint] = now + 12.0
+                    if self.current_waypoint:
+                        self._patrol_unreachable_until[self.current_waypoint] = now + 12.0
+                    self._reset_patrol(px, py)
+                    self.active_nav_path = None
+                    if plan_attempt + 1 < max_plan_attempts:
+                        continue
+                    self._patrol_no_wp_cooldown = now + 0.35
+                    self._click_debug("PATROL bloqueado: nenhum passo caminhável pode ser clicado no viewport.")
+                    return
+                self._click_debug("PATROL bloqueado: nenhum passo caminhável pode ser clicado no viewport.")
                 self._reset_patrol(px, py)
                 self.active_nav_path = None
                 return
-            self.current_patrol_path = path
-            self.active_nav_path = list(path)
+            break
 
-        # ── Detecção e Poda Precisa de Avanço na Rota ──
-        if self.current_patrol_path:
-            closest_idx = 0
-            min_dist_to_path = float("inf")
-            for i, (cx, cy) in enumerate(self.current_patrol_path):
-                d = math.hypot(px - cx, py - cy)
-                if d < min_dist_to_path:
-                    min_dist_to_path = d
-                    closest_idx = i
-
-            # Se o jogador já avançou pela rota, descarta nós anteriores ao ponto mais próximo
-            if closest_idx > 0 and min_dist_to_path <= 4.0:
-                self.current_patrol_path = self.current_patrol_path[closest_idx:]
-
-            while self.current_patrol_path and self.current_patrol_path[0] == cur_cell:
-                self.current_patrol_path.pop(0)
-
-            # Se o personagem se desviou muito da rota (> 4.5 células), recalcula a partir de onde ele está
-            if min_dist_to_path > 4.5 and self.current_waypoint:
-                cur_cell_p = (int(round(px)), int(round(py)))
-                recalc_p = gat.find_path(cur_cell_p, self.current_waypoint,
-                                         blocked_cells=blocked, penalty_cells=penalties)
-                if recalc_p:
-                    self.current_patrol_path = recalc_p
-                    self.active_nav_path = list(recalc_p)
-
-        if not self.current_patrol_path:
-            self.current_waypoint = None
-            return
-
-        stride = self._pick_walk_stride(self.current_patrol_path[:15], (px, py), blocked, ground_point)
         if stride is None:
-            self._click_debug("PATROL bloqueado: nenhum passo caminhável pode ser clicado no viewport.")
-            if roaming:
-                self._patrol_unreachable_until[self.current_waypoint] = now + 12.0
-                self._patrol_no_wp_cooldown = now + 0.25
-            self._reset_patrol(px, py)
-            self.active_nav_path = None
             return
 
         current_sub = getattr(self, "_current_patrol_sub_step", None)
-        if current_sub and world._is_player_walking() and math.dist((px, py), current_sub) > 3.5:
-            self._click_debug("PATROL bloqueado: personagem ainda caminhando até o passo anterior.")
-            return
         cell, point = stride
+        if world._is_player_walking() and current_sub and (cell == current_sub or math.dist(cell, current_sub) <= 1.5):
+            self._click_debug("PATROL bloqueado: passo atual já em andamento.")
+            return
         if click_patrol_ground(cell, point):
             self._current_patrol_sub_step = cell
             self._last_patrol_click_target = (now, px, py, *cell, *point, 0)
@@ -7184,9 +8356,26 @@ class Overlay:
         for box in self._portal_boxes(map_name, gat, portals, allowed_portal_cell).values():
             add_box(box, 2, 6.0)
         for x, y in npcs:
-            add_box((x - 1, y - 1, x + 1, y + 1), 1, 5.0)
+            add_box((x, y, x, y), 1, 3.0)
         for cell in blocked_cells:
             penalty_cells.pop(cell, None)
+
+        exempt_cells = set()
+        world = getattr(self.feed, "world", None)
+        if world is not None and getattr(world, "player", None) is not None:
+            p_cell = world.player.cell()
+            if p_cell and None not in p_cell:
+                exempt_cells.add((int(round(p_cell[0])), int(round(p_cell[1]))))
+        if self.current_waypoint:
+            exempt_cells.add((int(round(self.current_waypoint[0])), int(round(self.current_waypoint[1]))))
+        if self.nav_goal and len(self.nav_goal) >= 3:
+            exempt_cells.add((int(round(self.nav_goal[1])), int(round(self.nav_goal[2]))))
+        if self.patrol_target_route and len(self.patrol_target_route) >= 3:
+            exempt_cells.add((int(round(self.patrol_target_route[1])), int(round(self.patrol_target_route[2]))))
+
+        for cell in exempt_cells:
+            blocked_cells.discard(cell)
+
         return blocked_cells, penalty_cells
 
     def _navigation_entities(self, map_name):
@@ -7207,6 +8396,23 @@ class Overlay:
             if kind == "npc" and not ent.is_portal and gid != npc and ent.avoid_until > now:
                 x, y = map(round, ent.track.target)
                 blocked.update(self._patrol_cells_in_radius(x, y, 4))
+
+        exempt_cells = set()
+        world = getattr(self.feed, "world", None)
+        if world is not None and getattr(world, "player", None) is not None:
+            p_cell = world.player.cell()
+            if p_cell and None not in p_cell:
+                exempt_cells.add((int(round(p_cell[0])), int(round(p_cell[1]))))
+        if self.current_waypoint:
+            exempt_cells.add((int(round(self.current_waypoint[0])), int(round(self.current_waypoint[1]))))
+        if self.nav_goal and len(self.nav_goal) >= 3:
+            exempt_cells.add((int(round(self.nav_goal[1])), int(round(self.nav_goal[2]))))
+        if self.patrol_target_route and len(self.patrol_target_route) >= 3:
+            exempt_cells.add((int(round(self.patrol_target_route[1])), int(round(self.patrol_target_route[2]))))
+
+        for cell in exempt_cells:
+            blocked.discard(cell)
+
         return blocked, penalties
 
     def _is_intentional_warp(self, event, portal_ids):
@@ -7262,7 +8468,8 @@ class Overlay:
         self.current_patrol_path = []
         self.patrol_waypoints = []
         self.current_waypoint = None
-        self.active_nav_path = None
+        self._patrol_no_wp_cooldown = 0.0
+        self._clear_locked_nav_path()
         self.nav_path = None
         self.nav_goal = None
         self._minimap_goal = None
@@ -7339,7 +8546,7 @@ class Overlay:
     def _is_point_in_hud(self, sx, sy, margin=12):
         if margin:
             margin = max(12, margin)
-        for hud in (self._hud_panel, self._hud_drawer):
+        for hud in (self._hud_panel, self._hud_drawer, self._hud_submenu):
             try:
                 if hud and hud.winfo_viewable():
                     left, top = hud.winfo_rootx(), hud.winfo_rooty()
@@ -7492,10 +8699,12 @@ class Overlay:
 
     def _reset_patrol(self, px, py, *, keep_waypoint=False):
         """Limpa os passos pendentes e registra a posição atual."""
-        self.current_patrol_path = []
-        self.patrol_path = []
-        if not (keep_waypoint and self.auto_patrol and self.nav_goal is None and not self.patrol_target_route):
+        preserve = keep_waypoint and self.auto_patrol and self.nav_goal is None and not self.patrol_target_route
+        if not preserve:
+            self.current_patrol_path = []
+            self.patrol_path = []
             self.current_waypoint = None
+            self._patrol_no_wp_cooldown = 0.0
         self.patrol_waypoint = None
         self._current_patrol_sub_step = None
         self._last_patrol_click_target = None
@@ -7582,6 +8791,12 @@ class Overlay:
             self._engage_state = self._engagement = None
         if self.locked_combat_mob_gid == gid:
             self.locked_combat_mob_gid = None
+        if self._active_splash_gid == gid:
+            self._active_splash_gid = None
+            self._active_splash_until = 0.0
+        if self._skill_cast_target_gid == gid:
+            self._skill_cast_until = 0.0
+            self._skill_cast_target_gid = None
         self.active_nav_path = None
         world = self.feed.world
         with world.lock:
@@ -7642,6 +8857,178 @@ class Overlay:
         self._engage_state = self._engagement = None
         self.active_nav_path = None
 
+    @staticmethod
+    def _passes_skill_mob_filter(slot: dict, catalog_id: int, name: str) -> bool:
+        bl = slot.get("blacklist", ())
+        wl = slot.get("whitelist", ())
+        id_token = f"#{catalog_id}"
+        if any(tok == id_token or tok in name for tok in bl):
+            return False
+        if wl:
+            return any(tok == id_token or tok in name for tok in wl)
+        return True
+
+    def _count_mobs_in_3x3(self, world, target_cell, locked_gid, now) -> int:
+        tx, ty = int(round(target_cell[0])), int(round(target_cell[1]))
+        count = 0
+        with world.lock:
+            entities = tuple(world.entity_items())
+        for (kind, gid), ent in entities:
+            if kind != "mob" or ent.unreachable_until > now:
+                continue
+            if ent.engaged_by_other_until > now and gid != locked_gid:
+                continue
+            mx, my = ent.track.cell()
+            if max(abs(int(round(mx)) - tx), abs(int(round(my)) - ty)) <= 1:
+                count += 1
+        return count
+
+    @staticmethod
+    def _skill_has_sp(slot: dict, world) -> bool:
+        if world.player_max_sp <= 0:
+            return True
+        sp_pct = 100.0 * world.player_sp / world.player_max_sp
+        if sp_pct < slot.get("min_sp_pct", 0):
+            return False
+        skill_id = slot.get("skill_id", 0)
+        if skill_id > 0:
+            skill_snap = world.skill_snapshot()
+            info_cost = skill_snap["skill_info"].get(skill_id, {}).get("sp_cost", 0)
+            learned_cost = skill_snap["learned_skill_sp_cost"].get(skill_id, 0)
+            sp_cost = info_cost or learned_cost
+            if sp_cost > 0 and world.player_sp < sp_cost:
+                return False
+        return True
+
+    def _check_skill_cast_lock(self, world, position, now) -> bool:
+        if now >= self._skill_cast_until:
+            return False
+        fail_info = world.skill_snapshot().get("last_skill_fail")
+        if fail_info and fail_info.get("ts", 0.0) > self._skill_cast_started_at:
+            self._skill_cast_until = 0.0
+            self._skill_cast_target_gid = None
+            return False
+        if self._skill_cast_target_gid is not None:
+            with world.lock:
+                mob = world.entity("mob", self._skill_cast_target_gid)
+            if mob is None or math.dist(position, mob.track.cell()) > self._skill_cast_max_range + 0.5:
+                self._skill_cast_until = 0.0
+                self._skill_cast_target_gid = None
+                return False
+        return True
+
+    def _tick_auto_buff_skills(self, world, now) -> bool:
+        if not self.auto_farm or not self._hud_can_run() or not self.skills_config:
+            return False
+        if not self._game_is_foreground() or self._manual_mouse_button_pressed() or self._automation_click_active():
+            return False
+        active_statuses = world.skill_snapshot().get("active_status_ids", set())
+        for idx, slot in enumerate(self.skills_config):
+            if not slot["enabled"] or slot["mode"] != "Auto-Buff / Postura":
+                continue
+            if now < self._skill_cooldowns.get(idx, 0.0):
+                continue
+            if slot["status_id"] > 0 and slot["status_id"] in active_statuses:
+                continue
+            if not self._skill_has_sp(slot, world):
+                continue
+            vk = SKILL_HOTKEY_TO_VK.get(slot["hotkey"])
+            if vk and self._send_game_key(vk):
+                self._skill_cooldowns[idx] = now + slot["cooldown_sec"]
+                if slot["cast_time_sec"] > 0:
+                    self._skill_cast_until = now + slot["cast_time_sec"]
+                    self._skill_cast_started_at = time.time()
+                    self._skill_cast_target_gid = None
+                    self._skill_cast_skill_id = slot["skill_id"]
+                return True
+        return False
+
+    def _try_combat_skill(self, snapshot, position, gid, mob, now) -> str:
+        if not self.skills_config:
+            return "none"
+        world = self.feed.world
+        if self._check_skill_cast_lock(world, position, now):
+            return "used"
+        if not self._game_is_foreground() or self._manual_mouse_button_pressed() or self._automation_click_active():
+            return "none"
+
+        skill_snap = world.skill_snapshot()
+        steal_confirmed = skill_snap["steal_confirmed_targets"]
+        mob_name = self.names.get("mob", {}).get(mob.catalog_id, "").strip().lower()
+        cell = mob.track.cell()
+        distance = math.dist(position, cell)
+
+        for idx, slot in enumerate(self.skills_config):
+            if not slot["enabled"] or slot["mode"] == "Auto-Buff / Postura":
+                continue
+            if not self._passes_skill_mob_filter(slot, mob.catalog_id, mob_name):
+                continue
+            is_repeat = slot["mode"] == "Repetir até Confirmar no Alvo"
+            if is_repeat:
+                if gid in steal_confirmed:
+                    continue
+                if self._skill_target_attempts.get((gid, idx), 0) >= slot["max_attempts"]:
+                    continue
+            if slot["min_mobs_3x3"] > 1:
+                if self._count_mobs_in_3x3(world, cell, gid, now) < slot["min_mobs_3x3"]:
+                    continue
+            if not self._skill_has_sp(slot, world):
+                continue
+            if now < self._skill_cooldowns.get(idx, 0.0):
+                if is_repeat:
+                    return "used"
+                continue
+            if distance > slot["max_range"]:
+                return "approach"
+
+            hwnd = self.get_game_hwnd()
+            if not hwnd:
+                return "none"
+            terrain = getattr(self.feed, "terrain", None)
+            gat = terrain.for_map(snapshot.map) if terrain and snapshot.map else None
+            height = gat.get_elevation if gat else flat_height
+            viewport = snapshot.viewport
+            project = self.feed.camera.projector(viewport, getattr(self.feed, "_cam", None) or position, height)
+            resolve = self._safe_click_resolver(snapshot, project)
+            aimed = self._live_sprite_aim(("mob", gid), snapshot.map, viewport, height, mob, time.perf_counter() + 0.06)
+            if aimed is None:
+                continue
+            aimed_cell, uv = aimed
+            screen = resolve(aimed_cell, uv)
+            if not screen or self._is_point_in_hud(*screen, margin=10):
+                continue
+            vk = SKILL_HOTKEY_TO_VK.get(slot["hotkey"])
+            if not vk or not self._send_game_key(vk):
+                continue
+
+            def skill_target_point(lead):
+                latest = self._live_sprite_aim(("mob", gid), snapshot.map, viewport, height, mob, time.perf_counter() + lead)
+                if latest is None:
+                    return None
+                pt = resolve(*latest)
+                return pt if pt and not self._is_point_in_hud(*pt, margin=10) else None
+
+            target_tile = (int(round(aimed_cell[0])), int(round(aimed_cell[1])))
+            self._navigation_click(
+                snapshot, gat, target_tile, screen, hwnd=hwnd,
+                target_point=skill_target_point,
+                retry_key=(snapshot.map, "skill", gid, idx),
+            )
+            self._skill_cooldowns[idx] = now + slot["cooldown_sec"]
+            if is_repeat:
+                self._skill_target_attempts[(gid, idx)] = self._skill_target_attempts.get((gid, idx), 0) + 1
+            if slot["min_mobs_3x3"] > 1:
+                self._active_splash_gid = gid
+                self._active_splash_until = now + max(1.0, slot["cooldown_sec"], slot["cast_time_sec"] + 0.5)
+            if slot["cast_time_sec"] > 0:
+                self._skill_cast_until = now + slot["cast_time_sec"]
+                self._skill_cast_started_at = time.time()
+                self._skill_cast_target_gid = gid
+                self._skill_cast_max_range = slot["max_range"]
+                self._skill_cast_skill_id = slot["skill_id"]
+            return "used"
+        return "none"
+
     def _continue_farm_lock(self, snapshot, position, now):
         gid = self._locked_farm_target_id
         if gid is None:
@@ -7691,6 +9078,11 @@ class Overlay:
             self.active_nav_path = None
             return True
         if following:
+            return True
+
+        skill_state = self._try_combat_skill(snapshot, position, gid, mob, now)
+        if skill_state == "used":
+            self.active_nav_path = None
             return True
 
         self._smart_engage_target((gid, mob), "mob", snapshot, position)
@@ -7814,7 +9206,6 @@ class Overlay:
                 state["pending"] = None
                 state["direct_failures"] = 0
                 state["failed"].clear()
-                state["loot_lateral_used"] = state["loot_needs_lateral"] = False
                 state["retry_at"] = now + 0.35
                 return True
             with world.lock:
@@ -7844,9 +9235,9 @@ class Overlay:
                     if phase == "direct":
                         if elapsed < 0.75:
                             return True
-                        if state.get("loot_lateral_used") and not priority_loot:
-                            return pause_target()
-                        state["loot_needs_lateral"] = not priority_loot
+                        if walking:
+                            return True
+                        state["direct_failures"] += 1
                     elif phase == "approach":
                         if distance > 2.0 and (walking or elapsed < 0.95):
                             return True
@@ -7857,14 +9248,15 @@ class Overlay:
                     elif math.dist(position, last_cell) > 0.55:
                         if elapsed < 0.65:
                             return True
-                        return pause_target()
+                        state["failed"].add(last_cell)
+                        if len(state["failed"]) >= 3:
+                            return pause_target()
+                    else:
+                        state["direct_failures"] = 0
                 if phase == "direct" and aborted:
                     with world.lock:
                         if world.pending_pickup and world.pending_pickup[:2] == (gid, clicked_at):
                             world.pending_pickup = None
-                elif phase == "reposition" and aborted:
-                    state["loot_lateral_used"] = False
-                    state["loot_needs_lateral"] = True
                 state["pending"] = None
             else:
                 if (phase == "direct" and not aborted and elapsed < 1.8
@@ -8026,23 +9418,7 @@ class Overlay:
         if kind == "drop":
             distance = math.dist(position, cell)
             pickup_range = 3.0 if priority_loot else 2.0
-            if state.get("loot_needs_lateral"):
-                if walking:
-                    return True
-                if gat is None:
-                    return pause_target()
-                nearby = ((start[0] + dx, start[1] + dy) for dx, dy in
-                          ((1, 0), (-1, 0), (0, 1), (0, -1)))
-                for step in sorted(nearby, key=lambda step: math.dist(step, cell)):
-                    if (math.dist(step, cell) <= 2.0
-                            and (screen := self._walk_ground_point(gat, position, step, nav_blocked, resolve))):
-                        click(step, screen, "reposition")
-                        if state["pending"]:
-                            state["loot_lateral_used"] = True
-                            state["loot_needs_lateral"] = False
-                        return True
-                return pause_target()
-            if distance <= pickup_range and point and direct_line:
+            if state["direct_failures"] < 3 and distance <= pickup_range and point and direct_line:
                 last_attack = world.last_player_attack_ts
                 if (live.ownership != "MINE" and now - last_attack < 0.28
                         and state.get("loot_attack_at") != last_attack):
@@ -8057,7 +9433,7 @@ class Overlay:
             if gat is None or len(state["failed"]) >= 3:
                 return pause_target()
 
-        reposition = state["direct_failures"] >= 2
+        reposition = state["direct_failures"] >= (3 if kind == "drop" else 2)
         can_aim = kind == "mob" and point and direct_line and distance <= direct_range
         if can_aim and not reposition:
             self.active_nav_path = None
@@ -8072,7 +9448,7 @@ class Overlay:
         def ground_point(ground):
             return self._walk_ground_point(gat, position, ground, blocked, resolve)
 
-        if reposition and not obstacle_between:
+        if reposition and not obstacle_between and kind == "mob":
             nearby = sorted(
                 ((target_cell[0] + dx, target_cell[1] + dy)
                  for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy),
@@ -8081,7 +9457,7 @@ class Overlay:
             for ground in nearby:
                 if ground != start and (screen := ground_point(ground)):
                     self.active_nav_path = [start, ground]
-                    self.active_nav_color = "#F87171" if kind == "mob" else "#FBBF24"
+                    self.active_nav_color = "#F87171"
                     return click(ground, screen, "reposition")
             return pause_target()
 
@@ -8091,11 +9467,22 @@ class Overlay:
 
         def ring(ground):
             return (ground != start and ground not in blocked and ring_min <= math.dist(ground, cell) <= ring_max
+                    and (kind != "drop" or self._is_empty_walkable_cell(snapshot.map, gat, ground, blocked))
                     and not self._segment_hits_obstacle(*ground, *cell, nav_blocked)
                     and self._has_gat_line_of_sight(*ground, *cell, gat)
                     and (not protected_target or resolve(ground) is not None))
 
         path = self._approach_path(gat, start, target_cell, blocked, penalties, ring=ring)
+        if not path:
+            if kind == "mob" and gat is not None:
+                with world.lock:
+                    current = world.entity(*key)
+                    if current and world.map == snapshot.map:
+                        current.unreachable_until = max(current.unreachable_until, now + 6.0)
+                if committed:
+                    self._finish_farm_lock("sem rota válida no .gat")
+                return release()
+            return pause_target()
         self.active_nav_path = path or None
         self.active_nav_color = "#F87171" if kind == "mob" else "#FBBF24"
         if obstacle_between:
@@ -8110,7 +9497,7 @@ class Overlay:
         if stride is None:
             stride = self._pick_walk_stride(path[:15], position, blocked, ground_point)
         if stride:
-            return click(*stride, "approach")
+            return click(*stride, "reposition" if reposition and kind == "drop" else "approach")
         return pause_target()
 
     def get_game_hwnd(self, hwnd=None):
@@ -8875,27 +10262,39 @@ class Overlay:
         allowed = allowed or self._dialog_action_guard(dialog, lambda: True)
         result = Future()
         self._menu_selection_active = True
+        hwnd = self.get_game_hwnd()
+        game_window = self._remember_game_window(hwnd)
 
         def _worker():
             sent_at = None
+            ole32 = ctypes.WinDLL("ole32")
+            ole32.CoInitializeEx.argtypes = (ctypes.c_void_p, wintypes.DWORD)
+            ole32.CoInitializeEx.restype = ctypes.c_long
+            ole32.CoUninitialize.argtypes = ()
+            ole32.CoUninitialize.restype = None
+            com_hr = ole32.CoInitializeEx(None, 2)
             try:
-                delay = dialog.get("last_ts", 0.0) + 0.22 - time.perf_counter()
+                delay = dialog.get("last_ts", 0.0) + 0.15 - time.perf_counter()
                 if delay > 0:
                     time.sleep(delay)
-                for press in range(index + 1):
-                    key = 0x28 if press < index else 0x0D
-                    if key == 0x0D:
-                        time.sleep(0.12)
-                    elif press:
-                        time.sleep(0.11)
-                    completion = Future()
-                    if not allowed() or not self._send_game_key(key, completion=completion, allowed=allowed):
+                for step_down in range(index):
+                    if not allowed():
                         return
-                    confirmed = completion.result()
-                    if confirmed is None:
+                    if not self._send_key_via_osk(0x28, game_window=game_window, allowed=allowed):
                         return
-                sent_at = confirmed
+                    if step_down < index - 1:
+                        time.sleep(0.120)
+                time.sleep(0.150)
+                if not allowed():
+                    return
+                if not self._send_key_via_osk(0x0D, game_window=game_window, allowed=allowed):
+                    return
+                sent_at = time.monotonic()
+            except Exception as exc:
+                print(f"[Kafra] Falha ao enviar teclas via OSK: {exc}", flush=True)
             finally:
+                if com_hr >= 0:
+                    ole32.CoUninitialize()
                 self._menu_selection_active = False
                 result.set_result(sent_at)
 
@@ -9368,15 +10767,32 @@ class Overlay:
         start = tuple(round(coord) for coord in position)
         blocked, penalties = self._navigation_obstacles(snapshot.map, gat)
         ranked = []
+        attack_range = max(2.0, getattr(world, "player_attack_range", 1.0))
         for gid, mob, cell, distance, active, attacking_player in candidates:
             target_cell = tuple(round(coord) for coord in cell)
             if target_cell in blocked:
                 continue
             cost = distance * 10
-            if gat and not direct_only and (not self._has_gat_line_of_sight(*start, *target_cell, gat)
-                                            or self._segment_hits_obstacle(*start, *target_cell, blocked)):
-                path = self._approach_path(gat, start, target_cell, blocked, penalties)
-                if path:
+            if gat:
+                has_los = (self._has_gat_line_of_sight(*start, *target_cell, gat)
+                           and not self._segment_hits_obstacle(*start, *target_cell, blocked))
+                if not has_los:
+                    if direct_only:
+                        continue
+                    path = self._approach_path(gat, start, target_cell, blocked, penalties)
+                    if not path:
+                        path = self._approach_path(
+                            gat, start, target_cell, blocked, penalties,
+                            ring=lambda ground: (
+                                ground != start and ground not in blocked
+                                and math.dist(ground, target_cell) <= attack_range
+                                and not self._segment_hits_obstacle(*ground, *target_cell, blocked)
+                                and self._has_gat_line_of_sight(*ground, *target_cell, gat)
+                            ),
+                        )
+                    if not path:
+                        mob.unreachable_until = now + 6.0
+                        continue
                     cost = self._path_cost(path) + sum(penalties.get(step, 0.0) for step in path[1:])
             ranked.append((not attacking_player, defense and not active, cost, gid, distance, mob))
 
@@ -9606,6 +11022,20 @@ class Overlay:
                 path = [cell for _, end, _, cell in player.segments if end > moment] or [player.target]
             target = self._overlay_active_target(snapshot, player_cell, time.monotonic())
             self._draw_player_route(path, target, player_cell, pixels, width, height, color)
+
+        if (self._locked_farm_target_id is not None
+                and self._active_splash_gid == self._locked_farm_target_id
+                and time.monotonic() < self._active_splash_until):
+            splash_mob = getattr(self.feed, "world", None)
+            splash_mob = splash_mob.entity("mob", self._locked_farm_target_id) if splash_mob else None
+            if splash_mob is not None:
+                tx, ty = map(round, splash_mob.track.cell(moment))
+                corners = [(tx - 1.5, ty - 1.5), (tx + 1.5, ty - 1.5),
+                           (tx + 1.5, ty + 1.5), (tx - 1.5, ty + 1.5)]
+                outline = [pixels(cell, 0.5) for cell in corners + corners[:1]]
+                if all(outline):
+                    self.canvas_pool.get_line(*(value for point in outline for value in point),
+                                              fill="#f59e0b", width=2, dash=(4, 3))
 
         if status := self._player_overlay_status(player):
             label, color = status

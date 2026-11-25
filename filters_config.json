@@ -30,6 +30,8 @@
     "Asa de Borboleta"
   ],
   "restock_items": {},
+  "hud_x": 606,
+  "hud_y": 30,
   "survival_hp_pct": 30,
   "survival_resume_pct": 100,
   "survival_seek_portal": true,
