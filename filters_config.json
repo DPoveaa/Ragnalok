@@ -19,10 +19,9 @@
   "tier3_max_weight_pct": 55,
   "hud_pause_on_drawer": true,
   "hud_pause_on_click": true,
-  "survival_enabled": true,
-  "survival_seek_portal": true,
+  "survival_enabled": false,
   "survival_auto_respawn": true,
-  "auto_store_kafra": true,
+  "auto_store_kafra": false,
   "kafra_trigger_weight_pct": 75,
   "kafra_trigger_slots": 88,
   "kafra_pin": "6996",
@@ -33,5 +32,6 @@
   "restock_items": {},
   "survival_hp_pct": 30,
   "survival_resume_pct": 100,
+  "survival_seek_portal": true,
   "survival_danger_radius": 8
 }

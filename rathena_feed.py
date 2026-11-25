@@ -1,5 +1,7 @@
-"""Server-to-client rAthena packets, TCP reassembly and world snapshots."""
+"""rAthena packet capture, TCP reassembly and world snapshots."""
 
+from argparse import ArgumentParser
+import base64
 from dataclasses import dataclass, replace
 import json
 import math
@@ -75,6 +77,7 @@ def inventory_tab(item_type, favorite=False):
 
 ACCEPT = {0x0073, 0x02EB, 0x0A18}
 MAP_TRANSFER = {0x0092, 0x0AC7}
+MAP_ACTIVITY = ACCEPT | {0x0B1D, 0x0283, 0x035F, 0x09FF, 0x09FD}
 FLOOR = {0x009D, 0x009E, 0x084A, 0x084B, 0x0ADD, 0x0B14, 0x0B15}
 # Bytes depois de result e tamanho do layout com IDs de 32 bits.
 # 0x02C9 é ZC_PARTY_CONFIG, sem campos de coleta.
@@ -92,15 +95,23 @@ UNIT = {
     0x09FD: "walk", 0x09FE: "spawn", 0x09FF: "idle",
     0x0AFD: "walk", 0x0AFE: "spawn", 0x0AFF: "idle",
 }
+CANONICAL_UNIT_TYPES = {
+    0: "player", 1: "npc", 5: "mob", 6: "npc",
+    7: "pet", 8: "homun", 9: "merc", 10: "elem",
+}
+CANONICAL_UNIT_OPCODES = {0x09FF, 0x09FD, 0x09FE, 0x0915, 0x090F, 0x0856, 0x0857, 0x0858}
+
 KNOWN_PACKET_SIZES = {
     0x0080: 7,
     0x0086: 16,
     0x0087: 12,
     0x008A: 29,
     0x0091: 22,
+    0x00A1: 6,
     0x0119: 13,  # ZC_STATE_CHANGE (opções de status)
     0x0229: 15,  # ZC_STATE_CHANGE com effectState de 32 bits
     0x02E1: 33,
+    0x0291: 4,
     0x08C8: 34,
     0x0088: 10,
     0x00B0: 8,
@@ -110,6 +121,7 @@ KNOWN_PACKET_SIZES = {
     0x00F0: 3, 0x00F2: 6, 0x00F6: 8, 0x00F8: 2,
     0x0B44: 58, 0x0908: 5, 0x0999: 11, 0x099A: 9,
     0x0B08: -1, 0x0B0B: 4,
+    0x0B1D: 2,
     0x0A0F: -1,  # lista de equipamentos do carrinho
     **dict.fromkeys(ITEM_LISTS, -1),
     0x0BC9: 10,
@@ -149,8 +161,24 @@ KNOWN_PACKET_SIZES = {
     0x00A0: 33,  # ZC_ITEM_PICKUP_ACK
     0x011C: 68,  # ZC_WARPLIST
 }
+NPC_DIALOG_TEXT_OPCODES = (0x00B4, 0x00B7)
+CLIENT_DIALOG_SIZES = {0x00B8: 7, 0x00B9: 6}
+KAFRA_MENU_TOKENS = {
+    "0Ga0AQ": "Salvar Ponto de Retorno",
+    "0Wa0AQ": "Usar o Armazém",
+    "0ma0AQ": "Serviço de Teleporte",
+    "02a0AQ": "Comprar um Carrinho",
+    "1Ga0AQ": "Informações",
+    "1Wa0AQ": "Cancelar",
+    "g2e0AQ": "Bazar",
+}
+_KAFRA_MENU_LABELS_BY_ID = {
+    int.from_bytes(base64.b64decode(token + "=="), "little"): label
+    for token, label in KAFRA_MENU_TOKENS.items()
+}
+
 KNOWN_SYNC_OPCODES = (
-    ACCEPT
+    MAP_ACTIVITY
     | MAP_TRANSFER
     | PICKUP_ACK.keys()
     | FLOOR
@@ -175,6 +203,27 @@ def u32(data, offset):
     return struct.unpack_from("<I", data, offset)[0]
 
 
+def _decode_npc_dialog_text(data, *, prefer_utf8=False):
+    payload = data[8:u16(data, 2)].replace(b"\x00", b"")
+    encodings = ("utf-8", "cp1252") if prefer_utf8 else ("cp1252",)
+    for encoding in encodings:
+        try:
+            text = payload.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = payload.decode("latin1")
+    return re.sub(r"\^[0-9A-Fa-f]{6}", "", text)
+
+
+def _translate_kafra_menu_option(option):
+    if re.fullmatch(r"[A-Za-z0-9+/]{6}", option):
+        token_id = int.from_bytes(base64.b64decode(option + "=="), "little")
+        return _KAFRA_MENU_LABELS_BY_ID.get(token_id, option)
+    return option
+
+
 def position(data, offset):
     a, b, c = data[offset:offset + 3]
     return (a << 2 | b >> 6, (b & 63) << 4 | c >> 4)
@@ -183,6 +232,10 @@ def position(data, offset):
 def movement(data, offset):
     c, d, e = data[offset + 2:offset + 5]
     return position(data, offset), ((c & 15) << 6 | d >> 2, (d & 3) << 8 | e)
+
+
+def walk_speed(value):
+    return value if 60 <= value <= 600 else 150
 
 
 def map_name(value):
@@ -235,12 +288,13 @@ class PacketStream:
         while len(self.buffer) - start >= 2:
             opcode = u16(self.buffer, start)
             size = self.lengths.get(opcode)
+            minimum = 8 if opcode in NPC_DIALOG_TEXT_OPCODES else 4
 
             # Se o pacote não está na tabela ou tem tamanho incoerente, faz resync
             is_invalid_size = (
                 size == -1
                 and len(self.buffer) - start >= 4
-                and (u16(self.buffer, start + 2) < 4 or u16(self.buffer, start + 2) > 16384)
+                and not minimum <= u16(self.buffer, start + 2) <= 16384
             )
             if size is None or is_invalid_size:
                 # Procura o próximo opcode conhecido no buffer
@@ -251,7 +305,7 @@ class PacketStream:
                         cand_size = self.lengths.get(cand_op)
                         if cand_size == -1 and len(self.buffer) - candidate >= 4:
                             var_len = u16(self.buffer, candidate + 2)
-                            if var_len < 4 or var_len > 16384:
+                            if not (8 if cand_op in NPC_DIALOG_TEXT_OPCODES else 4) <= var_len <= 16384:
                                 continue
                         found = candidate
                         break
@@ -331,6 +385,77 @@ class TcpStream:
                         break
 
 
+class _OutboundOpcodes:
+    """Track the packet key on the reassembled client stream."""
+
+    def __init__(self, sequence, lengths, keys, on_combat_packet, on_dialog_packet=None):
+        seed, self.multiplier, self.increment = keys or (0, 1, 0)
+        self.encrypted = bool(keys)
+        self.key = (seed * self.multiplier + self.increment) & MASK
+        self.lengths = lengths
+        self.buffer = bytearray()
+        self.decoded = {}
+        self.on_combat_packet = on_combat_packet
+        self.on_dialog_packet = on_dialog_packet
+        self.last_dialog_sequence = None
+        self.stream = TcpStream(sequence, self._consume)
+
+    def _record_dialog(self, sequence, opcode, data):
+        if self.last_dialog_sequence is not None:
+            distance = (sequence - self.last_dialog_sequence) & MASK
+            if not 0 < distance < 0x80000000:
+                return
+        if self.on_dialog_packet is not None:
+            self.last_dialog_sequence = sequence
+            self.on_dialog_packet(opcode, data)
+
+    def _consume(self, data):
+        sequence = self.stream.sequence - len(self.buffer)
+        self.buffer.extend(data)
+        offset = 0
+        while self.key is not None and len(self.buffer) - offset >= 2:
+            opcode = u16(self.buffer, offset) ^ ((self.key >> 16) & 0x7FFF)
+            self.decoded[(sequence + offset) & MASK] = opcode
+            if len(self.decoded) > 1024:
+                del self.decoded[next(iter(self.decoded))]
+
+            size = CLIENT_DIALOG_SIZES.get(opcode, self.lengths.get(opcode))
+            if size == -1:
+                if len(self.buffer) - offset < 4:
+                    break
+                size = u16(self.buffer, offset + 2)
+                if size < 4 or size > 32768:
+                    size = None
+            if size is None or size < 2:
+                self.key = None
+                self.buffer.clear()
+                return
+            if len(self.buffer) - offset < size:
+                break
+            if opcode in (0x0437, 0x035F):
+                self.on_combat_packet(opcode, self.buffer[offset:offset + size])
+            elif opcode in CLIENT_DIALOG_SIZES:
+                self._record_dialog((sequence + offset) & MASK, opcode, self.buffer[offset:offset + size])
+            offset += size
+            self.key = (self.key * self.multiplier + self.increment) & MASK
+        del self.buffer[:offset]
+
+    def feed(self, sequence, payload):
+        if self.key is not None:
+            try:
+                self.stream.feed(sequence, payload)
+            except ValueError:
+                self.key = None
+                self.buffer.clear()
+        if self.key is None and not self.encrypted and len(payload) >= 2:
+            # O cliente pode acrescentar um byte ao tamanho da tabela.
+            # Após perder o alinhamento, só aceita diálogo no início do segmento.
+            opcode = u16(payload)
+            if opcode in CLIENT_DIALOG_SIZES and len(payload) >= CLIENT_DIALOG_SIZES[opcode]:
+                self._record_dialog(sequence, opcode, payload)
+        return self.decoded.get(sequence)
+
+
 def diagonal_first_path(x0, y0, x1, y1):
     """Gera passos diagonais primeiro (min(|dx|, |dy|)) seguidos dos passos ortogonais restantes."""
     x0, y0 = int(round(x0)), int(round(y0))
@@ -368,6 +493,7 @@ class Track:
     origin: tuple
     target: tuple
     started: float = 0.0
+    move_start_ts: float = 0.0
     duration: float = 0.0
     segments: tuple = ()  # ((t_start, t_end, p_from, p_to), ...)
     _speed_ms: float = 150.0
@@ -376,10 +502,12 @@ class Track:
     weight: int = 0
     max_weight: int = 1
 
-    def __init__(self, origin, target, started=0.0, duration=0.0, segments=(), speed_ms=150.0, base_level=1, job_level=1, weight=0, max_weight=1):
+    def __init__(self, origin, target, started=0.0, duration=0.0, segments=(), speed_ms=150.0,
+                 base_level=1, job_level=1, weight=0, max_weight=1, *, move_start_ts=0.0):
         self.origin = origin
         self.target = target
         self.started = started
+        self.move_start_ts = move_start_ts
         self.duration = duration
         self.segments = segments
         self._speed_ms = float(speed_ms)
@@ -409,7 +537,8 @@ class Track:
             segments.append((now + (t0 - now) * ratio, now + (t1 - now) * ratio, start, end))
         if not segments:
             return self.stationary(self.target, speed_ms)
-        return Track(current, self.target, now, segments[-1][1] - now, tuple(segments), speed_ms)
+        return Track(current, self.target, now, segments[-1][1] - now, tuple(segments), speed_ms,
+                     move_start_ts=time.time())
 
     @classmethod
     def stationary(cls, cell, speed_ms=150.0):
@@ -417,20 +546,17 @@ class Track:
         return cls(c, c, 0.0, 0.0, (), speed_ms=float(speed_ms))
 
     @classmethod
-    def walking(cls, cells, speed, started, gat=None, *, previous=None):
+    def walking(cls, cells, speed, started, gat=None, *, previous=None, path=None):
         origin, target = cells
+        move_start_ts = time.time()
+        speed = walk_speed(speed)
         if origin == target:
             return cls.stationary(origin, speed_ms=speed)
 
-        path = diagonal_first_path(*origin, *target)
-        if gat is not None and any(
-            not gat.is_walkable(nx, ny)
-            or (x != nx and y != ny and not (gat.is_walkable(nx, y) and gat.is_walkable(x, ny)))
-            for (x, y), (nx, ny) in zip(path, path[1:])
-        ):
+        if path is None and gat is not None and math.dist(origin, target) > 1:
             path = gat.find_path(origin, target)
-            if not path or path[0] != origin or path[-1] != target:
-                return cls.stationary(target, speed_ms=speed)
+        if not path or path[0] != origin or path[-1] != target:
+            path = diagonal_first_path(*origin, *target)
 
         if previous is not None:
             current = previous.cell(started)
@@ -444,7 +570,8 @@ class Track:
             segments.append((cur_t, cur_t + step_duration, p0, p1))
             cur_t += step_duration
 
-        return cls(path[0], target, started, cur_t - started, tuple(segments), speed)
+        return cls(path[0], target, started, cur_t - started, tuple(segments), speed,
+                   move_start_ts=move_start_ts)
 
     @classmethod
     def stopping(cls, target, speed, now, previous):
@@ -466,10 +593,11 @@ class Track:
 
         for t0, t1, p0, p1 in self.segments:
             if now < t1:
-                prog = (now - t0) / (t1 - t0) if t1 > t0 else 1.0
+                elapsed, duration = now - t0, t1 - t0
+                t = max(0.0, min(1.0, elapsed / duration)) if duration > 0 else 1.0
                 return (
-                    p0[0] + (p1[0] - p0[0]) * prog,
-                    p0[1] + (p1[1] - p0[1]) * prog,
+                    p0[0] + (p1[0] - p0[0]) * t,
+                    p0[1] + (p1[1] - p0[1]) * t,
                 )
         return self.target
 
@@ -501,11 +629,16 @@ class Entity:
     last_attacker_gid: int | None = None
     engaged_by_other_until: float = 0.0
     ignore_until: float = 0.0
-    public_at: float = 0.0
+    retry_after: float = 0.0
+    suspected_other_owner: bool = False
     unreachable_until: float = 0.0
     is_kafra: bool = False
     avoid_until: float = 0.0
     has_vending_shop: bool = False
+    last_seen: float = 0.0
+    last_combat_damage: float = 0.0
+    gid: int = 0
+    move_start_ts: float = 0.0
 
 
 class World:
@@ -513,7 +646,7 @@ class World:
         self.lock = Lock()
         self.initial_map = map_name(initial_map) if initial_map else None
         self.legacy_fields = legacy_fields
-        self.player_speed = player_speed
+        self.player_speed = walk_speed(player_speed)
         self.next_map = None
         self.tcp_bytes = 0
         self.packets_ok = 0
@@ -523,11 +656,10 @@ class World:
         self.aid_to_gid = {}
         self.mobs_damaged_by_me = {}
         self.mobs_damaged_by_others = {}
-        self.other_players = {}
+        self._player_attacked_mobs = {}
+        self.drop_is_priority = None
         self.last_invite_popup_ts = 0.0
         self.locked_combat_mob_gid = None
-        self.other_player_kills = []
-        self.players = {}
         self.entity_names = {}   # aid -> str (nome real do NPC/player)
         try:
             cached = json.loads(NPC_NAMES_PATH.read_text(encoding="utf-8"))
@@ -561,7 +693,11 @@ class World:
         self.npc_dialog_active = False
         self.npc_dialog_last_ts = 0.0
         self.npc_dialog_opcode = 0
-        self.npc_dialog_options = []
+        self.dialog_menu_options = []
+        self.dialog_menu_raw_options = []
+        self.dialog_menu_seq = 0
+        self.dialog_npc_id = 0
+        self.dialog_has_next = False
         self.npc_dialog = {
             "open": False,
             "active": False,
@@ -602,6 +738,7 @@ class World:
 
     def _set_player_track(self, new_track):
         """Preserva atributos de level e peso ao recriar o Track do jogador."""
+        self.predicted_player = None
         new_track._speed_ms = self.player_speed
         if self.player is not None:
             new_track.base_level = getattr(self.player, "base_level", self.player_base_level)
@@ -679,7 +816,7 @@ class World:
             print(f"[Feed] Falha ao salvar Kafras: {exc}", flush=True)
 
     def _remember_npc_name(self, aid, name):
-        npc = self.entities.get(("npc", aid))
+        npc = self.entity("npc", aid)
         if not self.map or npc is None:
             return
         self._remember_kafra(npc, name)
@@ -745,6 +882,8 @@ class World:
                 if destination == 0:
                     self.inventory_ready = True
             target.update(items)
+            if destination == 2:
+                self.storage_open = True
             if destination == 0:
                 self.inventory_slots = {index: item[1] for index, item in target.items()}
                 if not self.inventory_list_open:
@@ -870,11 +1009,11 @@ class World:
     def stats(self):
         with self.lock:
             now = time.monotonic()
-            pos = self.player.cell(now) if self.player else None
-            mobs = sum(1 for (kind, _) in self.entities.keys() if kind == "mob")
-            drops = sum(1 for (kind, _) in self.entities.keys() if kind == "drop")
-            npcs = sum(1 for (kind, _) in self.entities.keys() if kind == "npc")
-            warps = sum(1 for (kind, _) in self.entities.keys() if kind == "warp")
+            pos = self.player.cell() if self.player else None
+            mobs = sum(1 for ent in self.entities.values() if ent.kind == "mob")
+            drops = sum(1 for ent in self.entities.values() if ent.kind == "drop")
+            npcs = sum(1 for ent in self.entities.values() if ent.kind == "npc")
+            warps = sum(1 for ent in self.entities.values() if ent.kind == "warp")
             b_lvl = getattr(self.player, "base_level", self.player_base_level) if self.player else self.player_base_level
             j_lvl = getattr(self.player, "job_level", self.player_job_level) if self.player else self.player_job_level
             w = getattr(self.player, "weight", self.player_weight) if self.player else self.player_weight
@@ -903,8 +1042,9 @@ class World:
                 "npc_dialog_active": self.npc_dialog_active,
                 "npc_dialog_last_ts": self.npc_dialog_last_ts,
                 "npc_dialog_opcode": self.npc_dialog_opcode,
-                "npc_dialog_options": list(self.npc_dialog_options),
-                "npc_dialog": dict(self.npc_dialog),
+                "npc_dialog_options": list(self.dialog_menu_options),
+                "npc_dialog": self._npc_dialog_snapshot(),
+                "storage_open": self.storage_open,
                 "server": self.active_server,
                 "port": self.active_port,
             }
@@ -935,6 +1075,8 @@ class World:
     def reset(self, preserve_transfer=False):
         with self.lock:
             if not preserve_transfer:
+                self._map_loading_until = 0.0
+                self.account_id = None
                 self.player_zeny = None
                 self.zeny_known: bool = False
                 self.inventory = {}
@@ -955,7 +1097,9 @@ class World:
             self.map = self.next_map or self.initial_map
             self.current_map = f"{self.map}.gat" if self.map else None
             self.player = None
+            self.predicted_player = None
             self.storage_capacity = None
+            self.storage_open = False
             self.storage_items = {}
             self.player_id = None
             self.player_hp = 0
@@ -963,6 +1107,11 @@ class World:
             self.player_is_dead = False
             self.player_is_sitting = False
             self.last_player_attack_ts = 0.0
+            self.last_attack_target_id = None
+            self.last_attack_action = None
+            self.last_attack_ts = 0.0
+            self.last_move_ts = 0.0
+            self.last_mob_attack = (None, None, 0.0)
             self.last_player_damage_ts = 0.0
             self.last_player_aggro_ts = 0.0
             self.last_player_attacker_gid = None
@@ -975,8 +1124,7 @@ class World:
             self.aid_to_gid.clear()
             self.mobs_damaged_by_me.clear()
             self.mobs_damaged_by_others.clear()
-            self.other_players.clear()
-            self.players.clear()
+            self._player_attacked_mobs.clear()
             self.entity_names.clear()
             self.vending_aids.clear()
             self.patrol_npc_blocked_cells.clear()
@@ -988,7 +1136,10 @@ class World:
             self.player_move_pkt_count = 0
             self.npc_dialog_active = False
             self.npc_dialog_opcode = 0
-            self.npc_dialog_options = []
+            self.dialog_menu_options = []
+            self.dialog_menu_raw_options = []
+            self.dialog_npc_id = 0
+            self.dialog_has_next = False
             self.npc_dialog["open"] = False
             self.npc_dialog["active"] = False
             self.npc_dialog["type"] = "closed"
@@ -1001,22 +1152,44 @@ class World:
             self.vending_window_open = False
             self.vending_opened_ts = 0.0
 
+    def entity(self, kind, entity_id):
+        ent = self.entities.get(entity_id)
+        return ent if ent is not None and ent.kind == kind else None
+
+    def entity_items(self):
+        return (((ent.kind, entity_id), ent) for entity_id, ent in self.entities.items())
+
+    def is_self_entity(self, *ids):
+        own_ids = (self.player_id, self.account_id, getattr(self.player, "aid", None))
+        return any(entity_id and entity_id in own_ids for entity_id in ids)
+
+    def _is_local_player_id(self, entity_id):
+        return self.player_id is not None and self.player_id >= 100000 and entity_id == self.player_id
+
+    def _remove_entity(self, entity_id):
+        ent = self.entities.pop(entity_id, None)
+        if ent is not None:
+            for alias in (entity_id, ent.gid):
+                if self.aid_to_gid.get(alias) == entity_id:
+                    self.aid_to_gid.pop(alias)
+        return ent
+
     def get_npcs(self):
         with self.lock:
-            return [ent for (kind, _), ent in self.entities.items()
-                    if kind == "npc" and ent.catalog_id not in (111, 139, 32767)]
+            return [ent for ent in self.entities.values()
+                    if ent.kind == "npc" and ent.catalog_id not in (111, 139, 32767)]
 
     def get_warps(self):
         with self.lock:
-            return [ent for (kind, _), ent in self.entities.items() if kind == "warp"]
+            return [ent for ent in self.entities.values() if ent.kind == "warp"]
 
     def get_mobs(self):
         with self.lock:
-            return [ent for (kind, _), ent in self.entities.items() if kind == "mob"]
+            return [ent for ent in self.entities.values() if ent.kind == "mob"]
 
     def get_drops(self):
         with self.lock:
-            return [ent for (kind, _), ent in self.entities.items() if kind == "drop"]
+            return [ent for ent in self.entities.values() if ent.kind == "drop"]
 
     def get_recent_drop_gids(self):
         with self.lock:
@@ -1031,25 +1204,136 @@ class World:
         with self.lock:
             try:
                 aid = int(key_str.split(":", 1)[1])
-                ent = self.entities.get((kind, aid))
+                ent = self.entity(kind, aid)
                 if ent:
                     return ent.track.target
             except Exception:
                 pass
             return None
 
-    def snapshot(self):
+    def _npc_dialog_snapshot(self):
+        dialog = dict(self.npc_dialog)
+        opcode = dialog.get("opcode")
+        has_menu = opcode in (0x00B4, 0x00B5, 0x00B7)
+        dialog.update(
+            dialog_has_next=opcode == 0x00B5 and self.dialog_has_next,
+            dialog_has_close=opcode == 0x00B6,
+            dialog_menu_options=list(self.dialog_menu_options) if has_menu else [],
+            dialog_menu_raw_options=list(self.dialog_menu_raw_options) if has_menu else [],
+            dialog_menu_seq=self.dialog_menu_seq,
+            dialog_npc_id=self.dialog_npc_id,
+            storage_open=self.storage_open,
+        )
+        return dialog
+
+    def snapshot(self, *, include_dialog=False):
         with self.lock:
-            now = time.monotonic()
-            # Atualiza posse de drops expirados após 12 segundos (fim da proteção)
-            updated = {}
-            for key, entity in self.entities.items():
-                if entity.kind == "drop":
-                    if entity.ownership == "LOCKED" and now >= (entity.public_at or entity.created_at + 12.0):
-                        entity = replace(entity, ownership="FREE", public_at=0.0, ignore_until=0.0)
-                updated[key] = entity
-            self.entities = updated
-            return self.map, self.player, tuple(self.entities.items())
+            frame_time = time.perf_counter()
+            player_cell = self.player.cell(frame_time) if self.player else None
+            can_prune = player_cell is not None and min(player_cell) > 0 and not self.is_map_loading
+            for entity_id, entity in tuple(self.entities.items()):
+                if (can_prune and math.dist(player_cell, entity.track.cell(frame_time)) > 22.0
+                        and not (entity.kind == "drop"
+                                 and (entity.suspected_other_owner or entity.retry_after
+                                      or (self.drop_is_priority and self.drop_is_priority(entity.catalog_id))))):
+                    self._remove_entity(entity_id)
+                    if self.last_mob_attack[0] == entity_id:
+                        self.last_mob_attack = (None, None, 0.0)
+                    if self.locked_combat_mob_gid == entity_id:
+                        self.locked_combat_mob_gid = None
+                    if self.farm_target_gid == entity_id:
+                        self.farm_target_gid = None
+            entities = tuple(
+                (key, entity) for key, entity in self.entity_items()
+                if not self._is_local_player_id(key[1])
+            )
+            if include_dialog:
+                return self.map, self.player, entities, self._npc_dialog_snapshot()
+            return self.map, self.player, entities
+
+    @property
+    def is_map_loading(self):
+        return time.monotonic() < self._map_loading_until
+
+    def client_combat_snapshot(self):
+        with self.lock:
+            return self.last_attack_target_id, self.last_attack_action, self.last_attack_ts, self.last_move_ts
+
+    def record_client_combat_packet(self, opcode, data):
+        now = time.monotonic()
+        with self.lock:
+            if opcode == 0x0437 and len(data) >= 7:
+                raw_target = u32(data, 2)
+                self.last_attack_target_id = self.aid_to_gid.get(raw_target, raw_target)
+                self.last_attack_action = data[6]
+                self.last_attack_ts = now
+                if self.last_attack_action in (0x00, 0x07):
+                    target = self.last_attack_target_id
+                    self._player_attacked_mobs[raw_target] = self._player_attacked_mobs[target] = now
+                    if self.entity("mob", target) is not None:
+                        self.last_mob_attack = (target, self.last_attack_action, now)
+                        self.locked_combat_mob_gid = target
+            elif opcode == 0x035F and len(data) >= 5:
+                self.last_move_ts = now
+                self._map_loading_until = 0.0
+                if self.player is not None and not self.player_is_dead and not self.player_is_sitting:
+                    target = position(data, 2)
+                    started = time.perf_counter()
+                    prediction = self.predicted_player
+                    predicting_target = prediction and started < prediction[1] and prediction[0].target == target
+                    if target != self.player.target and not predicting_target:
+                        self.predicted_player = None
+                        origin = tuple(map(round, self.player.cell(started)))
+                        gat = self.get_gat()
+                        path = gat.find_path(origin, target) if gat is not None and gat.is_walkable(*target) else None
+                        if path and path[0] == origin and path[-1] == target:
+                            self.predicted_player = (Track.walking(
+                                (origin, target), self.player_speed, started, path=path,
+                            ), started + 0.35)
+
+    def record_client_dialog_packet(self, opcode, data):
+        with self.lock:
+            if u32(data, 2) != self.dialog_npc_id or self.npc_dialog.get("opcode") not in (0x00B4, 0x00B5, 0x00B7):
+                return
+            self.dialog_menu_options = []
+            self.dialog_menu_raw_options = []
+            self.dialog_has_next = False
+            self.npc_dialog_opcode = opcode
+            self.npc_dialog.update(type="pending", opcode=opcode, options=[])
+
+    def _apply_npc_dialog(self, opcode, data):
+        npc_id = u32(data, 4 if opcode in NPC_DIALOG_TEXT_OPCODES else 2)
+        now = time.monotonic()
+        dialog = self.npc_dialog
+        if opcode == 0x00B4:
+            text = _decode_npc_dialog_text(data).strip()
+            if dialog.get("type") == "say" and self.dialog_npc_id == npc_id and dialog.get("text"):
+                text = f"{dialog['text']}\n{text}" if text else dialog["text"]
+            dialog.update(text=text, text_ts=now, text_npc_gid=npc_id)
+        if opcode == 0x00B7:
+            raw_options = [option.strip() for option in _decode_npc_dialog_text(data, prefer_utf8=True).split(":")]
+            while raw_options and not raw_options[-1]:
+                raw_options.pop()
+            self.dialog_menu_raw_options = raw_options
+            self.dialog_menu_options = [_translate_kafra_menu_option(option) for option in raw_options]
+            self.dialog_menu_seq += 1
+            print(f"[NPC-Menu] npc={npc_id} options={self.dialog_menu_options} raw={self.dialog_menu_raw_options}",
+                  flush=True)
+        elif opcode == 0x00B6 or npc_id != self.dialog_npc_id:
+            self.dialog_menu_options = []
+            self.dialog_menu_raw_options = []
+
+        self.dialog_npc_id = npc_id
+        self.dialog_has_next = opcode == 0x00B5
+        self.npc_dialog_active = opcode != 0x00B6
+        self.npc_dialog_last_ts = now
+        self.npc_dialog_opcode = opcode
+        dialog.update(
+            open=self.npc_dialog_active, active=self.npc_dialog_active,
+            type=("say", "wait", "closed", "menu")[opcode - 0x00B4],
+            opcode=opcode, seq=dialog.get("seq", 0) + 1, npc_gid=npc_id, npc_id=npc_id,
+            options=self.dialog_menu_options, last_ts=time.perf_counter(), last_update=now,
+        )
 
     def consume(self, opcode, data):
         if opcode not in KNOWN_SYNC_OPCODES:
@@ -1057,86 +1341,66 @@ class World:
         try:
             with self.lock:
                 self._apply(opcode, data)
+                if opcode in MAP_ACTIVITY:
+                    self._map_loading_until = 0.0
                 self._maybe_save_heatmap()
         except (struct.error, IndexError, UnicodeError) as exc:
             raise ValueError(f"Layout inválido para 0x{opcode:04X}.") from exc
 
     def _classify_drop(self, cell):
         now = time.monotonic()
-        dx, dy = cell
+        nearby = (dead for dead in self.recent_dead_mobs
+                  if now - dead["time"] <= 2.0 and math.dist(cell, dead["cell"]) <= 3.0)
+        dead = min(nearby, key=lambda row: (not row["by_me"], math.dist(cell, row["cell"]), -row["time"]),
+                   default=None)
+        if dead and dead["by_me"]:
+            return "MINE", False
+        return "FREE", bool(dead and dead["by_others"])
 
-        # 1. Checa proximidade com mob morto recentemente (< 15s e dist <= 2)
-        for dead in reversed(self.recent_dead_mobs):
-            if now - dead["time"] < 15.0:
-                mx, my = dead["cell"]
-                if max(abs(dx - mx), abs(dy - my)) <= 2:
-                    # Só bloqueia se confirmado que outro jogador atacou E eu não ataquei
-                    if dead["by_others"] and not dead["by_me"]:
-                        return "LOCKED"
-                    if dead["by_me"]:
-                        return "MINE"
-
-        # 2. Checa proximidade de outros jogadores conhecidos (BL_PC)
-        px, py = self.player.cell(now) if self.player else (None, None)
-        dist_player = max(abs(dx - px), abs(dy - py)) if px is not None else 999
-
-        for p_gid, (p_cell, p_time) in self.other_players.items():
-            if self.player_id is not None and p_gid == self.player_id:
-                continue
-            if now - p_time < 10.0:
-                p_dist = max(abs(dx - p_cell[0]), abs(dy - p_cell[1]))
-                # Só bloqueia se outro jogador conhecido estava mais próximo que o player e colado no drop (dist <= 2)
-                if p_dist <= 2 and p_dist < dist_player:
-                    return "LOCKED"
-
-        return "MINE"
-
-    def mark_drop_locked(self, itaid):
-        with self.lock:
-            now = time.monotonic()
-            key = ("drop", itaid)
-            if key in self.entities:
-                ent = self.entities[key]
-                self.entities[key] = Entity(
-                    ent.kind, ent.catalog_id, ent.track, ent.amount, ent.speed,
-                    ownership="LOCKED", created_at=now, public_at=now + 12.0
-                )
-
-    def mark_nearest_drop_locked(self):
-        if not self.player:
+    def _record_pickup_denied(self, now):
+        if self.pending_pickup is None:
             return
-        now = time.monotonic()
-        px, py = self.player.cell(now)
-        nearest_key = None
-        min_dist = 999
-        for key, ent in self.entities.items():
-            if ent.kind == "drop":
-                dx, dy = ent.track.target
-                dist = max(abs(dx - px), abs(dy - py))
-                if dist < min_dist and dist <= 5:
-                    min_dist = dist
-                    nearest_key = key
-        if nearest_key:
-            ent = self.entities[nearest_key]
-            # Marca como LOCKED com tempo ajustado para durar 10s adicionais
-            self.entities[nearest_key] = Entity(
-                ent.kind, ent.catalog_id, ent.track, ent.amount, ent.speed,
-                ownership="LOCKED", created_at=now - 2.0, public_at=now + 12.0
-            )
+        gid, clicked_at, retry_delay = self.pending_pickup
+        if now - clicked_at > 1.75:
+            return
+        self.pending_pickup = None
+        self.last_pickup_ack = (gid, now, 53)
+        if drop := self.entity("drop", gid):
+            drop.retry_after = max(drop.retry_after, time.time() + retry_delay)
+
+    def _update_drop_owner(self, drop):
+        ownership, suspected = self._classify_drop(drop.track.target)
+        if drop.ownership == "MINE" and ownership != "MINE":
+            return
+        if ownership == "MINE" and drop.suspected_other_owner:
+            drop.retry_after = 0.0
+            drop.unreachable_until = 0.0
+        if suspected and not drop.suspected_other_owner:
+            drop.unreachable_until = 0.0
+            if self.drop_is_priority is None or not self.drop_is_priority(drop.catalog_id):
+                drop.retry_after = max(drop.retry_after, time.time() + 3.5)
+        drop.ownership = ownership
+        drop.suspected_other_owner = suspected
 
     def _apply(self, opcode, data):
         if opcode == 0x0283:
-            self.player_id = u32(data, 2)
+            self.account_id = self.player_id = u32(data, 2)
             self._sync_player_status()
         elif opcode in ACCEPT:
-            self.entities.clear()
+            self._player_attacked_mobs.clear()
+            self.last_attack_target_id = self.last_attack_action = None
+            self.last_attack_ts = self.last_move_ts = 0.0
+            self.last_mob_attack = (None, None, 0.0)
             self.entity_names.clear()
-            self.aid_to_gid.clear()
             self.storage_capacity = None
+            self.storage_open = False
             self.storage_items.clear()
             self.npc_dialog_active = False
             self.npc_dialog_opcode = 0
-            self.npc_dialog_options = []
+            self.dialog_menu_options = []
+            self.dialog_menu_raw_options = []
+            self.dialog_npc_id = 0
+            self.dialog_has_next = False
             self.npc_dialog["open"] = False
             self.npc_dialog["active"] = False
             self.npc_dialog["type"] = "closed"
@@ -1149,6 +1413,8 @@ class World:
             self.vending_opened_ts = 0.0
             if len(data) >= 9:
                 self._set_player_track(Track.stationary(position(data, 6)))
+            else:
+                self.player = None
             self.next_map = None
             if self.on_map_change_callback is not None:
                 try:
@@ -1156,6 +1422,8 @@ class World:
                 except Exception:
                     pass
         elif opcode == 0x0091:
+            self._map_loading_until = time.monotonic() + 2.0
+            self.predicted_player = None
             raw_name = extract_map_from_packet(data, 2)
             name = map_name(raw_name)
             prev_map = self.map
@@ -1182,18 +1450,25 @@ class World:
             self.last_pickup_ack = None
             self.farm_target_gid = None
             self.recent_dead_mobs.clear()
-            self.other_player_kills.clear()
             self.mobs_damaged_by_me.clear()
             self.mobs_damaged_by_others.clear()
+            self._player_attacked_mobs.clear()
             self.locked_combat_mob_gid = None
             self.entities.clear()
-            self.entity_names.clear()
             self.aid_to_gid.clear()
+            self.last_attack_target_id = self.last_attack_action = None
+            self.last_attack_ts = self.last_move_ts = 0.0
+            self.last_mob_attack = (None, None, 0.0)
+            self.entity_names.clear()
             self.storage_capacity = None
+            self.storage_open = False
             self.storage_items.clear()
             self.npc_dialog_active = False
             self.npc_dialog_opcode = 0
-            self.npc_dialog_options = []
+            self.dialog_menu_options = []
+            self.dialog_menu_raw_options = []
+            self.dialog_npc_id = 0
+            self.dialog_has_next = False
             self.npc_dialog["open"] = False
             self.npc_dialog["active"] = False
             self.npc_dialog["type"] = "closed"
@@ -1215,6 +1490,12 @@ class World:
                 self._set_player_track(Track.stationary((x, y)))
                 self.last_map_arrival = (name, (x, y), time.monotonic())
         elif opcode in MAP_TRANSFER:
+            self._map_loading_until = time.monotonic() + 2.0
+            self.predicted_player = None
+            self._player_attacked_mobs.clear()
+            self.mobs_damaged_by_me.clear()
+            self.mobs_damaged_by_others.clear()
+            self.recent_dead_mobs.clear()
             raw_name = extract_map_from_packet(data, 2)
             name = map_name(raw_name)
             prev_map = self.map
@@ -1230,9 +1511,19 @@ class World:
             self.pending_pickup = None
             self.last_pickup_ack = None
             self.entities.clear()
+            self.aid_to_gid.clear()
+            self.last_attack_target_id = self.last_attack_action = None
+            self.last_attack_ts = self.last_move_ts = 0.0
+            self.last_mob_attack = (None, None, 0.0)
+            self.storage_capacity = None
+            self.storage_open = False
+            self.storage_items.clear()
             self.npc_dialog_active = False
             self.npc_dialog_opcode = 0
-            self.npc_dialog_options = []
+            self.dialog_menu_options = []
+            self.dialog_menu_raw_options = []
+            self.dialog_npc_id = 0
+            self.dialog_has_next = False
             self.npc_dialog["open"] = False
             self.npc_dialog["active"] = False
             self.npc_dialog["type"] = "closed"
@@ -1257,105 +1548,8 @@ class World:
             self.player_is_sitting = False
             self.last_player_attack_ts = 0.0
             self._sync_player_status()
-        elif opcode == 0x00B4:  # ZC_SAY_DIALOG (texto NPC)
-            plen = struct.unpack_from("<H", data, 2)[0] if len(data) >= 4 else len(data)
-            npc_gid = struct.unpack_from("<I", data, 4)[0] if len(data) >= 8 else 0
-            raw_text = data[8:plen] if plen > 8 else data[8:]
-            raw_text = raw_text.split(b"\x00", 1)[0]
-            try:
-                txt = raw_text.decode("cp1252")
-            except Exception:
-                txt = raw_text.decode("latin1", errors="replace")
-            txt_clean = re.sub(r"\^[0-9A-Fa-f]{6}", "", txt).strip()
-
-            curr_text = self.npc_dialog.get("text", "")
-            if self.npc_dialog.get("open") and self.npc_dialog.get("npc_gid") == npc_gid and curr_text:
-                accum_text = f"{curr_text}\n{txt_clean}" if txt_clean else curr_text
-            else:
-                accum_text = txt_clean
-
-            now_perf = time.perf_counter()
-            now_mono = time.monotonic()
-            self.npc_dialog_active = True
-            self.npc_dialog_last_ts = now_mono
-            self.npc_dialog_opcode = opcode
-            self.npc_dialog["open"] = True
-            self.npc_dialog["active"] = True
-            self.npc_dialog["type"] = "say"
-            self.npc_dialog["opcode"] = opcode
-            self.npc_dialog["seq"] = self.npc_dialog.get("seq", 0) + 1
-            self.npc_dialog["npc_gid"] = npc_gid
-            self.npc_dialog["npc_id"] = npc_gid
-            self.npc_dialog["text"] = accum_text
-            self.npc_dialog["last_ts"] = now_perf
-            self.npc_dialog["last_update"] = now_mono
-            self.npc_dialog["text_ts"] = now_mono
-            self.npc_dialog["text_npc_gid"] = npc_gid
-        elif opcode == 0x00B5:  # ZC_WAIT_DIALOG (next)
-            npc_gid = struct.unpack_from("<I", data, 2)[0] if len(data) >= 6 else 0
-            now_perf = time.perf_counter()
-            now_mono = time.monotonic()
-            self.npc_dialog_active = True
-            self.npc_dialog_last_ts = now_mono
-            self.npc_dialog_opcode = opcode
-            self.npc_dialog["open"] = True
-            self.npc_dialog["active"] = True
-            self.npc_dialog["type"] = "wait"
-            self.npc_dialog["opcode"] = opcode
-            self.npc_dialog["seq"] = self.npc_dialog.get("seq", 0) + 1
-            self.npc_dialog["npc_gid"] = npc_gid
-            self.npc_dialog["npc_id"] = npc_gid
-            self.npc_dialog["last_ts"] = now_perf
-            self.npc_dialog["last_update"] = now_mono
-        elif opcode == 0x00B6:  # ZC_CLOSE_DIALOG (close)
-            npc_gid = struct.unpack_from("<I", data, 2)[0] if len(data) >= 6 else 0
-            now_perf = time.perf_counter()
-            now_mono = time.monotonic()
-            self.npc_dialog_active = False
-            self.npc_dialog_last_ts = now_mono
-            self.npc_dialog_opcode = opcode
-            self.npc_dialog_options = []
-            self.npc_dialog["open"] = False
-            self.npc_dialog["active"] = False
-            self.npc_dialog["type"] = "closed"
-            self.npc_dialog["opcode"] = opcode
-            self.npc_dialog["seq"] = self.npc_dialog.get("seq", 0) + 1
-            self.npc_dialog["npc_gid"] = npc_gid
-            self.npc_dialog["npc_id"] = npc_gid
-            self.npc_dialog["options"] = []
-            self.npc_dialog["last_ts"] = now_perf
-            self.npc_dialog["last_update"] = now_mono
-        elif opcode == 0x00B7:  # ZC_MENU_LIST (menu NPC)
-            plen = struct.unpack_from("<H", data, 2)[0] if len(data) >= 4 else len(data)
-            npc_gid = struct.unpack_from("<I", data, 4)[0] if len(data) >= 8 else 0
-            raw_menu = data[8:plen] if plen > 8 else data[8:]
-            raw_menu = raw_menu.split(b"\x00", 1)[0]
-            try:
-                menu_str = raw_menu.decode("cp1252")
-            except Exception:
-                menu_str = raw_menu.decode("latin1", errors="replace")
-            raw_options = menu_str.split(":")
-            clean_options = []
-            for opt in raw_options:
-                opt_c = re.sub(r"\^[0-9A-Fa-f]{6}", "", opt).strip()
-                if opt_c:
-                    clean_options.append(opt_c)
-            now_perf = time.perf_counter()
-            now_mono = time.monotonic()
-            self.npc_dialog_active = True
-            self.npc_dialog_last_ts = now_mono
-            self.npc_dialog_opcode = opcode
-            self.npc_dialog_options = list(clean_options)
-            self.npc_dialog["open"] = True
-            self.npc_dialog["active"] = True
-            self.npc_dialog["type"] = "menu"
-            self.npc_dialog["opcode"] = opcode
-            self.npc_dialog["seq"] = self.npc_dialog.get("seq", 0) + 1
-            self.npc_dialog["npc_gid"] = npc_gid
-            self.npc_dialog["npc_id"] = npc_gid
-            self.npc_dialog["options"] = list(clean_options)
-            self.npc_dialog["last_ts"] = now_perf
-            self.npc_dialog["last_update"] = now_mono
+        elif 0x00B4 <= opcode <= 0x00B7:
+            self._apply_npc_dialog(opcode, data)
         elif opcode in (0x00C4, 0x00C6):
             now = time.monotonic()
             npc_gid = u32(data, 2) if opcode == 0x00C4 and len(data) >= 6 else self.npc_dialog.get("npc_gid", 0)
@@ -1371,7 +1565,7 @@ class World:
                 cells = movement(data, 6)
                 self.player_is_sitting = False
                 self._set_player_track(Track.walking(
-                    cells, self.player_speed, now, self.get_gat(), previous=self.player,
+                    cells, self.player_speed, now, self.get_gat(),
                 ))
                 if self.on_player_move_callback is not None:
                     try:
@@ -1386,12 +1580,8 @@ class World:
                 now = time.perf_counter()
                 stop_cell = (x, y)
 
-                # Se for jogador ou se player_id ainda não foi associado e não for monstro/NPC conhecido
-                is_known_entity = any(
-                    (k, target_id) in self.entities or (k, aid) in self.entities
-                    for k in ("mob", "npc", "warp")
-                )
-                if self.player_id in (aid, target_id) or (self.player_id is None and not is_known_entity):
+                ent = self.entities.get(target_id)
+                if self.is_self_entity(aid, target_id) or (self.player_id is None and ent is None):
                     previous = self.player if opcode == 0x0088 else None
                     self._set_player_track(Track.stopping(stop_cell, self.player_speed, now, previous))
                     if self.on_player_move_callback is not None:
@@ -1399,20 +1589,10 @@ class World:
                             self.on_player_move_callback(x, y)
                         except Exception:
                             pass
-
-                # Atualiza imediatamente o Track ativo da entidade (mob, npc, warp)
-                for k in ("mob", "npc", "warp"):
-                    ent = self.entities.get((k, target_id)) or self.entities.get((k, aid))
-                    if ent:
-                        previous = ent.track if opcode == 0x0088 else None
-                        stopped = Track.stopping(stop_cell, ent.speed, now, previous)
-                        self.entities[k, target_id] = replace(ent, track=stopped)
-                        break
-
-                if aid in self.other_players:
-                    self.other_players[aid] = ((x, y), time.monotonic())
-                if target_id in self.other_players:
-                    self.other_players[target_id] = ((x, y), time.monotonic())
+                elif ent is not None and ent.kind != "drop":
+                    previous = ent.track if opcode == 0x0088 else None
+                    stopped = Track.stopping(stop_cell, ent.speed, now, previous)
+                    self.entities[target_id] = replace(ent, track=stopped, last_seen=time.monotonic())
         elif opcode == 0x0ACB:  # ZC_LONGLONGPAR_CHANGE
             if len(data) >= 12:
                 var_id, value = struct.unpack_from("<HQ", data, 2)
@@ -1423,10 +1603,10 @@ class World:
                 var_id, value = struct.unpack_from("<HI", data, 2)
                 if var_id == 20:
                     self._set_player_zeny(value)
-                elif var_id == 0 and 0 < value <= 0xFFFF:  # SP_SPEED, em ms por célula
-                    self.player_speed = value
+                elif var_id == 0:  # SP_SPEED, em ms por célula
+                    self.player_speed = walk_speed(value)
                     if self.player is not None:
-                        self._set_player_track(self.player.with_speed(value, time.perf_counter()))
+                        self._set_player_track(self.player.with_speed(self.player_speed, time.perf_counter()))
                 elif var_id == 5:
                     if value < self.player_hp:
                         self.last_player_damage_ts = time.monotonic()
@@ -1469,13 +1649,20 @@ class World:
                     self.player.max_weight = val
         elif opcode == 0x0086:
             if len(data) >= 16:
+                started = time.perf_counter()
                 aid = u32(data, 2)
                 target_id = self.aid_to_gid.get(aid, aid)
-                if mob := (self.entities.get(("mob", target_id)) or self.entities.get(("mob", aid))):
-                    track = Track.walking(
-                        movement(data, 6), mob.speed, time.perf_counter(), self.get_gat(), previous=mob.track,
+                ent = self.entities.get(target_id)
+                if self.is_self_entity(aid, target_id):
+                    self._set_player_track(Track.walking(
+                        movement(data, 6), self.player_speed, started,
+                        self.get_gat(), previous=self.player,
+                    ))
+                elif ent is not None and ent.kind != "drop":
+                    track = Track.walking(movement(data, 6), ent.speed, started, self.get_gat())
+                    self.entities[target_id] = replace(
+                        ent, track=track, move_start_ts=track.move_start_ts, last_seen=time.monotonic(),
                     )
-                    self.entities["mob", target_id] = replace(mob, track=track)
         elif opcode in (0x00FE, 0x02C6, 0x00E5, 0x01F4, 0x0207):
             self.last_invite_popup_ts = time.monotonic()
         elif opcode in (0x008A, 0x08C8, 0x02E1, 0x013E, 0x07FB, 0x01DE):  # ZC_NOTIFY_ACT / ZC_USESKILL (ataques/dano/skills)
@@ -1488,34 +1675,48 @@ class World:
                 real_dst = self.aid_to_gid.get(dst_id, dst_id)
                 real_src = self.aid_to_gid.get(src_id, src_id)
                 now = time.monotonic()
-                if self.player_id is None:
-                    if src_id not in self.other_players and (("mob", real_dst) in self.entities or ("mob", dst_id) in self.entities):
-                        self.player_id = src_id
-                        self._sync_player_status()
-                p_aid = getattr(self.player, "aid", None) or self.player_id
-                is_src_player = (p_aid and (src_id == p_aid or real_src == p_aid)) or (self.player_id and (src_id == self.player_id or real_src == self.player_id))
-                is_dst_player = (p_aid and (dst_id == p_aid or real_dst == p_aid)) or (self.player_id and (dst_id == self.player_id or real_dst == self.player_id))
-
+                for entity_id in (real_src, real_dst):
+                    if (ent := self.entities.get(entity_id)) is not None and ent.kind != "drop":
+                        ent.last_seen = now
+                dealt_damage = False
                 if opcode in (0x008A, 0x02E1, 0x08C8) and len(data) >= KNOWN_PACKET_SIZES[opcode]:
                     action_offset = {0x008A: 26, 0x02E1: 28, 0x08C8: 29}[opcode]
                     action = data[action_offset]
                     if action in (2, 3):  # DMG_SIT_DOWN / DMG_STAND_UP
-                        if is_src_player and not self.player_is_dead:
+                        if self.is_self_entity(src_id, real_src) and not self.player_is_dead:
                             self.player_is_sitting = action == 2
                             self._sync_player_status()
                         return
                     if action == 1:  # DMG_PICKUP_ITEM
                         return
-                    if is_dst_player and (opcode != 0x08C8 or data[26] == 0):
-                        damage_format = "<h" if opcode == 0x008A else "<i"
-                        damage = struct.unpack_from(damage_format, data, 22)[0]
-                        damage2 = struct.unpack_from(damage_format, data, action_offset + 1)[0]
-                        if damage > 0 or damage2 > 0:
-                            self.last_player_damage_ts = now
+                    damage_format = "<h" if opcode == 0x008A else "<i"
+                    damage = struct.unpack_from(damage_format, data, 22)[0]
+                    damage2 = struct.unpack_from(damage_format, data, action_offset + 1)[0]
+                    dealt_damage = (damage > 0 or damage2 > 0) and (opcode != 0x08C8 or data[26] == 0)
+                elif opcode == 0x01DE and len(data) >= KNOWN_PACKET_SIZES[opcode]:
+                    dealt_damage = struct.unpack_from("<i", data, 24)[0] > 0
+
+                if (opcode in (0x008A, 0x08C8, 0x01DE) and dealt_damage and src_id >= 100000
+                        and (self.player_id is None or self.player_id < 100000)):
+                    requested_at = max(self._player_attacked_mobs.get(dst_id, -math.inf),
+                                       self._player_attacked_mobs.get(real_dst, -math.inf))
+                    source = self.entities.get(real_src)
+                    if now - requested_at <= 2.0 and (source is None or source.kind == "player"):
+                        self.player_id = src_id
+                        self._sync_player_status()
+                is_src_player = self.is_self_entity(src_id, real_src)
+                is_dst_player = self.is_self_entity(dst_id, real_dst)
+                if dealt_damage:
+                    if is_dst_player:
+                        self.last_player_damage_ts = now
+                    if opcode in (0x008A, 0x08C8) and (is_src_player or is_dst_player):
+                        combat_mob = self.entity("mob", real_dst if is_src_player else real_src)
+                        if combat_mob:
+                            combat_mob.last_combat_damage = now
 
                 # Registra mob.last_attacker_gid quando dst_gid for monstro ativo
-                mob_ent = self.entities.get(("mob", real_dst)) or self.entities.get(("mob", dst_id))
-                mob_gid = real_dst if ("mob", real_dst) in self.entities else dst_id
+                mob_ent = self.entity("mob", real_dst)
+                mob_gid = real_dst
                 if mob_ent is not None:
                     try:
                         mob_ent.last_attacker_gid = real_src if real_src else src_id
@@ -1525,11 +1726,14 @@ class World:
                 if is_src_player:
                     if mob_ent is not None or opcode == 0x01DE:
                         self.last_player_attack_ts = now
-                    self.mobs_damaged_by_me[real_dst] = now
-                    self.mobs_damaged_by_me[dst_id] = now
+                    if dealt_damage:
+                        self.mobs_damaged_by_me[real_dst] = now
+                        self.mobs_damaged_by_me[dst_id] = now
                     if mob_ent is not None:
                         self.locked_combat_mob_gid = mob_gid
-                elif not is_src_player and mob_ent is not None:
+                elif (mob_ent is not None and dealt_damage and src_id >= 100000
+                      and self.player_id is not None and self.player_id >= 100000
+                      and (real_src not in self.entities or self.entity("player", real_src) is not None)):
                     # Outro player atacando mob que não é o combat mob travado
                     if mob_gid != getattr(self, "locked_combat_mob_gid", None):
                         try:
@@ -1541,8 +1745,8 @@ class World:
 
                 # Marca aggro e locked_combat_mob_gid se o alvo for o jogador
                 if is_dst_player:
-                    src_mob_ent = self.entities.get(("mob", real_src)) or self.entities.get(("mob", src_id))
-                    src_mob_gid = real_src if ("mob", real_src) in self.entities else src_id
+                    src_mob_ent = self.entity("mob", real_src)
+                    src_mob_gid = real_src
                     if src_mob_ent is not None:
                         if self.locked_combat_mob_gid is None:
                             self.locked_combat_mob_gid = src_mob_gid
@@ -1556,14 +1760,8 @@ class World:
                             src_mob_ent.last_aggro_ts = now
                         except Exception:
                             pass
-        elif opcode in (0x008E, 0x0295, 0x09DF):  # Chat / mensagens do servidor
-            try:
-                text = data[2:].decode("cp1252", errors="ignore").lower()
-                triggers = ("outro jogador", "someone else", "pertence")
-                if any(w in text for w in triggers):
-                    self.mark_nearest_drop_locked()
-            except Exception:
-                pass
+        elif opcode == 0x0291 and len(data) >= 4 and u16(data, 2) == 53:
+            self._record_pickup_denied(time.monotonic())
         elif opcode in (0x0095, 0x0195, 0x0A30):  # ZC_ACK_REQNAME / ZC_ACK_REQNAMEALL
             if len(data) >= 30:
                 aid_name = u32(data, 2)
@@ -1602,6 +1800,7 @@ class World:
         elif opcode in (0x00F2, 0x0B18) and len(data) >= 4:
             if opcode == 0x00F2 and len(data) >= 6:
                 self.storage_capacity = (u16(data, 2), u16(data, 4))
+                self.storage_open = True
             now_mono = time.monotonic()
             self.npc_dialog_active = True
             self.npc_dialog_last_ts = now_mono
@@ -1618,6 +1817,8 @@ class World:
             self.npc_dialog["active"] = False
             self.npc_dialog["last_update"] = time.monotonic()
             self.storage_capacity = None
+            self.storage_open = False
+            self.npc_dialog["opcode"] = opcode
             self.storage_items.clear()
             self.highest_inv_index = len(self.inventory_slots)
             self.inventory_pickup_blocked = False
@@ -1655,7 +1856,7 @@ class World:
                     self.inventory[index] = (*item[:3], True)
                 elif opcode == 0x099A and data[-1] == 0:
                     self.inventory[index] = (*item[:3], False)
-        elif opcode in (0x0131, 0x0136, 0x0813, 0x0857, 0x0858, 0x09CA):  # ZC_STORE_ENTRY / Lojas
+        elif opcode in (0x0131, 0x0136, 0x0813, 0x09CA):  # ZC_STORE_ENTRY / Lojas
             aid = None
             if len(data) >= 8 and u16(data, 2) == len(data):
                 aid = u32(data, 4)
@@ -1663,7 +1864,7 @@ class World:
                 aid = u32(data, 2)
             if aid:
                 self.vending_aids.add(aid)
-                for (k, eid), ent in list(self.entities.items()):
+                for eid, ent in self.entities.items():
                     if eid == aid or self.aid_to_gid.get(aid) == eid or self.aid_to_gid.get(eid) == aid:
                         ent.has_vending_shop = True
             if opcode in UNIT:
@@ -1676,7 +1877,7 @@ class World:
                 aid = u32(data, 2)
             if aid:
                 self.vending_aids.discard(aid)
-                for (k, eid), ent in list(self.entities.items()):
+                for eid, ent in self.entities.items():
                     if eid == aid or self.aid_to_gid.get(aid) == eid or self.aid_to_gid.get(eid) == aid:
                         ent.has_vending_shop = False
         elif opcode in (0x0133, 0x0800):  # ZC_PC_PURCHASE_ITEMLIST / ZC_PC_PURCHASE_ITEMLIST_FROMMC
@@ -1689,38 +1890,25 @@ class World:
             if len(data) >= 6:
                 self.vending_aids.discard(u32(data, 2))
         elif opcode in (0x0080, 0x00A1):
-            if len(data) >= 6:
+            if len(data) >= KNOWN_PACKET_SIZES[opcode]:
                 gid = u32(data, 2)
-                kind = "mob" if opcode == 0x0080 else "drop"
-                real_gid = self.aid_to_gid.get(gid, gid)
+                real_gid = self.aid_to_gid.get(gid, gid) if opcode == 0x0080 else gid
                 if opcode == 0x0080:
-                    vanish_type = data[6] if len(data) >= 7 else 0
-                    player_ids = (self.player_id, getattr(self.player, "aid", None))
-                    if vanish_type == 1 and (gid in player_ids or real_gid in player_ids):
+                    vanish_type = data[6]
+                    ids = {gid, real_gid}
+                    ids.update(alias for alias, canonical in self.aid_to_gid.items() if canonical == real_gid)
+                    attacked = any(entity_id in self._player_attacked_mobs for entity_id in ids)
+                    for entity_id in ids:
+                        self._player_attacked_mobs.pop(entity_id, None)
+                    if vanish_type == 1 and self.is_self_entity(gid, real_gid):
                         self.player_hp = 0
                         self._mark_player_dead()
-                    mob = self.entities.get(("mob", real_gid)) or self.entities.get(("mob", gid))
+                    mob = self.entity("mob", real_gid) or self.entity("mob", gid)
                     if mob and vanish_type == 1:  # 1 = DEAD
                         now = time.monotonic()
                         mob_cell = mob.track.cell()
-                        p_aid = getattr(self.player, "aid", None) or self.player_id
-                        last_att = getattr(mob, "last_attacker_gid", None)
-                        if last_att is not None and (p_aid is None or (last_att != p_aid and last_att != self.player_id)):
-                            self.other_player_kills.append((now, mob_cell[0], mob_cell[1]))
-                            for (ekind, egid), eent in self.entities.items():
-                                if ekind == "drop":
-                                    dc = eent.track.cell(now)
-                                    if math.hypot(dc[0] - mob_cell[0], dc[1] - mob_cell[1]) <= 3.0:
-                                        self.entities[ekind, egid] = replace(
-                                            eent, ownership="LOCKED", public_at=max(eent.public_at, now + 12.0)
-                                        )
-                        self.other_player_kills = [(ts, kx, ky) for ts, kx, ky in self.other_player_kills if now - ts <= 2.0]
-                        by_me = (gid in self.mobs_damaged_by_me or real_gid in self.mobs_damaged_by_me) and (
-                            now - self.mobs_damaged_by_me.get(real_gid, self.mobs_damaged_by_me.get(gid, 0)) < 15.0
-                        )
-                        by_others = (gid in self.mobs_damaged_by_others or real_gid in self.mobs_damaged_by_others) and (
-                            now - self.mobs_damaged_by_others.get(real_gid, self.mobs_damaged_by_others.get(gid, 0)) < 15.0
-                        )
+                        by_me = attacked or any(eid in self.mobs_damaged_by_me for eid in ids)
+                        by_others = not by_me and any(eid in self.mobs_damaged_by_others for eid in ids)
                         near_player = self.player is not None and math.dist(mob_cell, self.player.cell()) <= 14
                         self.recent_dead_mobs.append({
                             "gid": real_gid,
@@ -1738,19 +1926,26 @@ class World:
                         })
                         if len(self.recent_dead_mobs) > 40:
                             self.recent_dead_mobs.pop(0)
+                        for drop in self.entities.values():
+                            if (drop.kind == "drop" and now - drop.created_at <= 2.0
+                                    and math.dist(drop.track.target, mob_cell) <= 3.0):
+                                self._update_drop_owner(drop)
+                    for entity_id in ids:
+                        self.mobs_damaged_by_me.pop(entity_id, None)
+                        self.mobs_damaged_by_others.pop(entity_id, None)
                     if getattr(self, "locked_combat_mob_gid", None) in (gid, real_gid):
                         self.locked_combat_mob_gid = None
                     if self.farm_target_gid in (gid, real_gid):
                         self.farm_target_gid = None
-                    self.other_players.pop(gid, None)
-                    self.other_players.pop(real_gid, None)
-                    self.players.pop(gid, None)
-                    self.players.pop(real_gid, None)
-                elif opcode == 0x00A1:
+                    self._remove_entity(real_gid)
+                    self.entity_names.pop(real_gid, None)
+                    if self.last_mob_attack[0] == real_gid:
+                        self.last_mob_attack = (None, None, 0.0)
+                else:
                     # 0x00A1 ZC_ITEM_DISAPPEAR: registra posição do drop antes de removê-lo
                     # para permitir cruzamento com 0x00A0 (item coletado a <= 2.5 células)
                     now_a1 = time.monotonic()
-                    drop_ent = self.entities.get(("drop", real_gid)) or self.entities.get(("drop", gid))
+                    drop_ent = self.entity("drop", real_gid) or self.entity("drop", gid)
                     if drop_ent:
                         self.recent_seen_drops.append({
                             "aid": real_gid,
@@ -1764,9 +1959,8 @@ class World:
                             self.recent_seen_drops.pop(0)
                 self.vending_aids.discard(gid)
                 self.vending_aids.discard(real_gid)
-                for k in ("mob", "npc", "warp", "drop"):
-                    self.entities.pop((k, real_gid), None)
-                    self.entities.pop((k, gid), None)
+                if opcode == 0x00A1 and drop_ent is not None:
+                    self._remove_entity(real_gid)
         elif opcode in PICKUP_ACK:
             trailing, wide_size = PICKUP_ACK[opcode]
             result_offset = len(data) - trailing - 1
@@ -1790,16 +1984,15 @@ class World:
                     self.inventory_pickup_blocked = True
                 now = time.monotonic()
                 if self.pending_pickup:
-                    gid, clicked_at = self.pending_pickup
-                    key = ("drop", gid)
-                    drop = self.entities.get(key)
+                    gid, clicked_at, retry_delay = self.pending_pickup
+                    drop = self.entity("drop", gid)
                     if now - clicked_at <= 1.75 and (drop is None or nameid in (0, drop.catalog_id)):
                         self.pending_pickup = None
                         self.last_pickup_ack = (gid, now, fail)
-                        if not fail and drop:
-                            self.entities[key] = replace(drop, ignore_until=now + 2.0)
+                        if not fail and drop and nameid == drop.catalog_id and index >= 2 and count:
+                            self._remove_entity(gid)
                         elif fail and drop and (opcode == 0x00A0 or fail not in (2, 4)):
-                            self.entities[key] = replace(drop, ownership="LOCKED", public_at=now + 10.0)
+                            drop.retry_after = max(drop.retry_after, time.time() + retry_delay)
                 self.recent_picked_items.append({
                     "item_id": nameid,
                     "count": max(1, count),
@@ -1909,24 +2102,18 @@ class World:
         if aid is not None and item is not None and x is not None and y is not None:
             if 0 <= x < 2048 and 0 <= y < 2048 and item:
                 cell = (x, y)
-                current = self.entities.get(("drop", aid))
+                current = self.entity("drop", aid)
                 if current and current.catalog_id == item and current.track.target == cell:
-                    self.entities["drop", aid] = replace(current, amount=max(1, cnt))
+                    self.entities[aid] = replace(current, amount=max(1, cnt), last_seen=now)
                     return
-                ownership = self._classify_drop(cell)
-                drop_ignore_until = 0.0
-                drop_public_at = 0.0
-                for k_ts, kx, ky in getattr(self, "other_player_kills", []):
-                    if now - k_ts <= 2.0 and math.hypot(x - kx, y - ky) <= 3.0:
-                        drop_ignore_until = now + 12.0
-                        drop_public_at = now + 12.0
-                        break
-                self.entities["drop", aid] = Entity(
-                    "drop", item, Track.stationary(cell), max(1, cnt),
-                    ownership="LOCKED" if drop_public_at > 0.0 else ownership, created_at=now,
-                    ignore_until=drop_ignore_until,
-                    public_at=drop_public_at
-                )
+                if current:
+                    self._remove_entity(aid)
+                elif aid in self.entities:
+                    return
+                drop = Entity("drop", item, Track.stationary(cell), max(1, cnt),
+                              created_at=now, last_seen=now)
+                self._update_drop_owner(drop)
+                self.entities[aid] = drop
                 self.recent_seen_drops.append({
                     "aid": aid,
                     "item_id": item,
@@ -2011,16 +2198,17 @@ class World:
             base_offset = 53 + 4 * has_aid + 4 * wide + 2 * (opcode >= 0x07F7)
 
             wide_layout = opcode in (0x09FD, 0x09FE, 0x09FF, 0x0AFD, 0x0AFE, 0x0AFF)
-            speed = max(1, u16(data, 9 + 4 * has_aid)) if len(data) >= 11 + 4 * has_aid else 150
+            speed_offset = 12 if opcode == 0x09FD else 9 + 4 * has_aid
+            speed = walk_speed(u16(data, speed_offset) if len(data) >= speed_offset + 2 else 0)
             job = u16(data, 19 + 4 * has_aid) if len(data) >= 21 + 4 * has_aid else 1002
             aid = u32(data, 5) if len(data) >= 9 else 0
-            gid = u32(data, 9) if len(data) >= 13 else 0
-            entity_id = aid if aid > 0 else gid
+            gid = u32(data, 9) if has_aid and len(data) >= 13 else 0
+            entity_id = aid if opcode in CANONICAL_UNIT_OPCODES else aid or gid
             effective_offset = base_offset
 
             if wide_layout and obj_type != 0:
-                previous = (self.entities.get(("npc", entity_id)) or self.entities.get(("warp", entity_id))
-                            or self.entities.get(("mob", entity_id)))
+                previous = (self.entity("npc", entity_id) or self.entity("warp", entity_id)
+                            or self.entity("mob", entity_id))
                 detected = self._detect_posdir_offset(
                     data, (base_offset, 63, 65, 67), walking=walking,
                     track=previous.track if previous else None)
@@ -2031,42 +2219,28 @@ class World:
                         self._seen_posdir_layouts.add(signature)
                         print(f"[Feed] PosDir {detected} no pacote 0x{opcode:04X} de {len(data)} bytes.", flush=True)
 
-        # Rastreia outros jogadores (BL_PC = 0)
-        if obj_type == 0:
-            if len(data) >= 9:
-                p_aid = aid if not is_legacy else gid
-                p_gid = gid if len(data) >= 13 else p_aid
-                p_id = p_gid if p_gid >= 100000 else p_aid
-                self.aid_to_gid[p_aid] = p_id
-                if self.player_id is None or p_id != self.player_id:
-                    # Para jogadores usa offset base sem deteção extra
-                    if walking and len(data) >= effective_offset + 7:
-                        p_cell = position(data, effective_offset + 4)
-                    elif len(data) >= effective_offset + 3:
-                        p_cell = position(data, effective_offset)
-                    else:
-                        p_cell = None
-                    if p_cell:
-                        self.other_players[p_id] = (p_cell, time.monotonic())
-                        self.other_players[p_aid] = (p_cell, time.monotonic())
-                        self.players[p_id] = (p_cell, time.monotonic())
-                        has_vending = (p_aid in self.vending_aids or p_id in self.vending_aids)
-                        old_ent = self.entities.get(("player", p_id)) or self.entities.get(("player", p_aid))
-                        if old_ent and getattr(old_ent, "has_vending_shop", False):
-                            has_vending = True
-                        player_ent = Entity(
-                            kind="player", catalog_id=job, track=Track.stationary(p_cell, speed),
-                            has_vending_shop=has_vending
-                        )
-                        self.entities["player", p_id] = player_ent
-                        self.entities["player", p_aid] = player_ent
+        if not entity_id:
+            return
+        if self._is_local_player_id(entity_id):
+            self._remove_entity(entity_id)
             return
 
-        # Ignora Pet, Homunculus, Mercenary, Elemental como NPC
-        if obj_type in (7, 8, 9, 10):
-            return
+        kind = None
+        if opcode in CANONICAL_UNIT_OPCODES or obj_type in (0, 1, 5, 6):
+            kind = CANONICAL_UNIT_TYPES.get(obj_type)
+        if kind is None:
+            if obj_type != 0 and job >= 1000:
+                kind = "mob"
+            elif opcode in CANONICAL_UNIT_OPCODES or obj_type in (7, 8, 9, 10):
+                return
 
-        if walking:
+        if opcode == 0x0856:
+            pos_off = effective_offset + 4 if len(data) >= effective_offset + 10 else effective_offset
+            if len(data) < pos_off + 3:
+                return
+            cell = position(data, pos_off)
+            walking = False
+        elif walking:
             move_off = effective_offset + 4
             if len(data) < move_off + 6:
                 return
@@ -2076,40 +2250,35 @@ class World:
                 return
             cell = position(data, effective_offset)
 
-        # Classificação da entidade:
-        # - job == 45: portal de teleporte / warp
-        # - obj_type == 1 ou IDs de NPC: npc
-        # - obj_type in (0x05, 0x0D, 0x0E): mob
         name = self.entity_names.get(entity_id) or self.entity_names.get(gid)
         if not name and opcode in (0x09FD, 0x09FE, 0x09FF, 0x0AFD, 0x0AFE, 0x0AFF) and len(data) >= effective_offset + 32:
             inline_name = data[-24:].split(b"\x00", 1)[0].decode("cp1252", errors="replace").strip()
             if inline_name.isprintable():
                 name = inline_name
-        if job == 45:
+        if job == 45 and kind in (None, "npc"):
             kind = "warp"
-        elif is_kafra(job, name) or obj_type == 1 or (not (0x05 <= obj_type <= 0x0E) and (50000 <= entity_id or job < 1000)):
-            kind = "npc"
-        elif obj_type in (0x05, 0x0D, 0x0E):
-            kind = "mob"
-        else:
-            kind = "npc"
+        elif kind is None:
+            kind = "mob" if obj_type in (0x05, 0x0D, 0x0E) and not is_kafra(job, name) else "npc"
 
-        if aid and entity_id:
-            self.aid_to_gid[aid] = entity_id
-        if gid and gid != aid and entity_id:
-            self.aid_to_gid[gid] = entity_id
+        # AID é a chave; GID só resolve referências dos outros pacotes.
+        old_ent = self.entity(kind, entity_id)
+        aliases = {aid, gid} - {0}
+        for alias in aliases:
+            previous_id = self.aid_to_gid.get(alias, alias)
+            if previous_id != entity_id:
+                previous = self._remove_entity(previous_id)
+                if old_ent is None and previous is not None and previous.kind == kind:
+                    old_ent = previous
+        self._remove_entity(entity_id)
+        for alias in aliases:
+            self.aid_to_gid[alias] = entity_id
 
         if entity_id:
-            for other_kind in ("mob", "npc", "warp"):
-                if other_kind != kind:
-                    self.entities.pop((other_kind, entity_id), None)
-
-            old_ent = self.entities.get((kind, entity_id))
             previous_track = old_ent.track if old_ent else None
-            if walking:
+            if opcode == 0x09FD:
+                track = Track.walking(cells, speed, now, self.get_gat())
+            elif walking:
                 track = Track.walking(cells, speed, now, self.get_gat(), previous=previous_track)
-            elif opcode == 0x09FF and kind == "mob":
-                track = Track.stopping(cell, speed, now, previous_track)
             else:
                 track = Track.stationary(cell, speed)
             is_aggro = old_ent.is_aggro if old_ent else False
@@ -2122,7 +2291,7 @@ class World:
             ignore_until = getattr(old_ent, "ignore_until", 0.0) if old_ent else 0.0
 
             if kind == "mob":
-                px_m, py_m = self.player.cell(now) if self.player else (None, None)
+                px_m, py_m = self.player.cell() if self.player else (None, None)
                 cell_m = track.target
                 if px_m is not None:
                     cur_dist = math.hypot(cell_m[0] - px_m, cell_m[1] - py_m)
@@ -2152,24 +2321,29 @@ class World:
                         self.heatmap_data[sec_key] = self.heatmap_data.get(sec_key, 0) + 1
                         self.heatmap_dirty = True
 
-            self.entities[kind, entity_id] = Entity(
-                kind, job, track, speed=speed,
+            self.entities[entity_id] = Entity(
+                kind, job, track, speed=speed, last_seen=time.monotonic(), gid=gid,
+                move_start_ts=track.move_start_ts,
+                has_vending_shop=(kind == "player" and
+                                  (bool(aliases & self.vending_aids) or bool(old_ent and old_ent.has_vending_shop))),
                 is_aggro=is_aggro, last_aggro_ts=last_aggro_ts,
                 is_hostile_now=is_hostile_now,
                 consecutive_approaches=consecutive_approaches,
                 last_player_dist=last_player_dist,
                 last_attacker_gid=last_attacker_gid,
+                last_combat_damage=old_ent.last_combat_damage if old_ent else 0.0,
                 engaged_by_other_until=engaged_by_other_until,
                 ignore_until=ignore_until,
                 unreachable_until=old_ent.unreachable_until if old_ent else 0.0,
                 avoid_until=old_ent.avoid_until if old_ent else 0.0,
             )
+            if name and kind in ("npc", "player"):
+                self.entity_names[entity_id] = name
             if kind == "npc":
                 if name:
-                    self.entity_names[entity_id] = name
                     self._remember_npc_name(entity_id, name)
                 else:
-                    self._remember_kafra(self.entities[kind, entity_id],
+                    self._remember_kafra(self.entities[entity_id],
                                          self.npc_name(entity_id, job, track.target, self.map))
 
             # Log [MobDebug] dos primeiros 3 mobs para confirmar detecção e offset
@@ -2178,7 +2352,7 @@ class World:
                 try:
                     cell = track.target
                     now = time.monotonic()
-                    px, py = self.player.cell(now) if self.player else (None, None)
+                    px, py = self.player.cell() if self.player else (None, None)
                     dist = max(abs(cell[0] - px), abs(cell[1] - py)) if px is not None else -1
                     print(
                         f"[MobDebug #{self._mob_debug_count}] entity_id={entity_id} "
@@ -2278,7 +2452,25 @@ def monitor_ragexe_connections(target, ragexe_pid, stop):
         stop.wait(1.0)
 
 
-def capture(world, lengths, interface, server, port, local_port, stop, ready, ragexe_pid=None):
+def _capture_packet_keys(packet_keys):
+    if packet_keys is None:
+        # The overlay accepts this flag but does not pass it to capture().
+        parser = ArgumentParser(add_help=False, allow_abbrev=False)
+        parser.add_argument("--packet-keys")
+        packet_keys = parser.parse_known_args()[0].packet_keys
+    if packet_keys is None:
+        return None
+    if isinstance(packet_keys, str):
+        packet_keys = tuple(int(value.strip(), 0) for value in packet_keys.split(","))
+    else:
+        packet_keys = tuple(packet_keys)
+    if len(packet_keys) != 3 or any(not 0 <= key <= MASK for key in packet_keys):
+        raise ValueError("--packet-keys requer três inteiros de 32 bits separados por vírgula.")
+    return packet_keys if any(packet_keys) else None
+
+
+def capture(world, lengths, interface, server, port, local_port, stop, ready, ragexe_pid=None, *, packet_keys=None):
+    packet_keys = _capture_packet_keys(packet_keys)
     IP, IPv6, TCP, conf, sniff = scapy_capture()
     target = ConnectionTarget(server, port, local_port)
 
@@ -2302,6 +2494,18 @@ def capture(world, lengths, interface, server, port, local_port, stop, ready, ra
         target.changed.clear()
         active = None
         stream = None
+        outbound = {}
+
+        def outbound_decoder(peer, sequence):
+            def record(opcode, data):
+                if active == peer:
+                    world.record_client_combat_packet(opcode, data)
+
+            def record_dialog(opcode, data):
+                if active == peer:
+                    world.record_client_dialog_packet(opcode, data)
+
+            return _OutboundOpcodes(sequence, lengths, packet_keys, record, record_dialog)
 
         def receive(packet):
             nonlocal active, stream, diag_count
@@ -2310,12 +2514,46 @@ def capture(world, lengths, interface, server, port, local_port, stop, ready, ra
             if ip is None or tcp is None:
                 return
             flags = int(tcp.flags)
-            if ip.src != current_server or tcp.sport != current_port:
-                if (ip.dst, tcp.dport) == (current_server, current_port) and active == (ip.src, tcp.sport) and flags & 0x05:
-                    active = stream = None
-                    world.reset(preserve_transfer=True)
+            from_server = (ip.src, tcp.sport) == (current_server, current_port)
+            to_server = (ip.dst, tcp.dport) == (current_server, current_port)
+            if not from_server and not to_server:
+                return
+
+            payload = bytes(tcp.payload)
+            # Ethernet padding may be dissected as a TCP payload layer by Scapy.
+            padding = tcp.getlayer("Padding")
+            if padding:
+                padding_size = len(bytes(padding))
+                if 0 < padding_size <= len(payload):
+                    payload = payload[:-padding_size]
+
+            if not from_server:
+                peer = ip.src, tcp.sport
+                sequence = (tcp.seq + bool(flags & 0x02)) & MASK
+                if peer not in outbound and (flags & 0x02 or (payload and not packet_keys)):
+                    outbound[peer] = outbound_decoder(peer, sequence)
+                if payload:
+                    raw_op = u16(payload) if len(payload) >= 2 else None
+                    decoder = outbound.get(peer)
+                    dec_op = decoder.feed(sequence, payload) if decoder else None
+                    if not packet_keys:
+                        dec_op = raw_op
+                    raw_text = f"0x{raw_op:04X}" if raw_op is not None else "N/D"
+                    dec_text = f"0x{dec_op:04X}" if dec_op is not None else "N/D"
+                    print(
+                        f"[TCP C->S] len={len(payload)} | RawOp={raw_text} | "
+                        f"DecOp={dec_text} | Hex: {payload.hex(' ').upper()}",
+                        flush=True,
+                    )
+                if flags & 0x05:
+                    outbound.pop(peer, None)
+                    if active == peer:
+                        active = stream = None
+                        world.reset(preserve_transfer=True)
                 return
             peer = ip.dst, tcp.dport
+            if (flags & 0x12) == 0x12 and peer not in outbound:
+                outbound[peer] = outbound_decoder(peer, tcp.ack)
 
             # Inicializa o stream tanto em nova conexão (SYN) quanto em conexão já ativa
             if active is None:
@@ -2328,12 +2566,6 @@ def capture(world, lengths, interface, server, port, local_port, stop, ready, ra
 
             if active != peer:
                 return
-
-            payload = bytes(tcp.payload)
-            # Ethernet padding may be dissected as a TCP payload layer by Scapy.
-            padding = tcp.getlayer("Padding")
-            if padding and len(bytes(padding)) <= len(payload):
-                payload = payload[:len(payload) - len(bytes(padding))]
 
             if payload:
                 target.touch()
@@ -2383,6 +2615,7 @@ def capture(world, lengths, interface, server, port, local_port, stop, ready, ra
                     world.reset()
 
             if flags & 0x05:
+                outbound.pop(peer, None)
                 active = stream = None
                 world.reset(preserve_transfer=True)
 
