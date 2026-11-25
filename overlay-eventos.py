@@ -203,7 +203,7 @@ from rathena_terrain import (
     CITY_NAMES, CITY_KAFRA, MAP_PORTALS, find_map_route, get_city_travel_plan,
     get_mob_catalog, load_item_catalog, get_item_tier, search_mob_catalog,
     KNOWN_CITIES, load_heatmap,
-    matches_city, save_learned_warp, load_learned_warps
+    matches_city, save_portal_trigger, load_learned_warps
 )
 
 
@@ -544,7 +544,7 @@ def travel_step_key(step):
 
 
 def calculate_travel_route(start_map, dest_map, *, position=None, zeny=None, excluded=(), live_portals=(),
-                           routes_data=None, network=None, terrains=None):
+                           routes_data=None, network=None, terrains=None, navigation_obstacles=None):
     """Compara deslocamentos até as saídas e Kafras, com saldo acumulado quando conhecido."""
     import heapq
 
@@ -627,14 +627,21 @@ def calculate_travel_route(start_map, dest_map, *, position=None, zeny=None, exc
 
     walking_costs = {}
 
-    def walking_distance(map_id, entry, exit_cell):
+    def walking_distance(map_id, entry, exit_cell, is_portal):
         if entry is None:
             return 105
-        key = map_id, entry, exit_cell
+        key = map_id, entry, exit_cell, is_portal
         if key not in walking_costs:
             gat = terrains.get(map_id) if terrains else None
-            path = gat.find_path(entry, exit_cell) if gat is not None else None
-            walking_costs[key] = (sum(math.dist(a, b) for a, b in zip(path, path[1:]))
+            path = None
+            if gat is not None:
+                blocked, penalties = (navigation_obstacles(map_id, gat, exit_cell if is_portal else None)
+                                      if navigation_obstacles else (set(), {}))
+                goal = gat.find_nearest_walkable(*exit_cell, blocked_cells=blocked)
+                if goal is not None:
+                    path = gat.find_path(entry, goal, blocked_cells=blocked, penalty_cells=penalties)
+            walking_costs[key] = (sum(math.dist(a, b) + penalties.get(b, 0.0) / 10
+                                      for a, b in zip(path, path[1:]))
                                   if path else math.dist(entry, exit_cell))
         return walking_costs[key]
 
@@ -652,7 +659,7 @@ def calculate_travel_route(start_map, dest_map, *, position=None, zeny=None, exc
             price = spent + step["cost"]
             if zeny is not None and price > zeny:
                 continue
-            cost = score + walking_distance(city, entry, exit_cell) + action_cost
+            cost = score + walking_distance(city, entry, exit_cell, step["type"] == "portal") + action_cost
             labels = best.get((dst, arrival), ())
             if any(old_cost <= cost and old_price <= price for old_cost, old_price in labels):
                 continue
@@ -731,6 +738,7 @@ class ScreenObject:
     retry_after: float = 0.0
     name: str = None
     tag_uv: tuple[float, float] | None = None
+    destination_uv: tuple[float, float] | None = None
 
     def get_anchor(self):
         au = self.anchor_u if self.anchor_u is not None else self.u
@@ -745,6 +753,7 @@ class EntityOverlayLabel:
     text: str
     color: str
     amount: int
+    fixed: bool = False
 
 
 @dataclass(frozen=True)
@@ -762,6 +771,8 @@ class Snapshot:
     npc_dialog: dict | None = None
     frame_time: float = 0.0
     player_cell: tuple[float, float] | None = None
+    last_warp_from: dict | None = None
+    warp_context: tuple = ((), False)
 
 
 class KafraVision:
@@ -1045,7 +1056,8 @@ class LiveFeed:
         return entity.track.cell(now)
 
     def current(self):
-        name, player, entities, dialog = self.world.snapshot(include_dialog=True)
+        name, player, entities, dialog, last_warp_from, warp_context = self.world.snapshot(
+            include_dialog=True, include_warp=True)
         viewport = self.viewport()
         if not viewport:
             return None
@@ -1082,6 +1094,9 @@ class LiveFeed:
                 click_u, click_v = project(fx, fy, sprite_z)
                 if (-0.2 <= click_u <= 1.2 and -0.2 <= click_v <= 1.2) or (-0.2 <= anchor_u <= 1.2 and -0.2 <= anchor_v <= 1.2):
                     ownership = getattr(entity, "ownership", "FREE")
+                    track = entity.track
+                    destination_uv = (project(*track.target)
+                                      if kind == "mob" and track.started <= now < track.end_time else None)
                     objects.append(ScreenObject(
                         f"{kind}:{aid}", kind, entity.catalog_id,
                         click_u, click_v, entity.amount, ownership,
@@ -1089,6 +1104,7 @@ class LiveFeed:
                         (self.world.npc_name(aid, entity.catalog_id, entity.track.target, name)
                          if kind == "npc" else self.world.entity_names.get(aid) if kind == "player" else None),
                         tag_uv=project(fx, fy, self.TAG_HEIGHT_CELLS.get(kind, 1.9) * CELL_SIZE),
+                        destination_uv=destination_uv,
                     ))
 
         attack_target, attack_action, attack_ts, move_ts = self.world.client_combat_snapshot()
@@ -1105,6 +1121,8 @@ class LiveFeed:
             npc_dialog=dialog,
             frame_time=now,
             player_cell=player_cell,
+            last_warp_from=last_warp_from,
+            warp_context=warp_context,
         )
 
 
@@ -2362,6 +2380,8 @@ class CanvasPool:
         return item
 
     def get_oval(self, x1, y1, x2, y2, **kwargs):
+        kwargs.setdefault("fill", "")
+        kwargs.setdefault("dash", "")
         if self._oval_idx < len(self.ovals):
             item = self.ovals[self._oval_idx]
             self.canvas.coords(item, x1, y1, x2, y2)
@@ -2384,6 +2404,7 @@ class CanvasPool:
         return item
 
     def get_line(self, *coords, **kwargs):
+        kwargs.setdefault("dash", "")
         if self._line_idx < len(self.lines):
             item = self.lines[self._line_idx]
             self.canvas.coords(item, *coords)
@@ -2502,6 +2523,10 @@ class Overlay:
             feed.world.drop_is_priority = self._is_priority_drop
         self.tier3_max_weight_pct = self.filters_config.get("tier3_max_weight_pct", 55)
         self.world_routes_data = load_world_routes()
+        self._learned_warps = load_learned_warps()
+        self._navigation_kafras = load_kafra_network()
+        self._last_warp_seen = 0.0
+        self._intentional_portal_click = None
         self.nav_path = None
         self.farm_map = None
         self.retreat_origin_map = None
@@ -2620,6 +2645,7 @@ class Overlay:
         world = getattr(self.feed, "world", None)
         if world:
             world.on_pickup_ack_callback = self._on_pickup_ack
+            world.warp_intent_callback = self._is_intentional_warp
         self._create_hud_panel()
         if hasattr(self.feed, "camera"):
             self.feed.camera.on_lbutton_down_callback = self._on_game_lbutton_down
@@ -3832,7 +3858,7 @@ class Overlay:
 
         # Projeta e clica no sprite
         snap_i = self.feed.current()
-        if snap_i:
+        if snap_i and snap_i.map == selected_map:
             vp_i = snap_i.viewport
             left_i, top_i, w_i, h_i = vp_i
             sprite_z_i = 5.5 if kind == "npc" else 1.2
@@ -3842,6 +3868,10 @@ class Overlay:
             u_i, v_i = proj_i(tx, ty, sprite_z_i)
             sx_i = left_i + int(u_i * w_i)
             sy_i = top_i + int(v_i * h_i)
+            portal = (tx, ty) if kind == "warp" else None
+            npc = aid if kind == "npc" else None
+            blocked, penalties = self._navigation_obstacles(selected_map, gat_i, portal=portal, npc=npc)
+            resolve = self._safe_click_resolver(snap_i, proj_i, allowed_portal=portal, allowed_npc=npc)
             g_hwnd_i = self.get_game_hwnd(None)
             if g_hwnd_i:
                 u32.SetForegroundWindow(g_hwnd_i)
@@ -3849,7 +3879,16 @@ class Overlay:
                 self._side_step_to_reveal((tx, ty), px_i, py_i)
             else:
                 self._click_debug(f"INTERAGIR: clique #{_npc_st['clicks']+1} a {dist_i:.1f} células em ({sx_i},{sy_i})")
-                if not self.patrol_move_and_click(sx_i, sy_i, hwnd=g_hwnd_i):
+                step = self._navigation_target_step(gat_i, (px_i, py_i), (tx, ty), (u_i, v_i),
+                                                    resolve, blocked, penalties)
+                if not step:
+                    return
+                cell, point, direct = step
+                if not self._navigation_click(snap_i, gat_i, cell, point, hwnd=g_hwnd_i,
+                                              portal=portal, npc=npc, ground=not direct):
+                    return
+                if not direct:
+                    self.patrol_target_route = (selected_map, tx, ty, aid)
                     return
                 self._hud_npc_line_target = (f"{kind}:{aid}", selected_map, now_i + 0.950)
                 _npc_st["clicks"] += 1
@@ -4109,11 +4148,11 @@ class Overlay:
             self._close_hud_drawer()
 
     @staticmethod
-    def _kafra_locations_for_map(current_map):
+    def _kafra_locations_for_map(current_map, network=None):
         if not current_map:
             return ()
         m = str(current_map).lower().removesuffix(".gat").removesuffix(".rsw").strip()
-        _, entry = get_kafra_network_map_entry(m)
+        _, entry = get_kafra_network_map_entry(m, network)
         if entry and entry.get("locations"):
             return tuple(entry["locations"])
         base = re.sub(r"_[a-z0-9]+$", "", m)
@@ -4238,11 +4277,12 @@ class Overlay:
         if npc is None:
             self._click_debug(f"Kafra cadastrada em {target} ainda não encontrada no feed.")
             return "waiting"
-        left, top, width, height = snapshot.viewport
         terrain = getattr(self.feed, "terrain", None)
         gat = terrain.cached_gats.get(snapshot.map) if terrain else None
         project = self.feed.camera.projector(snapshot.viewport, self.feed._cam or position,
                                              gat.get_elevation if gat else flat_height)
+        blocked, penalties = self._navigation_obstacles(snapshot.map, gat, npc=gid)
+        resolve = self._safe_click_resolver(snapshot, project, allowed_npc=gid)
 
         if "npc_click_at" in leg:
             click_at = self._touch_click_finished_at(leg["npc_click_point"], leg["npc_click_at"])
@@ -4251,30 +4291,29 @@ class Overlay:
             start = tuple(map(round, position))
             came_closer = math.dist(start, target) < math.dist(leg["npc_click_cell"], target)
             if gat is not None and not came_closer:
-                blocked = self._get_all_blocked_cells() | {target}
-                blocked.update(cell for cell, until in leg["blocked"].items() if until > now)
-                resolve = self._safe_click_resolver(snapshot, project, allowed_npc=gid)
+                failed = {cell for cell, until in leg["blocked"].items() if until > now}
+                retry_blocked = blocked | failed | {target}
                 closer = sorted((cell for cell in self._patrol_cells_in_radius(*start, 2)
                                  if math.dist(start, cell) <= 1.5 and math.dist(cell, target) < math.dist(start, target)),
                                 key=lambda cell: math.dist(cell, target))
                 for cell in closer:
-                    point = self._walk_ground_point(gat, position, cell, blocked, resolve)
+                    point = self._walk_ground_point(gat, position, cell, retry_blocked, resolve)
                     if point is not None:
-                        if self.patrol_move_and_click(*point, hwnd=hwnd):
+                        if self._navigation_click(snapshot, gat, cell, point, hwnd=hwnd, npc=gid):
                             leg["walk_click"] = now, position, cell, point, False
                         return "waiting"
             leg.pop("npc_click_at")
 
         item = next((obj for obj in snapshot.objects if obj.key == f"npc:{gid}"), None)
         u, v = (item.u, item.v) if item else project(*npc.track.cell(), 5.5)
-        if not (0 <= u < 1 and 0 <= v < 1):
+        target_cell = tuple(map(round, npc.track.target))
+        step = self._navigation_target_step(gat, position, target_cell, (u, v), resolve, blocked, penalties)
+        if not step:
             return "waiting"
-        point = left + int(u * width), top + int(v * height)
-        if self._is_point_in_game_ui(*point) or self._is_point_in_vending_shop(*point):
-            return "waiting"
-        if any(obj.kind == "npc" and obj.key != f"npc:{gid}"
-               and math.hypot((u - obj.u) * width, (v - obj.v) * height) <= 12
-               for obj in snapshot.objects):
+        cell, point, direct = step
+        if not direct:
+            if self._navigation_click(snapshot, gat, cell, point, hwnd=hwnd, npc=gid):
+                leg["walk_click"] = now, position, cell, point, False
             return "waiting"
 
         def aim(_lead):
@@ -4285,7 +4324,7 @@ class Overlay:
                     return point
             return None
 
-        if self.patrol_move_and_click(*point, hwnd=hwnd, target_point=aim):
+        if self._navigation_click(snapshot, gat, cell, point, hwnd=hwnd, target_point=aim, npc=gid, ground=False):
             leg.update(npc_gid=gid, npc_raw_gid=raw_gid, npc_click_at=now, npc_click_seq=seq,
                        npc_click_point=point, npc_click_cell=tuple(map(round, position)), awaiting_npc_click=True)
             print(f"[Kafra] Interação com NPC {gid} em {npc.track.target} ({snapshot.map}).", flush=True)
@@ -4839,6 +4878,10 @@ class Overlay:
         return calculate_travel_route(
             current_map, target, position=position, zeny=zeny, excluded=excluded,
             live_portals=portals, routes_data=self.world_routes_data, terrains=terrains,
+            navigation_obstacles=lambda map_id, gat, portal: self._build_navigation_obstacles(
+                current_map if map_id == travel_map_group(current_map) else map_id,
+                self._navigation_entities(current_map) if map_id == travel_map_group(current_map) else (),
+                gat, allowed_portal_cell=portal),
         )
 
     @staticmethod
@@ -4975,17 +5018,12 @@ class Overlay:
         )
         resolve = self._safe_click_resolver(snapshot, project, allowed_portal=portal, allowed_npc=npc_gid)
         detour = leg.get("detour", False)
-        blocked = self._get_all_blocked_cells()
-        if detour:
-            blocked = (self._get_portal_blocked_cells(radius=1.0) | self._npc_dialog_blocked_cells(now)
-                       | {cell for cell, until in self.temp_blocked_cells.items() if until > now})
-        if portal:
-            blocked.discard(portal)
+        blocked, penalties = self._navigation_obstacles(snapshot.map, gat, portal=portal, npc=npc_gid)
         failed_points = {cell for cell, until in leg["blocked"].items() if until > now}
         leg["blocked"] = {cell: leg["blocked"][cell] for cell in failed_points}
 
         def ground_point(cell):
-            if cell in failed_points or cell in visited:
+            if cell != portal and (cell in failed_points or cell in visited):
                 return None
             return self._walk_ground_point(gat, position, cell, blocked, resolve)
 
@@ -5007,8 +5045,8 @@ class Overlay:
             return "waiting"
 
         def click(cell, point, enter_portal=False):
-            if self.patrol_move_and_click(*point, hwnd=self.get_game_hwnd(),
-                                          retry_key=(snapshot.map, "ground", cell)):
+            if self._navigation_click(snapshot, gat, cell, point, portal=portal, npc=npc_gid,
+                                      retry_key=(snapshot.map, "ground", cell)):
                 leg["walk_click"] = (now, position, cell, point, enter_portal)
             return "waiting"
 
@@ -5022,7 +5060,7 @@ class Overlay:
                         if cell not in (portal, start) and (point := ground_point(cell)):
                             leg["portal_attempts"] = attempts + 1
                             return click(cell, point, enter_portal=True)
-                if point := resolve(portal):
+                if point := ground_point(portal):
                     leg["portal_attempts"] = attempts + 1
                     return click(portal, point, enter_portal=True)
             else:
@@ -5034,7 +5072,7 @@ class Overlay:
         elif not portal and math.dist(position, target) <= 4.0:
             return "approached"
 
-        path_key = target, portal, npc_gid, detour
+        path_key = target, portal, npc_gid, detour, frozenset(blocked), frozenset(penalties.items())
         path = leg.get("path")
         if path and leg.get("path_key") == path_key:
             closest = min(range(len(path)), key=lambda idx: math.dist(position, path[idx]))
@@ -5075,7 +5113,7 @@ class Overlay:
                         )
                         for goal in candidates[:5]:
                             candidate = gat.find_path(
-                                start, goal, blocked_cells=blocked, cell_costs=costs,
+                                start, goal, blocked_cells=blocked, penalty_cells=penalties, cell_costs=costs,
                                 max_iterations=(40000 if detour else 18000) if goal == target else 12000,
                             )
                             if candidate and candidate[-1] == goal:
@@ -5097,7 +5135,7 @@ class Overlay:
                                           previous_point=failed[1], radius=5)
             if retry:
                 return click(*retry)
-        stride = self._pick_walk_stride(local_path, position, ground_point, allow_short=True)
+        stride = self._pick_walk_stride(local_path, position, blocked, ground_point)
         if stride:
             leg["side_steps"] = 0
             return click(*stride)
@@ -5243,7 +5281,7 @@ class Overlay:
                     leg["next_dialog_at"] = now + 1.2
                 return
             target = step["wx"], step["wy"]
-            observed = self._get_portal_blocked_cells(radius=0, allow_current_goal=False)
+            observed = self._visible_portal_cells(current_map)
             target = min((cell for cell in observed if math.dist(cell, target) <= 6),
                          key=lambda cell: math.dist(cell, target), default=target)
             self._travel_allowed_portal = target
@@ -5293,9 +5331,9 @@ class Overlay:
             return
         start = tuple(map(round, player.cell()))
         raw_x, raw_y = int(rx * gat.width), int((1.0 - ry) * gat.height)
-        blocked = self._get_all_blocked_cells()
+        blocked, penalties = self._navigation_obstacles(map_id, gat)
         goal = gat.find_nearest_walkable(raw_x, raw_y, max_radius=15, blocked_cells=blocked)
-        path = self._find_minimap_path(gat, start, goal, blocked) if goal else []
+        path = self._find_minimap_path(gat, start, goal, blocked, penalties) if goal else []
         if not path:
             self._click_debug(f"PATROL bloqueado: minimapa sem rota caminhável até ({raw_x}, {raw_y}).")
             return
@@ -5315,8 +5353,8 @@ class Overlay:
         print(f"[Minimapa] {map_id} {start} → {goal}.", flush=True)
 
     @staticmethod
-    def _find_minimap_path(gat, start, goal, blocked):
-        path = gat.find_path(start, goal, blocked_cells=blocked,
+    def _find_minimap_path(gat, start, goal, blocked, penalties):
+        path = gat.find_path(start, goal, blocked_cells=blocked, penalty_cells=penalties,
                              max_iterations=max(7000, 3 * gat.width * gat.height))
         return path if path and path[-1] == goal else []
 
@@ -5486,6 +5524,7 @@ class Overlay:
                     self.last = None
             else:
                 self._hud_snapshot_missing_since = None
+                self._learn_accidental_warp(snapshot)
                 try:
                     if self.draw(snapshot, stats):
                         self.last = snapshot
@@ -5636,16 +5675,7 @@ class Overlay:
         return False
 
     def _retreat_portal_cells(self, current_map):
-        cells = self._get_portal_blocked_cells(radius=0, allow_current_goal=False)
-        cells.update(tuple(cell) for (source, _), cell in MAP_PORTALS.items() if source == current_map)
-        cells.update(tuple(cell) for (source, _), cell in KAFRA_STORAGE_PORTALS.items() if source == current_map)
-        cells.update((int(portal["wx"]), int(portal["wy"]))
-                     for portal in self.world_routes_data.get("portals", ())
-                     if portal["from_map"].lower() == current_map)
-        cells.update(tuple(map(int, cell)) for link, cell in load_learned_warps().items()
-                     if link.lower().partition("->")[0] == current_map
-                     and isinstance(cell, (list, tuple)) and len(cell) == 2)
-        return cells
+        return self._visible_portal_cells(current_map) | self._registered_portal_cells(current_map)
 
     def _can_auto_sit(self):
         world = self.feed.world
@@ -5706,7 +5736,8 @@ class Overlay:
         def ground_point(cell):
             if (cell in blocked or self.temp_blocked_cells.get(cell, 0.0) > now
                     or not gat.is_walkable(*cell)
-                    or not self._has_gat_line_of_sight(*player_cell, *cell, gat)):
+                    or not self._has_gat_line_of_sight(*player_cell, *cell, gat)
+                    or self._segment_hits_obstacle(*player_cell, *cell, blocked)):
                 return None
             point = resolve(cell)
             if point and not any(abs(point[0] - mx) <= 55 and my - 75 <= point[1] <= my + 25
@@ -5749,8 +5780,8 @@ class Overlay:
                             return None
                 return point
 
-            if self.patrol_move_and_click(*point, hwnd=self.get_game_hwnd(), target_point=safe_retreat_point,
-                                          retry_key=(snapshot.map, "ground", cell)):
+            if self._navigation_click(snapshot, gat, cell, point, target_point=safe_retreat_point,
+                                      portal=portal, retry_key=(snapshot.map, "ground", cell)):
                 self._last_retreat_target = cell
                 self._last_retreat_step_at = now
                 self._retreat_click = (now, player_cell, cell, point, portal == cell)
@@ -5863,8 +5894,8 @@ class Overlay:
                 for dy in range(-4, 5):
                     if dx * dx + dy * dy <= 16:
                         costs[x + dx, y + dy] = 35
-        blocked = mob_cells | self._npc_dialog_blocked_cells(now)
-        blocked.update(cell for cell, until in self.temp_blocked_cells.items() if until > now)
+        blocked, penalties = self._navigation_obstacles(current_map, gat)
+        blocked |= mob_cells
         portals = self._retreat_portal_cells(current_map)
 
         returning = self._survival_state == SURVIVAL_RETURN
@@ -5898,18 +5929,19 @@ class Overlay:
                         self._retreat_portal_attempts[key] = 4
                         self._click_debug(f"SOBREVIVÊNCIA: Travessia em {goal} não confirmada; aguardando servidor.")
                     continue
-                barriers = blocked | (portals - {goal})
+                barriers, portal_penalties = self._navigation_obstacles(current_map, gat, portal=goal)
+                barriers |= mob_cells | (portals - {goal})
                 if start == goal:
                     # Reentrar na célula é necessário se o personagem já chegou sobre o portal.
                     for dx, dy in ((2, 0), (-2, 0), (0, 2), (0, -2), (1, 0), (-1, 0), (0, 1), (0, -1)):
                         step = start[0] + dx, start[1] + dy
                         if step not in barriers and gat.is_walkable(*step):
                             self._move_on_retreat_path(snapshot, gat, player_cell,
-                                                       [start, step], mobs, blocked=barriers)
+                                                       [start, step], mobs, portal=goal, blocked=barriers)
                             if self._retreat_click:
                                 break
                     return True
-                path = gat.find_path(start, goal, blocked_cells=barriers, cell_costs=costs)
+                path = gat.find_path(start, goal, blocked_cells=barriers, penalty_cells=portal_penalties, cell_costs=costs)
                 if path and path[-1] == goal:
                     self._move_on_retreat_path(snapshot, gat, player_cell, path, mobs, portal=goal, blocked=barriers)
                     return True
@@ -5920,7 +5952,7 @@ class Overlay:
 
         goal = self._retreat_goal
         if goal and goal not in blocked and clearance(goal) >= 11:
-            path = gat.find_path(start, goal, blocked_cells=blocked, cell_costs=costs)
+            path = gat.find_path(start, goal, blocked_cells=blocked, penalty_cells=penalties, cell_costs=costs)
             if len(path) > 1 and path[-1] == goal:
                 self._move_on_retreat_path(snapshot, gat, player_cell, path, mobs, blocked=blocked)
                 return True
@@ -5939,10 +5971,10 @@ class Overlay:
                     best = score, cell
             return False
 
-        gat.find_path(start, None, blocked_cells=blocked, cell_costs=costs, goal_test=consider)
+        gat.find_path(start, None, blocked_cells=blocked, penalty_cells=penalties, cell_costs=costs, goal_test=consider)
         if best:
             self._retreat_goal = best[1]
-            path = gat.find_path(start, best[1], blocked_cells=blocked, cell_costs=costs)
+            path = gat.find_path(start, best[1], blocked_cells=blocked, penalty_cells=penalties, cell_costs=costs)
             if path and path[-1] == best[1]:
                 self._move_on_retreat_path(snapshot, gat, player_cell, path, mobs, blocked=blocked)
         return True
@@ -6362,48 +6394,85 @@ class Overlay:
 
     def _safe_click_resolver(self, snapshot, project, *, allowed_portal=None, allowed_npc=None):
         left, top, width, height = snapshot.viewport
-        world = self.feed.world
-        now = time.monotonic()
-        visible = {obj.key: (obj.u, obj.v) for obj in snapshot.objects if obj.kind in ("npc", "warp")}
-        with world.lock:
-            interactive = [(kind, gid, ent.track.target, ent.avoid_until)
-                           for (kind, gid), ent in world.entity_items() if kind in ("npc", "warp")]
-        known_portals = {tuple(cell) for (source, _), cell in MAP_PORTALS.items() if source == snapshot.map}
-        known_portals.update(cell for (source, _), cell in KAFRA_STORAGE_PORTALS.items() if source == snapshot.map)
-        known_portals.update((portal["wx"], portal["wy"]) for portal in self.world_routes_data.get("portals", ())
-                             if portal["from_map"].lower() == snapshot.map)
-        interactive.extend(("warp", None, cell, 0.0) for cell in known_portals)
-
-        protected = []
-        for kind, gid, cell, avoid_until in interactive:
-            center = visible.pop(f"{kind}:{gid}", None)
-            if ((kind == "warp" and allowed_portal and math.dist(cell, allowed_portal) <= 2.5)
-                    or (kind == "npc" and allowed_npc is not None and gid == allowed_npc)):
-                continue
-            if center is None:
-                center = project(*cell, 5.5 if kind == "npc" else 1.2)
-            u, v = center
-            protected.append((cell, 4.0 if avoid_until > now else 2.5,
-                              (left + u * width, top + v * height)))
-        screen_only = [(left + u * width, top + v * height) for u, v in visible.values()]
+        entities = self._navigation_entities(snapshot.map)
+        portals, npcs = self._navigation_centers(snapshot.map, entities, allowed_npc)
+        portal_keys = {f"{kind}:{gid}": tuple(map(round, ent.track.target))
+                       for (kind, gid), ent in entities if ent.is_portal}
+        points = []
+        for item in snapshot.objects:
+            if item.key in portal_keys or item.kind == "warp":
+                if allowed_portal is None or portal_keys.get(item.key) != allowed_portal:
+                    points.append((item.u, item.v))
+            elif item.kind == "npc" and item.key != f"npc:{allowed_npc}":
+                points.append((item.u, item.v))
+        points.extend(project(*cell, 1.2) for cell in portals if cell != allowed_portal)
+        points.extend(project(*cell, 5.5) for cell in npcs)
+        protected = [(left + u * width, top + v * height) for u, v in points]
 
         def resolve(cell, uv=None):
             u, v = project(*cell) if uv is None else uv
             if not (0 <= u < 1 and 0 <= v < 1):
                 return None
             point = (left + int(u * width), top + int(v * height))
-            if self._is_point_in_game_ui(*point):
+            if (self._is_point_in_game_ui(*point) or self._is_point_in_vending_shop(*point)
+                    or self._is_point_in_hud(*point, margin=10)):
                 return None
-            if self._is_point_in_vending_shop(*point):
-                return None
-            if any(math.dist(cell, npc) <= radius or math.dist(point, center) <= 60
-                   for npc, radius, center in protected):
-                return None
-            if any(math.dist(point, center) <= 60 for center in screen_only):
+            # Inclui 5 px de retentativa e 3 px de tolerância do cursor.
+            if any(math.dist(point, center) < 36 for center in protected):
                 return None
             return point
 
         return resolve
+
+    def _navigation_click(self, snapshot, gat, cell, point, *, hwnd=None, target_point=None,
+                          retry_key=None, portal=None, npc=None, ground=True):
+        world = self.feed.world
+
+        def guarded_aim(lead):
+            with world.lock:
+                if (world.map != snapshot.map or world.player is None or world.is_map_loading
+                        or self.current_viewport != snapshot.viewport):
+                    return None
+                position = world.player.cell()
+            blocked, _ = self._navigation_obstacles(snapshot.map, gat, portal=portal, npc=npc)
+            if self._segment_hits_obstacle(*position, *cell, blocked):
+                return None
+            if ground and (gat is None or not self._has_gat_line_of_sight(*position, *cell, gat)):
+                return None
+            current_point = target_point(lead) if target_point else point
+            if current_point is None:
+                return None
+            left, top, width, height = snapshot.viewport
+            project = self.feed.camera.projector(snapshot.viewport, getattr(self.feed, "_cam", None) or position,
+                                                 gat.get_elevation if gat else flat_height)
+            resolve = self._safe_click_resolver(snapshot, project, allowed_portal=portal, allowed_npc=npc)
+            if ground:
+                return resolve(cell)
+            uv = (current_point[0] - left) / width, (current_point[1] - top) / height
+            return resolve(cell, uv)
+
+        if guarded_aim(getattr(self, "_sprite_click_lead", 0.085)) is None:
+            return False
+        sent = self.patrol_move_and_click(*point, hwnd=hwnd, target_point=guarded_aim, retry_key=retry_key)
+        if sent and portal is not None:
+            self._intentional_portal_click = snapshot.map, time.time() + 4.0
+        return sent
+
+    def _navigation_target_step(self, gat, position, target, uv, resolve, blocked, penalty_cells):
+        """Retorna o clique no alvo ou um ponto alcançável do caminho até ele."""
+        if target in blocked:
+            return None
+        if not (self._segment_hits_obstacle(*position, *target, blocked)
+                or (gat and gat.is_walkable(*target) and not self._has_gat_line_of_sight(*position, *target, gat))):
+            point = resolve(target, uv)
+            return (target, point, True) if point else None
+        if gat is None:
+            return None
+        path = gat.find_path(tuple(map(round, position)), target,
+                             blocked_cells=blocked, penalty_cells=penalty_cells)
+        stride = self._pick_walk_stride(
+            path, position, blocked, lambda cell: self._walk_ground_point(gat, position, cell, blocked, resolve))
+        return (*stride, False) if stride else None
 
     @staticmethod
     def _pick_long_stride_cell(path_cells, min_dist=9, max_dist=14, *, position=None, ground_point):
@@ -6429,20 +6498,23 @@ class Overlay:
 
     def _walk_ground_point(self, gat, position, cell, blocked, resolve):
         if (cell not in blocked and gat.is_walkable(*cell)
+                and not self._segment_hits_obstacle(*position, *cell, blocked)
                 and self._has_gat_line_of_sight(*position, *cell, gat)
                 and abs(gat.get_elevation(*position) - gat.get_elevation(*cell)) <= 16):
             return resolve(cell)
         return None
 
-    def _pick_walk_stride(self, path, position, ground_point, *, allow_short=False):
-        for minimum, maximum in ((9, 14), (2.2, 9), (1.0, 2.2)):
-            if minimum == 1.0 and not allow_short:
+    def _pick_walk_stride(self, path, position, blocked, ground_point):
+        start = tuple(map(round, position))
+        waypoint = None
+        for cell in path:
+            if cell == start:
+                continue
+            if math.dist(position, cell) > 14 or self._segment_hits_obstacle(*position, *cell, blocked):
                 break
-            if stride := self._pick_long_stride_cell(
-                path, minimum, maximum, position=position, ground_point=ground_point,
-            ):
-                return stride
-        return None
+            if point := ground_point(cell):
+                waypoint = cell, point
+        return waypoint
 
     def _pick_walk_retry(self, path, position, target, ground_point, *, previous_point=None, radius=2):
         start = tuple(map(round, position))
@@ -6567,7 +6639,7 @@ class Overlay:
             return 0
         return 1 if alignment >= -0.30 else 2
 
-    def _choose_patrol_waypoint(self, map_id, gat, position, blocked, now):
+    def _choose_patrol_waypoint(self, map_id, gat, position, blocked, penalties, now):
         distances, width, minimum = self._get_patrol_wall_clearance(map_id, gat)
         center = tuple(map(round, position))
         unexplored = []
@@ -6617,7 +6689,7 @@ class Overlay:
                 attempts_by_sector[sector] += 1
                 budget -= 1
                 path = gat.find_path(center, cell, blocked_cells=blocked,
-                                     cell_costs=wall_costs, max_iterations=2500)
+                                     penalty_cells=penalties, cell_costs=wall_costs, max_iterations=2500)
                 if len(path) > 1 and path[-1] == cell:
                     first_leg = path[min(len(path) - 1, 6)]
                     if self._patrol_turn(center, first_leg) < 2:
@@ -6638,7 +6710,7 @@ class Overlay:
             # Procura uma fronteira alcançável além da área local, inclusive atrás de curvas.
             self._patrol_frontier_retry_at = now + 3.0
             path = gat.find_path(
-                center, None, blocked_cells=blocked, cell_costs=wall_costs, max_iterations=14000,
+                center, None, blocked_cells=blocked, penalty_cells=penalties, cell_costs=wall_costs, max_iterations=14000,
                 goal_test=lambda cell: (cell not in self._patrol_scanned_ts
                                         and math.dist(center, cell) >= 6 and available(cell)),
             )
@@ -6697,22 +6769,31 @@ class Overlay:
             self._click_debug(f"PATROL bloqueado: terreno .gat de {curr_map} indisponível.")
             return
 
-        def click_patrol_ground(cell, point):
+        allowed_portal = self._patrol_portal_goal(curr_map)
+        directed_route = self.patrol_target_route
+        allowed_npc = (directed_route[3] if directed_route and allowed_portal is None
+                       and isinstance(directed_route[3], int) else None)
+        blocked, penalties = self._navigation_obstacles(curr_map, gat, portal=allowed_portal, npc=allowed_npc)
+
+        def click_patrol_ground(cell, point, *, sprite=False, finish_interaction=False):
             if self._patrol_combat_or_loot_pending(snapshot):
                 return False
             goal = self.nav_goal
             route = self.patrol_target_route
 
             def aim(_lead):
+                route_matches = (self.patrol_target_route == route
+                                 or (finish_interaction and self.patrol_target_route is None))
                 if (world.map != curr_map or not self._hud_can_run() or self.nav_goal != goal
-                        or self.patrol_target_route != route or not (goal or route or self.auto_patrol)
+                        or not route_matches or not (goal or route or self.auto_patrol)
                         or world.npc_dialog_active or world.npc_dialog.get("open")
                         or self._client_combat_blocks_ground(world, curr_map)):
                     return None
                 return point
 
-            return self.patrol_move_and_click(*point, hwnd=target_hwnd, target_point=aim,
-                                              retry_key=(curr_map, "ground", cell))
+            return self._navigation_click(snapshot, gat, cell, point, hwnd=target_hwnd, target_point=aim,
+                                          portal=allowed_portal, npc=allowed_npc, ground=not sprite,
+                                          retry_key=(curr_map, "ground", cell))
 
         # ── Helper de projeção (definido antes de qualquer uso) ──
         viewport = snapshot.viewport
@@ -6731,7 +6812,7 @@ class Overlay:
                 dist_ng = math.hypot(px - ng_x, py - ng_y)
                 is_manual = (getattr(self, "manual_nav_goal", None) is not None)
                 reach_thresh = 0.75 if minimap else 1.5 if is_manual else 2.0
-                if dist_ng <= reach_thresh:
+                if dist_ng <= reach_thresh and allowed_portal != (ng_x, ng_y):
                     self._click_debug(f"NAV_GOAL: Destino alcançado ({ng_x},{ng_y}) — encerrando.")
                     self.manual_nav_goal = None
                     self._minimap_goal = None
@@ -6741,14 +6822,15 @@ class Overlay:
                     return
                 # Usa apenas find_path, nunca pick_next_waypoint
                 goal = (ng_x, ng_y)
-                blocked = self._get_all_blocked_cells()
-                if minimap:
+                if goal in blocked:
+                    ng_path = []
+                elif minimap:
                     ng_path = self.current_patrol_path if self.current_waypoint == goal else []
                     if (not ng_path or min(math.dist((px, py), cell) for cell in ng_path) > 4.5
-                            or any(cell in blocked for cell in ng_path[1:15])):
-                        ng_path = self._find_minimap_path(gat, cur_cell, goal, blocked)
+                            or any(cell in blocked for cell in ng_path if cell != cur_cell)):
+                        ng_path = self._find_minimap_path(gat, cur_cell, goal, blocked, penalties)
                 else:
-                    ng_path = gat.find_path(cur_cell, goal, blocked_cells=blocked)
+                    ng_path = gat.find_path(cur_cell, goal, blocked_cells=blocked, penalty_cells=penalties)
                 if ng_path:
                     self.current_patrol_path = ng_path
                     self.current_waypoint = (ng_x, ng_y)
@@ -6767,11 +6849,16 @@ class Overlay:
                 if walk_route:
                     m_from, m_to, port_x, port_y = walk_route[0]
                     self.patrol_target_route = (m_from, port_x, port_y, "warp")
+                    allowed_portal = (port_x, port_y)
+                    blocked, penalties = self._navigation_obstacles(curr_map, gat, portal=allowed_portal)
                     self._click_debug(f"NAV_GOAL multi-mapa: Indo para portal {m_to} em ({port_x},{port_y})")
                 else:
                     self._click_debug(f"NAV_GOAL: Sem rota de {curr_map} para {norm_ng}")
                     self.nav_goal = None
                     return
+
+        resolve = self._safe_click_resolver(
+            snapshot, project, allowed_portal=allowed_portal, allowed_npc=allowed_npc)
 
         # ── Suporte a Rotas de Destino: (map_name, x, y, target_npc_or_warp) ──
         if self.patrol_target_route:
@@ -6780,46 +6867,36 @@ class Overlay:
             if curr_map == norm_r_map:
                 dist_to_route = math.hypot(px - r_x, py - r_y)
                 interact_dist = 3.8 if r_target else 2.5
-                if dist_to_route <= interact_dist:
-                    if r_target == "warp":
-                        gate_resolve = self._safe_click_resolver(snapshot, project, allowed_portal=(r_x, r_y))
-                        if point := gate_resolve((r_x, r_y)):
-                            click_patrol_ground((r_x, r_y), point)
-                        return
-                    if r_target:
-                        left, top, width, height = snapshot.viewport
-                        for item in snapshot.objects:
-                            if item.kind in ("npc", "warp"):
-                                if item.key.partition(":")[2] == str(r_target):
-                                    sprite_z = 5.5 if item.kind == "npc" else 1.2
-                                    u_tgt, v_tgt = project(r_x, r_y, sprite_z)
-                                    sx = left + int(u_tgt * width)
-                                    sy = top + int(v_tgt * height)
-                                    if self._is_point_in_game_ui(sx, sy):
-                                        self._side_step_to_reveal((r_x, r_y), px, py, from_patrol=True)
-                                        return
-                                    self._click_debug(f"PATROL: Interagindo com alvo na rota {item.key} em ({sx},{sy})")
-                                    if not self.patrol_move_and_click(sx, sy, hwnd=target_hwnd):
-                                        return
+                if dist_to_route <= interact_dist and self._last_patrol_click_target is None:
+                    item = next((obj for obj in snapshot.objects
+                                 if obj.kind in ("npc", "warp") and obj.key.partition(":")[2] == str(r_target)),
+                                None)
+                    if r_target == "warp" or item:
+                        target = r_x, r_y
+                        step = self._navigation_target_step(gat, (px, py), target, (item.u, item.v) if item else None,
+                                                            resolve, blocked, penalties)
+                        if step:
+                            cell, point, direct = step
+                            finish = bool(direct and item and allowed_portal is None)
+                            if click_patrol_ground(cell, point, sprite=direct and item is not None,
+                                                   finish_interaction=finish):
+                                if finish:
                                     self._hud_npc_line_target = (item.key, curr_map, now + 0.950)
                                     self.patrol_target_route = None
                                     self._reset_patrol(px, py)
-                                    return
+                                elif not direct:
+                                    self._last_patrol_click_target = (now, px, py, *cell, *point, 0)
+                        elif item and self._is_point_in_game_ui(
+                            left + int(item.u * width), top + int(item.v * height)
+                        ):
+                            self._side_step_to_reveal(target, px, py, from_patrol=True)
+                        return
                     self._click_debug(f"PATROL: Destino da rota alcançado ({r_x}, {r_y})")
                     self.patrol_target_route = None
                     self._reset_patrol(px, py)
 
-        allowed_portal = self._travel_allowed_portal
-        directed_route = self.patrol_target_route
-        if allowed_portal is None and directed_route and directed_route[3] == "warp":
-            allowed_portal = directed_route[1:3]
-        allowed_npc = (self._kafra_cycle.get("approach_npc") if self._kafra_cycle
-                       else directed_route[3] if directed_route and isinstance(directed_route[3], int) else None)
-        resolve = self._safe_click_resolver(
-            snapshot, project, allowed_portal=allowed_portal, allowed_npc=allowed_npc)
-
         def ground_point(cell):
-            return self._walk_ground_point(gat, (px, py), cell, self.temp_blocked_cells, resolve)
+            return self._walk_ground_point(gat, (px, py), cell, blocked, resolve)
 
         route_target = self.patrol_target_route and curr_map == self.patrol_target_route[0].lower().removesuffix(".gat")
         roaming = not route_target and self.nav_goal is None
@@ -6839,14 +6916,10 @@ class Overlay:
                     self._patrol_heading = dx / distance, dy / distance
             else:
                 self.temp_blocked_cells[failed] = now + 25.0
+                blocked.add(failed)
                 if attempts < 2:
-                    blocked = self._get_all_blocked_cells()
-
-                    def alternate_point(cell):
-                        return None if cell in blocked else ground_point(cell)
-
                     retry = self._pick_walk_retry(
-                        self.current_patrol_path, (px, py), failed, alternate_point, previous_point=(sx, sy),
+                        self.current_patrol_path, (px, py), failed, ground_point, previous_point=(sx, sy),
                     )
                     if retry:
                         cell, point = retry
@@ -6873,7 +6946,6 @@ class Overlay:
                 self._reset_patrol(px, py)
                 self.active_nav_path = None
             next_path = None
-            blocked = self._get_all_blocked_cells()
             if route_target:
                 next_wp = (int(self.patrol_target_route[1]), int(self.patrol_target_route[2]))
             elif getattr(self, "nav_goal", None) is not None:
@@ -6883,15 +6955,15 @@ class Overlay:
                 self.active_nav_color = "#A78BFA"  # Roxo = nav_goal
             else:
                 next_wp, next_path = self._choose_patrol_waypoint(
-                    curr_map, gat, (px, py), blocked, now,
+                    curr_map, gat, (px, py), blocked, penalties, now,
                 )
                 self.active_nav_color = "#38BDF8"  # Ciano = Auto-Patrol
             if next_wp:
                 self.current_waypoint = next_wp
                 if minimap:
-                    next_path = self._find_minimap_path(gat, cur_cell, next_wp, blocked)
+                    next_path = self._find_minimap_path(gat, cur_cell, next_wp, blocked, penalties)
                 elif next_path is None:
-                    next_path = gat.find_path((px, py), next_wp, blocked_cells=blocked)
+                    next_path = gat.find_path((px, py), next_wp, blocked_cells=blocked, penalty_cells=penalties)
                 self.current_patrol_path = next_path or []
                 self.active_nav_path = list(self.current_patrol_path)
                 # Preserva a cor já definida por nav_goal se aplicável
@@ -6904,9 +6976,10 @@ class Overlay:
                 self._click_debug("PATROL bloqueado: nenhum waypoint caminhável disponível.")
                 return
 
+        if any(cell in blocked for cell in self.current_patrol_path if cell != cur_cell):
+            self.current_patrol_path = []
         if not self.current_patrol_path:
-            blocked = self._get_all_blocked_cells()
-            path = gat.find_path(cur_cell, self.current_waypoint, blocked_cells=blocked)
+            path = gat.find_path(cur_cell, self.current_waypoint, blocked_cells=blocked, penalty_cells=penalties)
             if not path or (roaming and path[-1] != self.current_waypoint):
                 self._click_debug(f"PATROL bloqueado: A* sem rota até {self.current_waypoint}.")
                 if roaming:
@@ -6931,15 +7004,14 @@ class Overlay:
             if closest_idx > 0 and min_dist_to_path <= 4.0:
                 self.current_patrol_path = self.current_patrol_path[closest_idx:]
 
-            # Remove os nós iniciais que o jogador já alcançou (distância <= 1.8 células)
-            prune_radius = 0.75 if minimap else 1.8
-            while self.current_patrol_path and math.dist(self.current_patrol_path[0], (px, py)) <= prune_radius:
+            while self.current_patrol_path and self.current_patrol_path[0] == cur_cell:
                 self.current_patrol_path.pop(0)
 
             # Se o personagem se desviou muito da rota (> 4.5 células), recalcula a partir de onde ele está
             if min_dist_to_path > 4.5 and self.current_waypoint:
                 cur_cell_p = (int(round(px)), int(round(py)))
-                recalc_p = gat.find_path(cur_cell_p, self.current_waypoint, blocked_cells=self._get_all_blocked_cells())
+                recalc_p = gat.find_path(cur_cell_p, self.current_waypoint,
+                                         blocked_cells=blocked, penalty_cells=penalties)
                 if recalc_p:
                     self.current_patrol_path = recalc_p
                     self.active_nav_path = list(recalc_p)
@@ -6948,8 +7020,7 @@ class Overlay:
             self.current_waypoint = None
             return
 
-        stride = self._pick_walk_stride(self.current_patrol_path, (px, py), ground_point,
-                                        allow_short=roaming or minimap)
+        stride = self._pick_walk_stride(self.current_patrol_path[:15], (px, py), blocked, ground_point)
         if stride is None:
             self._click_debug("PATROL bloqueado: nenhum passo caminhável pode ser clicado no viewport.")
             if roaming:
@@ -7000,59 +7071,190 @@ class Overlay:
             fg = u32.GetForegroundWindow()
         return self._window_pid(fg) == self._own_pid
 
-    def _get_warp_positions(self):
-        """Retorna lista de coordenadas (wx, wy) de todos os portais ativos (job == 45 ou kind == 'warp')."""
-        warps = []
-        if hasattr(self.feed, "world") and self.feed.world:
-            with self.feed.world.lock:
-                for (k, _aid), ent in self.feed.world.entity_items():
-                    if k == "warp" or getattr(ent, "catalog_id", None) == 45:
-                        pos = getattr(ent.track, "target", None) or ent.track.cell(time.monotonic())
-                        if pos:
-                            warps.append((pos[0], pos[1]))
-        return warps
 
-    def _get_portal_blocked_cells(self, radius=5.5, allow_current_goal=True):
-        """Retorna conjunto de células a <= 5.5 de qualquer portal (job == 45 ou kind == 'warp'),
-        bloqueando no A*, no Auto-Patrol e nos passos de fuga/desvio, exceto se for o nav_goal do usuário."""
-        blocked = set()
-        if not hasattr(self.feed, "world") or not self.feed.world:
-            return blocked
-        ng = self.nav_goal if allow_current_goal else None
-        tp_portal = self._travel_allowed_portal if allow_current_goal else None
-        limit = math.ceil(radius)
-        with self.feed.world.lock:
-            for (k, _aid), ent in self.feed.world.entity_items():
-                if k == "warp" or getattr(ent, "catalog_id", None) == 45:
-                    pos = getattr(ent.track, "target", None) or ent.track.cell(time.monotonic())
-                    if not pos:
-                        continue
-                    wx, wy = pos[0], pos[1]
-                    if tp_portal is not None:
-                        if math.hypot(wx - tp_portal[0], wy - tp_portal[1]) <= 2.5:
-                            continue  # Portal alvo da etapa atual liberado (todos os outros mantidos bloqueados a 5.5)
-                    elif ng is not None:
-                        _, ng_x, ng_y = ng
-                        if math.hypot(wx - ng_x, wy - ng_y) <= 1.5:
-                            continue  # Portal é o destino explícito do usuário
-                    for dx in range(-limit, limit + 1):
-                        for dy in range(-limit, limit + 1):
-                            if math.hypot(dx, dy) <= radius:
-                                blocked.add((int(round(wx)) + dx, int(round(wy)) + dy))
-        return blocked
+    def _segment_hits_obstacle(self, x0, y0, x1, y1, blocked_cells):
+        if not blocked_cells:
+            return False
+        x, y, end_x, end_y = map(round, (x0, y0, x1, y1))
+        if (end_x, end_y) in blocked_cells:
+            return True
+        dx, dy = abs(end_x - x), abs(end_y - y)
+        sx, sy = (1 if x < end_x else -1), (1 if y < end_y else -1)
+        ix = iy = 0
+        while ix < dx or iy < dy:
+            cross_x = (2 * ix + 1) * dy
+            cross_y = (2 * iy + 1) * dx
+            if cross_x == cross_y and ((x + sx, y) in blocked_cells or (x, y + sy) in blocked_cells):
+                return True
+            if cross_x <= cross_y:
+                x += sx
+                ix += 1
+            if cross_x >= cross_y:
+                y += sy
+                iy += 1
+            if (x, y) in blocked_cells:
+                return True
+        return False
 
-    def _npc_dialog_blocked_cells(self, now):
-        world = self.feed.world
+    def _registered_portal_cells(self, map_name):
+        cells = {tuple(cell) for (source, _), cell in MAP_PORTALS.items() if source == map_name}
+        cells.update(tuple(cell) for (source, _), cell in KAFRA_STORAGE_PORTALS.items() if source == map_name)
+        cells.update((int(row["wx"]), int(row["wy"])) for row in self.world_routes_data.get("portals", ())
+                     if row["from_map"].lower() == map_name)
+        cells.update((int(x), int(y)) for source, _, x, y, _, _ in
+                     self.world_routes_data.get("reference_portals", ()) if source.lower() == map_name)
+        cells.update(tuple(cell) for link, cell in self._learned_warps.items()
+                     if link.partition("->")[0] == map_name and "->" in link
+                     and isinstance(cell, (list, tuple)) and len(cell) == 2
+                     and all(type(coord) is int for coord in cell))
+        triggers = self._learned_warps.get("portal_guard", {}).get(map_name, {})
+        cells.update(tuple(portal) for portal in triggers.values()
+                     if isinstance(portal, (list, tuple)) and len(portal) == 2
+                     and all(type(coord) is int for coord in portal))
+        return cells
+
+    def _navigation_centers(self, map_name, entities, allowed_target_id=None):
+        portals = self._registered_portal_cells(map_name)
+        npcs = set()
+        allowed_cells = set()
+        for (_, entity_id), entity in entities:
+            if entity.is_portal:
+                portals.add(tuple(map(round, entity.track.target)))
+            elif entity.objecttype in (1, 6) or entity.is_kafra:
+                cell = tuple(map(round, entity.track.target))
+                if entity_id == allowed_target_id:
+                    allowed_cells.add(cell)
+                else:
+                    npcs.add(cell)
+
+        world = getattr(self.feed, "world", None)
+        locations = list(self._kafra_locations_for_map(map_name, self._navigation_kafras))
+        if world and (discovered := world.kafras_discovered.get(map_name)):
+            locations.append(discovered)
+        for location in locations:
+            cell = int(location["x"]), int(location["y"])
+            if all(math.dist(cell, allowed) > 2.0 for allowed in allowed_cells):
+                npcs.add(cell)
+        return portals, npcs
+
+    def _portal_boxes(self, map_name, gat, portals, allowed_portal_cell=None):
+        triggers = self._learned_warps.get("portal_guard", {}).get(map_name, {})
+        boxes = {}
+        attached = []
+        for key, portal in triggers.items():
+            try:
+                x, y = map(int, key.split(","))
+            except (AttributeError, ValueError):
+                continue
+            if isinstance(portal, (list, tuple)) and len(portal) == 2 and all(type(n) is int for n in portal):
+                center = tuple(portal)
+                portals.add(center)
+                attached.append((center, x, y))
+            elif (x, y) != allowed_portal_cell:
+                boxes[(x, y)] = (x - 1, y - 1, x + 1, y + 1)
+
+        for x, y in portals:
+            if (x, y) == allowed_portal_cell:
+                continue
+            radius = 3 if gat and (x <= 35 or x >= gat.width - 35 or y <= 35 or y >= gat.height - 35) else 2
+            boxes[(x, y)] = (x - radius, y - radius, x + radius, y + radius)
+        for center, x, y in attached:
+            if center != allowed_portal_cell:
+                left, bottom, right, top = boxes[center]
+                boxes[center] = min(left, x), min(bottom, y), max(right, x), max(top, y)
+        return boxes
+
+    def _build_navigation_obstacles(self, map_name, entities, gat, allowed_target_id=None, allowed_portal_cell=None):
+        portals, npcs = self._navigation_centers(map_name, entities, allowed_target_id)
+        blocked_cells = set()
+        penalty_cells = {}
+
+        def add_box(box, ring, cost):
+            left, bottom, right, top = box
+            x_range = range(max(0, left - ring), min(gat.width, right + ring + 1) if gat else right + ring + 1)
+            y_range = range(max(0, bottom - ring), min(gat.height, top + ring + 1) if gat else top + ring + 1)
+            for x in x_range:
+                for y in y_range:
+                    cell = x, y
+                    if left <= x <= right and bottom <= y <= top:
+                        blocked_cells.add(cell)
+                    else:
+                        penalty_cells[cell] = max(cost, penalty_cells.get(cell, 0.0))
+
+        for box in self._portal_boxes(map_name, gat, portals, allowed_portal_cell).values():
+            add_box(box, 2, 6.0)
+        for x, y in npcs:
+            add_box((x - 1, y - 1, x + 1, y + 1), 1, 5.0)
+        for cell in blocked_cells:
+            penalty_cells.pop(cell, None)
+        return blocked_cells, penalty_cells
+
+    def _navigation_entities(self, map_name):
+        world = getattr(self.feed, "world", None)
+        if world is None:
+            return ()
         with world.lock:
-            centers = [ent.track.target for (kind, _), ent in world.entity_items()
-                       if kind == "npc" and ent.avoid_until > now]
-        return {(round(x) + dx, round(y) + dy) for x, y in centers
-                for dx in range(-4, 5) for dy in range(-4, 5) if math.hypot(dx, dy) <= 4}
+            return tuple(world.entity_items()) if world.map == map_name else ()
 
-    def _get_all_blocked_cells(self):
+    def _navigation_obstacles(self, map_name, gat, *, portal=None, npc=None):
+        entities = self._navigation_entities(map_name)
+        blocked, penalties = self._build_navigation_obstacles(
+            map_name, entities, gat, allowed_target_id=npc, allowed_portal_cell=portal)
         now = time.monotonic()
-        temporary = {cell for cell, until in self.temp_blocked_cells.items() if until > now}
-        return temporary | self._get_portal_blocked_cells(radius=2.5) | self._npc_dialog_blocked_cells(now)
+        blocked.update(cell for cell, until in tuple(self.temp_blocked_cells.items())
+                       if until > now and cell != portal)
+        for (kind, gid), ent in entities:
+            if kind == "npc" and not ent.is_portal and gid != npc and ent.avoid_until > now:
+                x, y = map(round, ent.track.target)
+                blocked.update(self._patrol_cells_in_radius(x, y, 4))
+        return blocked, penalties
+
+    def _is_intentional_warp(self, event, portal_ids):
+        if self.travel_plan or self._city_travel_state or self._travel_allowed_portal or self._kafra_cycle:
+            return True
+        retreat = self._retreat_click
+        if retreat and retreat[-1]:
+            return True
+        map_name = event["map"]
+        recent = self._intentional_portal_click
+        if recent and map_name == recent[0] and event["ts"] <= recent[1]:
+            return True
+        route = self.patrol_target_route
+        return bool(route and route[0].lower().removesuffix(".gat").removesuffix(".rsw") == map_name
+                    and (route[3] == "warp" or route[3] in portal_ids))
+
+    def _learn_accidental_warp(self, snapshot):
+        event = snapshot.last_warp_from
+        if not event or event["ts"] <= self._last_warp_seen:
+            return
+        self._last_warp_seen = event["ts"]
+        portals, intentional = snapshot.warp_context
+        if intentional:
+            return
+        map_name = event["map"]
+        cell = event["x"], event["y"]
+        portal = min(portals, key=lambda center: math.dist(cell, center), default=None)
+        try:
+            saved = save_portal_trigger(map_name, cell, portal)
+        except OSError as exc:
+            print(f"[PortalGuard] Falha ao gravar learned_warps.json: {exc}", flush=True)
+            return
+        if saved:
+            self._learned_warps = load_learned_warps()
+            print(f"[PortalGuard] Célula de teleporte aprendida em {map_name} ({cell[0]},{cell[1]})", flush=True)
+
+    def _patrol_portal_goal(self, map_name):
+        route = self.patrol_target_route
+        if route and route[0].lower().removesuffix(".gat").removesuffix(".rsw") == map_name:
+            if route[3] == "warp" or any(
+                entity.is_portal and gid == route[3] for (_, gid), entity in self._navigation_entities(map_name)
+            ):
+                return tuple(route[1:3])
+        return None
+
+    def _visible_portal_cells(self, map_name):
+        return {tuple(map(round, ent.track.target)) for _, ent in self._navigation_entities(map_name)
+                if ent.is_portal}
 
     def _clear_patrol_route(self):
         """Limpa imediatamente todas as rotas e waypoints do Patrol e força redesenho do overlay."""
@@ -7199,9 +7401,8 @@ class Overlay:
         target_hwnd = getattr(vp_obj, "handle", None) if vp_obj else None
         target_hwnd = self.get_game_hwnd(target_hwnd)
         snap = self.feed.current()
-        if not snap:
+        if not snap or snap.map != curr_map:
             return False
-        left, top, width, height = snap.viewport
         cam_pos = getattr(self.feed, "_cam", None) or (px, py)
         height_fn = getattr(gat, "get_elevation", gat.height_at)
         project = self.feed.camera.projector(snap.viewport, cam_pos, height_fn)
@@ -7215,7 +7416,8 @@ class Overlay:
         else:
             perp_dx, perp_dy = -dy / dist, dx / dist
 
-        portal_blocked = self._get_portal_blocked_cells()
+        blocked, _ = self._navigation_obstacles(curr_map, gat)
+        resolve = self._safe_click_resolver(snap, project)
         candidates = []
         for sign in (1, -1):
             for step_r in (2.3, 2.8, 3.2):
@@ -7223,16 +7425,11 @@ class Overlay:
                 sy_cell = int(round(py + perp_dy * step_r * sign))
                 if not (0 <= sx_cell < gat.width and 0 <= sy_cell < gat.height):
                     continue
-                if not gat.is_walkable(sx_cell, sy_cell):
-                    continue
-                if (sx_cell, sy_cell) in getattr(self, "temp_blocked_cells", {}) or (sx_cell, sy_cell) in portal_blocked:
-                    continue
                 u_cand, v_cand = project(sx_cell, sy_cell)
                 if 0.15 <= u_cand <= 0.85 and 0.15 <= v_cand <= 0.85:
-                    screen_x = left + int(u_cand * width)
-                    screen_y = top + int(v_cand * height)
-                    if not self._is_point_in_game_ui(screen_x, screen_y):
-                        candidates.append((sx_cell, sy_cell, screen_x, screen_y))
+                    cell = sx_cell, sy_cell
+                    if point := self._walk_ground_point(gat, (px, py), cell, blocked, resolve):
+                        candidates.append((cell, point))
                         break
             if candidates:
                 break
@@ -7246,28 +7443,23 @@ class Overlay:
                 cy_c = int(round(py + dir_y * step_r))
                 if not (0 <= cx_c < gat.width and 0 <= cy_c < gat.height):
                     continue
-                if not gat.is_walkable(cx_c, cy_c):
-                    continue
-                if (cx_c, cy_c) in getattr(self, "temp_blocked_cells", {}) or (cx_c, cy_c) in portal_blocked:
-                    continue
                 u_c, v_c = project(cx_c, cy_c)
                 if 0.25 <= u_c <= 0.75 and 0.25 <= v_c <= 0.75:
-                    sc_x = left + int(u_c * width)
-                    sc_y = top + int(v_c * height)
-                    if not self._is_point_in_game_ui(sc_x, sc_y):
-                        candidates.append((cx_c, cy_c, sc_x, sc_y))
+                    cell = cx_c, cy_c
+                    if point := self._walk_ground_point(gat, (px, py), cell, blocked, resolve):
+                        candidates.append((cell, point))
                         break
 
         if candidates:
-            sx_c, sy_c, sc_x, sc_y = candidates[0]
-            self._click_debug(f"PASSO DESLOCAMENTO CÂMERA: movendo char para ({sx_c},{sy_c}) para tirar alvo de trás da interface")
+            cell, point = candidates[0]
+            self._click_debug(f"PASSO DESLOCAMENTO CÂMERA: movendo char para {cell} para tirar alvo de trás da interface")
 
             def aim(_lead):
                 if not self._client_combat_blocks_ground(self.feed.world, snap.map):
-                    return sc_x, sc_y
+                    return point
 
-            return self.patrol_move_and_click(sc_x, sc_y, hwnd=target_hwnd,
-                                              target_point=aim if from_patrol else None)
+            return self._navigation_click(snap, gat, cell, point, hwnd=target_hwnd,
+                                          target_point=aim if from_patrol else None)
         return False
 
     def _project_ground_cell(self, snapshot, gx, gy, sprite_z=0.0):
@@ -7341,8 +7533,11 @@ class Overlay:
     def _eligible_drops(self, snapshot, position, entities, now):
         candidates = []
         wall_now = time.time()
+        terrain = getattr(self.feed, "terrain", None)
+        gat = terrain.cached_gats.get(snapshot.map) if terrain else None
+        blocked, _ = self._navigation_obstacles(snapshot.map, gat)
         for (kind, gid), drop in entities:
-            if kind != "drop" or drop.ignore_until > now:
+            if kind != "drop" or drop.ignore_until > now or tuple(map(round, drop.track.target)) in blocked:
                 continue
             name = self.names.get("drop", {}).get(drop.catalog_id, "").strip().lower()
             tier = self.classify_item_tier(drop.catalog_id, name)
@@ -7403,17 +7598,20 @@ class Overlay:
             return False
 
         start, target = tuple(map(round, position)), tuple(map(round, cell))
-        check = snapshot.map, start, target, attack_range
+        blocked, penalties = self._build_navigation_obstacles(
+            snapshot.map, self._navigation_entities(snapshot.map), gat)
+        check = snapshot.map, start, target, attack_range, frozenset(blocked)
         if self._farm_reachability_check == check:
             return False
         self._farm_reachability_check = check
 
         def within_attack_range(ground):
             return (max(abs(ground[0] - target[0]), abs(ground[1] - target[1])) <= attack_range
+                    and not self._segment_hits_obstacle(*ground, *target, blocked)
                     and self._has_gat_line_of_sight(*ground, *target, gat))
 
-        # Considera apenas o terreno para que bloqueios temporários não encerrem a trava.
         return not gat.find_path(start, None, goal_test=within_attack_range,
+                                 blocked_cells=blocked, penalty_cells=penalties,
                                  max_iterations=8 * gat.width * gat.height + 1)
 
     def _sync_client_farm_target(self, world, map_id):
@@ -7539,13 +7737,14 @@ class Overlay:
     def _path_cost(path):
         return sum(14 if a[0] != b[0] and a[1] != b[1] else 10 for a, b in zip(path, path[1:]))
 
-    def _approach_path(self, gat, start, target_cell, blocked, *, ring=None):
+    def _approach_path(self, gat, start, target_cell, blocked, penalties, *, ring=None):
         if gat is None:
             return []
         if ring is None:
-            path = gat.find_path(start, target_cell, blocked_cells=blocked)
+            path = gat.find_path(start, target_cell, blocked_cells=blocked, penalty_cells=penalties)
             return path if path and path[-1] == target_cell else []
-        return gat.find_path(start, None, blocked_cells=blocked, max_iterations=3500, goal_test=ring)
+        return gat.find_path(start, None, blocked_cells=blocked, penalty_cells=penalties,
+                             max_iterations=3500, goal_test=ring)
 
     def _live_sprite_aim(self, key, map_id, viewport, height, expected, at):
         world = self.feed.world
@@ -7730,6 +7929,9 @@ class Overlay:
         viewport = snapshot.viewport
         project = self.feed.camera.projector(viewport, getattr(self.feed, "_cam", None) or position, height)
         resolve = self._safe_click_resolver(snapshot, project)
+        nav_blocked, penalties = self._navigation_obstacles(snapshot.map, gat)
+        if target_cell in nav_blocked:
+            return pause_target()
         aim_at = time.perf_counter() + getattr(self, "_sprite_click_lead", 0.085)
 
         def aim(at):
@@ -7738,6 +7940,10 @@ class Overlay:
         visible = any(obj.key == f"{kind}:{gid}" for obj in snapshot.objects)
         planned = aim(aim_at) if visible else None
         aimed_cell, uv = planned if planned is not None else (cell, None)
+        aimed_tile = tuple(map(round, aimed_cell))
+        if aimed_tile in nav_blocked:
+            return pause_target()
+        obstacle_between = self._segment_hits_obstacle(*position, *aimed_cell, nav_blocked)
         point = resolve(aimed_cell, uv) if uv is not None else None
         protected_target = visible and point is None
 
@@ -7760,6 +7966,11 @@ class Overlay:
             if latest is None:
                 return None
             cell_now, uv_now = latest
+            with world.lock:
+                player_now = world.player.cell() if world.player else position
+            blocked_now, _ = self._navigation_obstacles(snapshot.map, gat)
+            if self._segment_hits_obstacle(*player_now, *cell_now, blocked_now):
+                return None
             screen_now = resolve(cell_now, uv_now)
             if screen_now and not self._is_point_in_hud(*screen_now, margin=10):
                 return screen_now
@@ -7785,7 +7996,8 @@ class Overlay:
             target_point = current_target_point if phase == "direct" else ground_target_point
             retry_key = ((snapshot.map, kind, gid, live.created_at) if phase == "direct"
                          else (snapshot.map, "ground", ground))
-            if not self.patrol_move_and_click(*screen, hwnd=hwnd, target_point=target_point, retry_key=retry_key):
+            if not self._navigation_click(snapshot, gat, ground, screen, hwnd=hwnd,
+                                          target_point=target_point, retry_key=retry_key, ground=phase != "direct"):
                 if pickup:
                     with world.lock:
                         if world.pending_pickup and world.pending_pickup[:2] == (gid, clicked_at):
@@ -7810,7 +8022,7 @@ class Overlay:
         direct_range = 7 if kind == "drop" else 13
         direct_line = (self._has_gat_line_of_sight(*position, *aimed_cell, gat)
                        if gat else distance <= (3.0 if priority_loot else 2.2))
-        aimed_tile = tuple(map(round, aimed_cell))
+        direct_line = direct_line and not obstacle_between
         if kind == "drop":
             distance = math.dist(position, cell)
             pickup_range = 3.0 if priority_loot else 2.0
@@ -7819,12 +8031,11 @@ class Overlay:
                     return True
                 if gat is None:
                     return pause_target()
-                blocked = self._get_all_blocked_cells()
                 nearby = ((start[0] + dx, start[1] + dy) for dx, dy in
                           ((1, 0), (-1, 0), (0, 1), (0, -1)))
                 for step in sorted(nearby, key=lambda step: math.dist(step, cell)):
-                    if (math.dist(step, cell) <= 2.0 and step not in blocked
-                            and gat.is_walkable(*step) and (screen := resolve(step))):
+                    if (math.dist(step, cell) <= 2.0
+                            and (screen := self._walk_ground_point(gat, position, step, nav_blocked, resolve))):
                         click(step, screen, "reposition")
                         if state["pending"]:
                             state["loot_lateral_used"] = True
@@ -7841,7 +8052,7 @@ class Overlay:
                     return True
                 self.active_nav_path = None
                 return click(aimed_tile, point, "direct")
-            if walking or direct_only:
+            if walking or (direct_only and not obstacle_between):
                 return True
             if gat is None or len(state["failed"]) >= 3:
                 return pause_target()
@@ -7851,21 +8062,17 @@ class Overlay:
         if can_aim and not reposition:
             self.active_nav_path = None
             return click(aimed_tile, point, "direct")
-        if reposition and direct_only and gat is not None:
+        if reposition and direct_only and gat is not None and not obstacle_between:
             return True
-        if direct_only or gat is None or (walking and failed is None and not reposition):
+        if (direct_only and not obstacle_between) or gat is None or (walking and failed is None and not reposition):
             return pause_target() if failed or reposition else release()
 
-        blocked = self._get_all_blocked_cells() | state["failed"] | {target_cell}
+        blocked = nav_blocked | state["failed"] | {target_cell}
 
         def ground_point(ground):
-            if ground in blocked or not gat.is_walkable(*ground):
-                return None
-            if not self._has_gat_line_of_sight(*position, *ground, gat):
-                return None
-            return resolve(ground)
+            return self._walk_ground_point(gat, position, ground, blocked, resolve)
 
-        if reposition:
+        if reposition and not obstacle_between:
             nearby = sorted(
                 ((target_cell[0] + dx, target_cell[1] + dy)
                  for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy),
@@ -7884,13 +8091,16 @@ class Overlay:
 
         def ring(ground):
             return (ground != start and ground not in blocked and ring_min <= math.dist(ground, cell) <= ring_max
-                    and (resolve(ground) is not None if protected_target
-                         else self._has_gat_line_of_sight(*ground, *cell, gat)))
+                    and not self._segment_hits_obstacle(*ground, *cell, nav_blocked)
+                    and self._has_gat_line_of_sight(*ground, *cell, gat)
+                    and (not protected_target or resolve(ground) is not None))
 
-        path = self._approach_path(gat, start, target_cell, blocked, ring=ring)
+        path = self._approach_path(gat, start, target_cell, blocked, penalties, ring=ring)
         self.active_nav_path = path or None
         self.active_nav_color = "#F87171" if kind == "mob" else "#FBBF24"
-        if failed:
+        if obstacle_between:
+            stride = self._pick_walk_stride(path[:15], position, blocked, ground_point)
+        elif failed:
             stride = self._pick_long_stride_cell(path, 6, 8, position=position, ground_point=ground_point)
             if stride is None:
                 stride = next(((ground, screen) for ground in self._retry_lateral_cells(failed, position)
@@ -7898,7 +8108,7 @@ class Overlay:
         else:
             stride = self._pick_long_stride_cell(path, position=position, ground_point=ground_point)
         if stride is None:
-            stride = self._pick_long_stride_cell(path, 1, 9, position=position, ground_point=ground_point)
+            stride = self._pick_walk_stride(path[:15], position, blocked, ground_point)
         if stride:
             return click(*stride, "approach")
         return pause_target()
@@ -9156,17 +9366,22 @@ class Overlay:
         terrain = getattr(self.feed, "terrain", None)
         gat = terrain.for_map(world.map) if terrain and world.map else None
         start = tuple(round(coord) for coord in position)
-        blocked = self._get_all_blocked_cells()
+        blocked, penalties = self._navigation_obstacles(snapshot.map, gat)
         ranked = []
         for gid, mob, cell, distance, active, attacking_player in candidates:
             target_cell = tuple(round(coord) for coord in cell)
+            if target_cell in blocked:
+                continue
             cost = distance * 10
-            if gat and not direct_only and not self._has_gat_line_of_sight(*start, *target_cell, gat):
-                path = self._approach_path(gat, start, target_cell, blocked)
+            if gat and not direct_only and (not self._has_gat_line_of_sight(*start, *target_cell, gat)
+                                            or self._segment_hits_obstacle(*start, *target_cell, blocked)):
+                path = self._approach_path(gat, start, target_cell, blocked, penalties)
                 if path:
-                    cost = self._path_cost(path)
+                    cost = self._path_cost(path) + sum(penalties.get(step, 0.0) for step in path[1:])
             ranked.append((not attacking_player, defense and not active, cost, gid, distance, mob))
 
+        if not ranked:
+            return False
         _, _, _, gid, distance, mob = min(ranked)
         self._locked_farm_target_id = self._locked_mob_gid = gid
         self._farm_lock_started_at = now
@@ -9337,6 +9552,7 @@ class Overlay:
             return
 
         height_fn = flat_height
+        gat = None
         terrain = getattr(self.feed, "terrain", None)
         if terrain:
             try:
@@ -9354,6 +9570,24 @@ class Overlay:
                 return None
             u, v = result
             return u * width, v * height
+
+        if self._show_warps.get():
+            portals = self._visible_portal_cells(snapshot.map) | self._registered_portal_cells(snapshot.map)
+            allowed = self._travel_allowed_portal or self._patrol_portal_goal(snapshot.map)
+            for left, bottom, right, top in self._portal_boxes(snapshot.map, gat, portals, allowed).values():
+                if not (left - 28 <= player_cell[0] <= right + 28 and bottom - 28 <= player_cell[1] <= top + 28):
+                    continue
+                if gat:
+                    left, bottom = max(left, 0), max(bottom, 0)
+                    right, top = min(right, gat.width - 1), min(top, gat.height - 1)
+                if left > right or bottom > top:
+                    continue
+                corners = [(left - .5, bottom - .5), (right + .5, bottom - .5),
+                           (right + .5, top + .5), (left - .5, top + .5)]
+                outline = [pixels(cell, 0.5) for cell in corners + corners[:1]]
+                if all(outline):
+                    self.canvas_pool.get_line(*(value for point in outline for value in point),
+                                              fill="#ff6347", width=2, dash=(5, 4))
 
         if self._show_routes.get():
             retreating = self._survival_state == SURVIVAL_RETREAT
@@ -9411,7 +9645,7 @@ class Overlay:
         return int(u * width), int(v * height)
 
     def _draw_overlay_label(self, width, height, occupied, x, y, label, color, *,
-                            font_size=8, padding=(4, 2), outline=None):
+                            font_size=8, padding=(4, 2), outline=None, fixed=False):
         margin, gap = 2, 3
         pad_x, pad_y = padding
         text = self.canvas_pool.get_text(
@@ -9444,22 +9678,26 @@ class Overlay:
                 candidates.append(max(first, wanted_top))
             return min(candidates, key=lambda top: abs(top - wanted_top), default=None)
 
-        left = wanted_left
-        top = nearest_free_top(left)
-        if top is None:
-            # Se a coluna estiver cheia, procura espaço ao lado das caixas já desenhadas.
-            side_positions = {margin, max_left}
-            for _, _, other_left, other_right in occupied:
-                side_positions.add(other_left - gap - box_width)
-                side_positions.add(other_right + gap)
-            for left in sorted(side_positions, key=lambda pos: (abs(pos - wanted_left), pos)):
-                if margin <= left <= max_left:
+        if fixed:
+            left, top = x1 - pad_x, y1 - pad_y
+        else:
+            left = wanted_left
+            top = nearest_free_top(left)
+            if top is None:
+                # Se a coluna estiver cheia, procura espaço ao lado das caixas já desenhadas.
+                side_positions = {margin, max_left}
+                for _, _, other_left, other_right in occupied:
+                    side_positions.add(other_left - gap - box_width)
+                    side_positions.add(other_right + gap)
+                for left in sorted(side_positions, key=lambda pos: (abs(pos - wanted_left), pos)):
+                    if not margin <= left <= max_left:
+                        continue
                     top = nearest_free_top(left)
                     if top is not None:
                         break
-        if top is None:
-            self.canvas.itemconfigure(text, state="hidden")
-            return
+            if top is None:
+                self.canvas.itemconfigure(text, state="hidden")
+                return
 
         right, bottom = left + box_width, top + box_height
         insort(occupied, (top, bottom, left, right))
@@ -9564,6 +9802,13 @@ class Overlay:
                 self.canvas_pool.get_oval(ax - 4, ay - 4, ax + 4, ay + 4, outline="#0D9488", width=1)
             else:
                 is_locked_mob = (self._locked_mob_gid is not None and item.key == f"mob:{self._locked_mob_gid}")
+                if item.destination_uv is not None:
+                    dx, dy = self._projection_pixels(*item.destination_uv, width, height)
+                    trail_color = "#D99441" if is_locked_mob else "#D28B7E"
+                    self.canvas_pool.get_line(ax, ay, dx, dy, fill=trail_color, width=1)
+                    if 0 <= dx < width and 0 <= dy < height:
+                        self.canvas_pool.get_oval(dx - 2, dy - 2, dx + 2, dy + 2,
+                                                  fill=trail_color, outline="", width=0, dash=())
                 if is_locked_mob:
                     color = "#FFA500"  # Laranja vibrante para o mob em foco
                     self.canvas_pool.get_rect(cx - 7, cy - 7, cx + 7, cy + 7, outline=color, width=2, fill="", dash=())
@@ -9580,15 +9825,12 @@ class Overlay:
                 text_x, text_y = self._projection_pixels(*item.tag_uv, width, height)
             if not (0 <= text_x < width and 0 <= text_y < height):
                 continue
-            entry = EntityOverlayLabel(text_x, text_y, label, color, item.amount)
-            if item.kind in ("mob", "drop"):
-                ownership = item.ownership if item.kind == "drop" else None
-                nearby = groups[item.kind, item.catalog_id, label, ownership]
+            entry = EntityOverlayLabel(text_x, text_y, label, color, item.amount, fixed=item.kind == "mob")
+            if item.kind == "drop":
+                nearby = groups[item.catalog_id, label, item.ownership]
                 for group_x, group_y, group in nearby:
                     if (ax - group_x) ** 2 + (ay - group_y) ** 2 <= OVERLAY_LABEL_GROUP_RADIUS ** 2:
                         group.amount += item.amount
-                        if item.kind == "mob" and is_locked_mob:
-                            group.color = color
                         break
                 else:
                     nearby.append((ax, ay, entry))
@@ -9611,9 +9853,10 @@ class Overlay:
         if player_status:
             self._draw_overlay_label(width, height, occupied, *player_status,
                                      font_size=9, padding=(5, 2), outline="#334155")
-        for entry in labels:
+        for entry in sorted(labels, key=lambda entry: not entry.fixed):
             label = f"{entry.amount}× {entry.text}" if entry.amount > 1 else entry.text
-            self._draw_overlay_label(width, height, occupied, entry.x, entry.y, label, entry.color)
+            self._draw_overlay_label(width, height, occupied, entry.x, entry.y, label, entry.color,
+                                     fixed=entry.fixed)
         self.canvas_pool.end_frame()
         return True
 

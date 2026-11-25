@@ -140,9 +140,10 @@ class Gat:
                 return best
         return None
 
-    def find_path(self, start_xy, goal_xy, blocked_cells=None, max_iterations=7000, *,
+    def find_path(self, start_xy, goal_xy, blocked_cells: set[tuple[int, int]] | None = None,
+                  max_iterations=7000, *, penalty_cells: dict[tuple[int, int], float] | None = None,
                   cell_costs=None, goal_test=None):
-        """A* pathfinding em 8 direções evitando corte de quinas em paredes (preferindo passos diagonais primeiro)."""
+        """Busca A* em oito direções com bloqueios, penalidades por célula e sem corte de quinas."""
         start = (int(start_xy[0]), int(start_xy[1]))
         goal = (int(goal_xy[0]), int(goal_xy[1])) if goal_test is None else None
         blocked_set = set(blocked_cells) if blocked_cells else set()
@@ -190,7 +191,7 @@ class Gat:
             iterations += 1
             f, h_val, _, current = heapq.heappop(open_heap)
 
-            if current == goal or (goal_test is not None and goal_test(current)):
+            if current == goal or (goal_test is not None and current not in blocked_set and goal_test(current)):
                 # Reconstrói caminho
                 path = [current]
                 while current in came_from:
@@ -228,6 +229,8 @@ class Gat:
                 tentative_g = current_g + step_cost
                 if cell_costs is not None:
                     tentative_g += cell_costs.get(neighbor, 0)
+                if penalty_cells is not None:
+                    tentative_g += penalty_cells.get(neighbor, 0.0)
                 if tentative_g < g_score.get(neighbor, float("inf")):
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g
@@ -1229,6 +1232,21 @@ def load_learned_warps() -> dict:
     return {}
 
 
+def save_portal_trigger(map_name, cell, portal):
+    """Persiste gatilhos mantendo o formato das rotas aprendidas existentes."""
+    warps = load_learned_warps()
+    triggers = warps.setdefault("portal_guard", {}).setdefault(map_name, {})
+    key = f"{cell[0]},{cell[1]}"
+    if key in triggers:
+        return False
+    triggers[key] = list(portal) if portal is not None else None
+    target = _get_base_dir() / LEARNED_WARPS_FILE
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(warps, indent=2), encoding="utf-8")
+    temporary.replace(target)
+    return True
+
+
 def save_learned_warp(prev_map: str, prev_x: int, prev_y: int, new_map: str):
     """Registra automaticamente transição de portal: (mapa_ant, x, y) -> novo_mapa."""
     p_map = str(prev_map).lower().removesuffix(".gat").removesuffix(".rsw").strip()
@@ -1396,7 +1414,7 @@ KNOWN_CITIES = {
 }
 
 
-def get_adjacent_city_portal(current_map: str, player_xy: tuple[float, float], max_dist: float = 28.0, gat=None):
+def get_adjacent_city_portal(current_map: str, player_xy: tuple[float, float], max_dist: float = 28.0, gat=None, *, blocked_cells=None, penalty_cells=None):
     """Verifica se o mapa atual tem um portal conhecido que leva diretamente a uma cidade
     e se o jogador está a <= max_dist células com caminho A* livre.
     Retorna (cidade_destino, (portal_x, portal_y)) ou None.
@@ -1418,8 +1436,9 @@ def get_adjacent_city_portal(current_map: str, player_xy: tuple[float, float], m
                 has_path = True
                 if gat is not None:
                     try:
-                        path = gat.find_path((int(round(px)), int(round(py))), (int(wx), int(wy)))
-                        if not path:
+                        path = gat.find_path((int(round(px)), int(round(py))), (int(wx), int(wy)),
+                                             blocked_cells=blocked_cells, penalty_cells=penalty_cells)
+                        if not path or path[-1] != (int(wx), int(wy)):
                             has_path = False
                     except Exception:
                         pass

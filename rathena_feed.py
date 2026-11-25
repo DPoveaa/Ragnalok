@@ -234,8 +234,8 @@ def movement(data, offset):
     return position(data, offset), ((c & 15) << 6 | d >> 2, (d & 3) << 8 | e)
 
 
-def walk_speed(value):
-    return value if 60 <= value <= 600 else 150
+def walk_speed(value, fallback=150):
+    return value if 80 <= value <= 1000 else fallback
 
 
 def map_name(value):
@@ -503,11 +503,11 @@ class Track:
     max_weight: int = 1
 
     def __init__(self, origin, target, started=0.0, duration=0.0, segments=(), speed_ms=150.0,
-                 base_level=1, job_level=1, weight=0, max_weight=1, *, move_start_ts=0.0):
+                 base_level=1, job_level=1, weight=0, max_weight=1, *, move_start_ts=None):
         self.origin = origin
         self.target = target
         self.started = started
-        self.move_start_ts = move_start_ts
+        self.move_start_ts = started if move_start_ts is None else move_start_ts
         self.duration = duration
         self.segments = segments
         self._speed_ms = float(speed_ms)
@@ -538,7 +538,7 @@ class Track:
         if not segments:
             return self.stationary(self.target, speed_ms)
         return Track(current, self.target, now, segments[-1][1] - now, tuple(segments), speed_ms,
-                     move_start_ts=time.time())
+                     move_start_ts=now)
 
     @classmethod
     def stationary(cls, cell, speed_ms=150.0):
@@ -548,30 +548,41 @@ class Track:
     @classmethod
     def walking(cls, cells, speed, started, gat=None, *, previous=None, path=None):
         origin, target = cells
-        move_start_ts = time.time()
-        speed = walk_speed(speed)
-        if origin == target:
-            return cls.stationary(origin, speed_ms=speed)
+        current = origin
+        if previous is not None and previous.started <= started < previous.end_time:
+            previous_cell = previous.cell(started)
+            if math.dist(previous_cell, origin) <= 2.2:
+                current = previous_cell
+                current_tile = tuple(map(round, current))
+                if gat is None or gat.is_walkable(*current_tile):
+                    origin = current_tile
 
-        if path is None and gat is not None and math.dist(origin, target) > 1:
+        if current == target:
+            return cls.stationary(target, speed_ms=speed)
+
+        if path is None and gat is not None and origin != target:
             path = gat.find_path(origin, target)
         if not path or path[0] != origin or path[-1] != target:
             path = diagonal_first_path(*origin, *target)
 
-        if previous is not None:
-            current = previous.cell(started)
-            if math.dist(current, origin) < 0.6:
-                path[0] = current
+        # O primeiro passo pode começar no meio de uma célula durante uma mudança de rota.
+        points = (current, *(path[1:] or (target,)))
         segments = []
-        cur_t = started
-        seconds_per_cell = max(0.001, speed / 1000.0)
-        for p0, p1 in zip(path, path[1:]):
-            step_duration = seconds_per_cell * math.dist(p0, p1)
-            segments.append((cur_t, cur_t + step_duration, p0, p1))
-            cur_t += step_duration
+        elapsed_ms = 0.0
+        for start, end in zip(points, points[1:]):
+            dx, dy = abs(end[0] - start[0]), abs(end[1] - start[1])
+            if (dx, dy) == (1, 1):
+                distance = 1.4142
+            else:
+                distance = math.hypot(dx, dy)
+            if not distance:
+                continue
+            step_start = started + elapsed_ms / 1000.0
+            elapsed_ms += speed * distance
+            segments.append((step_start, started + elapsed_ms / 1000.0, start, end))
 
-        return cls(path[0], target, started, cur_t - started, tuple(segments), speed,
-                   move_start_ts=move_start_ts)
+        return cls(current, target, started, elapsed_ms / 1000.0, tuple(segments), speed,
+                   move_start_ts=started)
 
     @classmethod
     def stopping(cls, target, speed, now, previous):
@@ -580,15 +591,17 @@ class Track:
             distance = math.dist(current, target)
             if 0 < distance < 0.6:
                 duration = distance * max(0.001, speed / 1000.0)
-                return cls(current, target, now, duration, ((now, now + duration, current, target),), speed)
+                return cls(current, target, now, duration, ((now, now + duration, current, target),), speed,
+                           move_start_ts=now)
         return cls.stationary(target, speed)
 
     def cell(self, now=None):
         if now is None:
             now = time.perf_counter()
-        if not self.duration or now >= self.started + self.duration:
+        elapsed_ms = (now - self.move_start_ts) * 1000.0
+        if not self.duration or elapsed_ms >= self.duration * 1000.0:
             return self.target
-        if now <= self.started:
+        if elapsed_ms <= 0:
             return self.origin
 
         for t0, t1, p0, p1 in self.segments:
@@ -639,6 +652,11 @@ class Entity:
     last_combat_damage: float = 0.0
     gid: int = 0
     move_start_ts: float = 0.0
+    objecttype: int | None = None
+
+    @property
+    def is_portal(self):
+        return self.kind == "warp" or (self.kind != "drop" and self.catalog_id == 45)
 
 
 class World:
@@ -654,6 +672,7 @@ class World:
         self.active_port = None
         self.unknown_log_count = 0
         self.aid_to_gid = {}
+        self._entity_speed_cache: dict[int, int] = {}
         self.mobs_damaged_by_me = {}
         self.mobs_damaged_by_others = {}
         self._player_attacked_mobs = {}
@@ -713,6 +732,9 @@ class World:
         }
         self.on_player_move_callback = None
         self.on_map_change_callback = None
+        self.last_warp_from = None
+        self.warp_intent_callback = None
+        self._warp_context = ((), False)
         self.on_pickup_ack_callback = None
         self.player_hp = 0
         self.player_max_hp = 0
@@ -1024,6 +1046,7 @@ class World:
                 "packets_ok": self.packets_ok,
                 "map": self.map,
                 "current_map": self.current_map,
+                "last_warp_from": dict(self.last_warp_from) if self.last_warp_from else None,
                 "pos": pos,
                 "mobs": mobs,
                 "drops": drops,
@@ -1122,6 +1145,7 @@ class World:
             self.player_max_sp = 0
             self.entities = {}
             self.aid_to_gid.clear()
+            self._entity_speed_cache.clear()
             self.mobs_damaged_by_me.clear()
             self.mobs_damaged_by_others.clear()
             self._player_attacked_mobs.clear()
@@ -1167,6 +1191,7 @@ class World:
         return self.player_id is not None and self.player_id >= 100000 and entity_id == self.player_id
 
     def _remove_entity(self, entity_id):
+        self._entity_speed_cache.pop(entity_id, None)
         ent = self.entities.pop(entity_id, None)
         if ent is not None:
             for alias in (entity_id, ent.gid):
@@ -1226,7 +1251,25 @@ class World:
         )
         return dialog
 
-    def snapshot(self, *, include_dialog=False):
+    def _record_warp_from(self, new_map):
+        if not self.map or not new_map or self.map == new_map or self.player is None:
+            return
+        prev_x, prev_y = self.player.cell()
+        self.last_warp_from = {
+            "map": self.map, "x": int(round(prev_x)), "y": int(round(prev_y)), "ts": time.time(),
+        }
+        portals = {entity_id: tuple(map(round, ent.track.target))
+                   for (_, entity_id), ent in self.entity_items() if ent.is_portal}
+        intentional = self.player_is_dead
+        if not intentional and self.warp_intent_callback is not None:
+            try:
+                intentional = self.warp_intent_callback(self.last_warp_from, portals)
+            except Exception as exc:
+                intentional = True
+                print(f"[PortalGuard] Falha ao classificar transição: {exc}", flush=True)
+        self._warp_context = tuple(portals.values()), intentional
+
+    def snapshot(self, *, include_dialog=False, include_warp=False):
         with self.lock:
             frame_time = time.perf_counter()
             player_cell = self.player.cell(frame_time) if self.player else None
@@ -1247,9 +1290,12 @@ class World:
                 (key, entity) for key, entity in self.entity_items()
                 if not self._is_local_player_id(key[1])
             )
+            result = (self.map, self.player, entities)
             if include_dialog:
-                return self.map, self.player, entities, self._npc_dialog_snapshot()
-            return self.map, self.player, entities
+                result += (self._npc_dialog_snapshot(),)
+            if include_warp:
+                result += (dict(self.last_warp_from) if self.last_warp_from else None, self._warp_context)
+            return result
 
     @property
     def is_map_loading(self):
@@ -1426,14 +1472,7 @@ class World:
             self.predicted_player = None
             raw_name = extract_map_from_packet(data, 2)
             name = map_name(raw_name)
-            prev_map = self.map
-            prev_pos = self.player.cell() if self.player else None
-            if prev_map and name and prev_map != name and prev_pos and not self.player_is_dead:
-                try:
-                    from rathena_terrain import save_learned_warp
-                    save_learned_warp(prev_map, int(round(prev_pos[0])), int(round(prev_pos[1])), name)
-                except Exception:
-                    pass
+            self._record_warp_from(name)
             self.map = name
             self.current_map = f"{name}.gat" if name else None
             if name:
@@ -1456,6 +1495,7 @@ class World:
             self.locked_combat_mob_gid = None
             self.entities.clear()
             self.aid_to_gid.clear()
+            self._entity_speed_cache.clear()
             self.last_attack_target_id = self.last_attack_action = None
             self.last_attack_ts = self.last_move_ts = 0.0
             self.last_mob_attack = (None, None, 0.0)
@@ -1498,20 +1538,14 @@ class World:
             self.recent_dead_mobs.clear()
             raw_name = extract_map_from_packet(data, 2)
             name = map_name(raw_name)
-            prev_map = self.map
-            prev_pos = self.player.cell() if self.player else None
-            if prev_map and name and prev_map != name and prev_pos:
-                try:
-                    from rathena_terrain import save_learned_warp
-                    save_learned_warp(prev_map, int(round(prev_pos[0])), int(round(prev_pos[1])), name)
-                except Exception:
-                    pass
+            self._record_warp_from(name)
             self.map = name
             self.current_map = f"{name}.gat" if name else None
             self.pending_pickup = None
             self.last_pickup_ack = None
             self.entities.clear()
             self.aid_to_gid.clear()
+            self._entity_speed_cache.clear()
             self.last_attack_target_id = self.last_attack_action = None
             self.last_attack_ts = self.last_move_ts = 0.0
             self.last_mob_attack = (None, None, 0.0)
@@ -1565,7 +1599,7 @@ class World:
                 cells = movement(data, 6)
                 self.player_is_sitting = False
                 self._set_player_track(Track.walking(
-                    cells, self.player_speed, now, self.get_gat(),
+                    cells, self.player_speed, now, self.get_gat(), previous=self.player,
                 ))
                 if self.on_player_move_callback is not None:
                     try:
@@ -1592,7 +1626,9 @@ class World:
                 elif ent is not None and ent.kind != "drop":
                     previous = ent.track if opcode == 0x0088 else None
                     stopped = Track.stopping(stop_cell, ent.speed, now, previous)
-                    self.entities[target_id] = replace(ent, track=stopped, last_seen=time.monotonic())
+                    self.entities[target_id] = replace(
+                        ent, track=stopped, move_start_ts=stopped.move_start_ts, last_seen=time.monotonic(),
+                    )
         elif opcode == 0x0ACB:  # ZC_LONGLONGPAR_CHANGE
             if len(data) >= 12:
                 var_id, value = struct.unpack_from("<HQ", data, 2)
@@ -1659,9 +1695,10 @@ class World:
                         self.get_gat(), previous=self.player,
                     ))
                 elif ent is not None and ent.kind != "drop":
-                    track = Track.walking(movement(data, 6), ent.speed, started, self.get_gat())
+                    speed = self._entity_speed_cache.get(target_id, ent.speed)
+                    track = Track.walking(movement(data, 6), speed, started, self.get_gat(), previous=ent.track)
                     self.entities[target_id] = replace(
-                        ent, track=track, move_start_ts=track.move_start_ts, last_seen=time.monotonic(),
+                        ent, track=track, speed=speed, move_start_ts=track.move_start_ts, last_seen=time.monotonic(),
                     )
         elif opcode in (0x00FE, 0x02C6, 0x00E5, 0x01F4, 0x0207):
             self.last_invite_popup_ts = time.monotonic()
@@ -2198,8 +2235,16 @@ class World:
             base_offset = 53 + 4 * has_aid + 4 * wide + 2 * (opcode >= 0x07F7)
 
             wide_layout = opcode in (0x09FD, 0x09FE, 0x09FF, 0x0AFD, 0x0AFE, 0x0AFF)
-            speed_offset = 12 if opcode == 0x09FD else 9 + 4 * has_aid
-            speed = walk_speed(u16(data, speed_offset) if len(data) >= speed_offset + 2 else 0)
+            if opcode in (0x09FD, 0x0915, 0x0856, 0x09FF):
+                speed = 0
+                for speed_offset in (13, 12):
+                    if len(data) >= speed_offset + 2:
+                        speed = walk_speed(u16(data, speed_offset), fallback=0)
+                        if speed:
+                            break
+            else:
+                speed_offset = 9 + 4 * has_aid
+                speed = u16(data, speed_offset) if len(data) >= speed_offset + 2 else 0
             job = u16(data, 19 + 4 * has_aid) if len(data) >= 21 + 4 * has_aid else 1002
             aid = u32(data, 5) if len(data) >= 9 else 0
             gid = u32(data, 9) if has_aid and len(data) >= 13 else 0
@@ -2234,8 +2279,8 @@ class World:
             elif opcode in CANONICAL_UNIT_OPCODES or obj_type in (7, 8, 9, 10):
                 return
 
-        if opcode == 0x0856:
-            pos_off = effective_offset + 4 if len(data) >= effective_offset + 10 else effective_offset
+        if opcode == 0x0856 and len(data) < effective_offset + 10:
+            pos_off = effective_offset
             if len(data) < pos_off + 3:
                 return
             cell = position(data, pos_off)
@@ -2262,22 +2307,26 @@ class World:
 
         # AID é a chave; GID só resolve referências dos outros pacotes.
         old_ent = self.entity(kind, entity_id)
+        cached_speed = self._entity_speed_cache.get(entity_id) if old_ent is not None else None
         aliases = {aid, gid} - {0}
         for alias in aliases:
             previous_id = self.aid_to_gid.get(alias, alias)
             if previous_id != entity_id:
+                previous_speed = self._entity_speed_cache.get(previous_id)
                 previous = self._remove_entity(previous_id)
                 if old_ent is None and previous is not None and previous.kind == kind:
                     old_ent = previous
+                    cached_speed = previous_speed
         self._remove_entity(entity_id)
         for alias in aliases:
             self.aid_to_gid[alias] = entity_id
 
         if entity_id:
+            fallback_speed = 250 if kind == "mob" else 150
+            speed = walk_speed(speed, fallback=cached_speed or fallback_speed)
+            self._entity_speed_cache[entity_id] = speed
             previous_track = old_ent.track if old_ent else None
-            if opcode == 0x09FD:
-                track = Track.walking(cells, speed, now, self.get_gat())
-            elif walking:
+            if walking:
                 track = Track.walking(cells, speed, now, self.get_gat(), previous=previous_track)
             else:
                 track = Track.stationary(cell, speed)
@@ -2323,7 +2372,7 @@ class World:
 
             self.entities[entity_id] = Entity(
                 kind, job, track, speed=speed, last_seen=time.monotonic(), gid=gid,
-                move_start_ts=track.move_start_ts,
+                move_start_ts=track.move_start_ts, objecttype=obj_type,
                 has_vending_shop=(kind == "player" and
                                   (bool(aliases & self.vending_aids) or bool(old_ent and old_ent.has_vending_shop))),
                 is_aggro=is_aggro, last_aggro_ts=last_aggro_ts,
