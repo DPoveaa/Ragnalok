@@ -1,0 +1,30 @@
+{
+  "by_job": {
+    "139": {
+      "rachel,112,136": "ÿÿÿÿÿÿÿÿ",
+      "rachel,115,125": "ÿÿÿÿÿÿ",
+      "moc_para0a,31,14": "ÿÿÿÿÿÿ",
+      "prontera,116,72": "ÿÿÿÿÿÿ"
+    }
+  },
+  "base": {
+    "10242": "Kafra",
+    "581": "Kafra",
+    "423": "Kafra",
+    "10045": "Kafra",
+    "112": "Kafra",
+    "113": "Kafra",
+    "114": "Kafra",
+    "115": "Kafra",
+    "116": "Kafra",
+    "117": "Kafra",
+    "721": "Kafra",
+    "791": "Kafra",
+    "859": "Kafra",
+    "860": "Kafra",
+    "861": "Kafra",
+    "951": "Mestre do Éden",
+    "952": "Oficial do Éden",
+    "953": "Guarda do Éden"
+  }
+}

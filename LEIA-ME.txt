@@ -1,0 +1,46 @@
+========================================================================
+                      RAGNALOK OVERLAY & BOT
+========================================================================
+
+Bem-vindo! Este pacote contém tudo que você precisa para rodar o overlay
+e as automações do Ragnarok sem precisar instalar Python ou configurar nada.
+
+------------------------------------------------------------------------
+COMO USAR (PASSO A PASSO):
+------------------------------------------------------------------------
+
+1. INSTALAÇÃO DO DRIVER DE CAPTURA (Apenas na primeira vez no PC):
+   - Dê dois cliques em: "1. Instalar_Npcap.exe"
+   - Na tela de instalação do Npcap, certifique-se de marcar a opção:
+     [X] "Install Npcap in WinPcap API-compatible Mode"
+   - Avance e conclua a instalação.
+
+2. ABRIR O JOGO:
+   - Abra o Ragnarok normalmente e entre no mapa com seu personagem.
+
+3. INICIAR O OVERLAY:
+   - Dê dois cliques em: "2. Ragnalok_Overlay.exe"
+   - Se o Windows solicitar permissão de Administrador (UAC), clique em "Sim".
+   - O programa detectará automaticamente o jogo e se conectará.
+   - Assim que você clicar na janela do jogo, o HUD aparecerá no topo!
+
+------------------------------------------------------------------------
+TECLAS DE ATALHO NO JOGO:
+------------------------------------------------------------------------
+
+  [F5]  - Ativa / Desativa o Auto-Farm (atacar monstros)
+  [F6]  - Ativa / Desativa o Auto-Patrol (andar pelo mapa caçando monstros)
+  [F7]  - Ativa / Desativa o Auto-Loot (pegar itens caídos no chão)
+  [F8]  - Abre / Fecha as Gavetas do HUD (Configurações, Mapas, Filtros)
+  [F9]  - Exibe diagnóstico técnico na tela
+  [ESC] - Fecha o Overlay
+
+------------------------------------------------------------------------
+OBSERVAÇÕES IMPORTANTES:
+------------------------------------------------------------------------
+- O HUD no topo só aparece quando a janela do Ragnarok estiver EM FOCO (clique no jogo).
+- O anti-KS e o filtro de mob train já vêm ativados por padrão (o bot não
+  ataca monstros que outros jogadores estiverem lurando ou atacando).
+- Para pausar as ações do bot instantaneamente, basta segurar o botão
+  esquerdo do mouse ou pressionar F5/F6/F7 para desligar o modo desejado.
+========================================================================

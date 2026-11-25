@@ -95,6 +95,9 @@
   ('PIL.ImageFont',
    'C:\\Users\\danie\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\PIL\\ImageFont.py',
    'PYMODULE'),
+  ('PIL.ImageGrab',
+   'C:\\Users\\danie\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\PIL\\ImageGrab.py',
+   'PYMODULE'),
   ('PIL.ImageMath',
    'C:\\Users\\danie\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\PIL\\ImageMath.py',
    'PYMODULE'),
@@ -1356,6 +1359,9 @@
    'PYMODULE'),
   ('numpy.core._utils',
    'C:\\Users\\danie\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\numpy\\core\\_utils.py',
+   'PYMODULE'),
+  ('numpy.core.multiarray',
+   'C:\\Users\\danie\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\numpy\\core\\multiarray.py',
    'PYMODULE'),
   ('numpy.ctypeslib',
    'C:\\Users\\danie\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\numpy\\ctypeslib\\__init__.py',
@@ -3065,12 +3071,6 @@
    'C:\\Program '
    'Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_3.11.2544.0_x64__qbz5n2kfra8p0\\Lib\\quopri.py',
    'PYMODULE'),
-  ('ragx',
-   'C:\\Users\\danie\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\ragx\\__init__.py',
-   'PYMODULE'),
-  ('ragx.grf',
-   'C:\\Users\\danie\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\ragx\\grf.py',
-   'PYMODULE'),
   ('random',
    'C:\\Program '
    'Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_3.11.2544.0_x64__qbz5n2kfra8p0\\Lib\\random.py',
@@ -4518,6 +4518,9 @@
   ('webbrowser',
    'C:\\Program '
    'Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_3.11.2544.0_x64__qbz5n2kfra8p0\\Lib\\webbrowser.py',
+   'PYMODULE'),
+  ('win32_input',
+   'D:\\Daniel\\Projetos GitHub\\Ragnalok\\win32_input.py',
    'PYMODULE'),
   ('xml',
    'C:\\Program '

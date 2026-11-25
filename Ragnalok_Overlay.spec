@@ -1,9 +1,35 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('monstros-pt-br.json', '.'), ('rathena-lengths.txt', '.'), ('filters_config.json', '.')]
+datas = [
+    ('monstros-pt-br.json', '.'),
+    ('rathena-lengths.txt', '.'),
+    ('filters_config.json', '.'),
+    ('kafra_network.json', '.'),
+    ('learned_warps.json', '.'),
+    ('camera_calibration.json', '.'),
+    ('world_routes.json', '.'),
+    ('assets', 'assets'),
+]
 binaries = []
-hiddenimports = ['psutil', 'tkinter']
+hiddenimports = [
+    'psutil',
+    'tkinter',
+    'PIL',
+    'PIL.Image',
+    'PIL.ImageTk',
+    'PIL.ImageGrab',
+    'PIL.ImageDraw',
+    'cv2',
+    'numpy',
+    'serial',
+    'pystray',
+    'pytesseract',
+    'win32_input',
+    'rathena_feed',
+    'rathena_terrain',
+    'rathena_mock',
+]
 tmp_ret = collect_all('scapy')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

@@ -3,6 +3,7 @@ import ctypes
 from ctypes import wintypes
 import math
 import random
+import threading
 import time
 
 
@@ -22,11 +23,18 @@ kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
 LAST_BOT_CLICK_TS = float("-inf")
+LAST_BOT_KEY_TS = float("-inf")
 _BOT_CLICKING = False
+_TOUCH_CLICK_LOCK = threading.Lock()
 
 
 def is_bot_clicking(grace_sec: float = 0.65) -> bool:
-    return _BOT_CLICKING or time.monotonic() - LAST_BOT_CLICK_TS < grace_sec
+    now = time.monotonic()
+    return _BOT_CLICKING or _TOUCH_CLICK_LOCK.locked() or (now - LAST_BOT_CLICK_TS < grace_sec) or (now - LAST_BOT_KEY_TS < grace_sec)
+
+
+def is_bot_keying(grace_sec: float = 0.65) -> bool:
+    return time.monotonic() - LAST_BOT_KEY_TS < grace_sec
 
 
 def begin_bot_click():
@@ -165,11 +173,17 @@ u32.SetCursorPos.restype = wintypes.BOOL
 u32.GetCursorPos.argtypes = (ctypes.POINTER(wintypes.POINT),)
 u32.GetCursorPos.restype = wintypes.BOOL
 
-u32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
 u32.SendInput.restype = wintypes.UINT
 
-u32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
+u32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t]
+u32.keybd_event.restype = None
+
+u32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
 u32.MapVirtualKeyW.restype = wintypes.UINT
+
+u32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+u32.GetAncestor.restype = wintypes.HWND
 
 u32.mouse_event.argtypes = (wintypes.DWORD, ctypes.c_long, ctypes.c_long, wintypes.DWORD, ULONG_PTR)
 u32.mouse_event.restype = None
@@ -338,7 +352,32 @@ def _move_pointer_with_touch(sx: int, sy: int):
     return r_down, err_down, r_up, err_up
 
 
-def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=None, log=None, is_admin=False, test_mode=False, **kwargs):
+def _wait_cursor_arrival(sx, sy, tolerance=3):
+    started = time.monotonic()
+    correction_at = started + 0.032
+    deadline = started + 0.080
+    corrected = False
+    point = wintypes.POINT()
+    while True:
+        if (u32.GetCursorPos(ctypes.byref(point))
+                and abs(point.x - sx) <= tolerance and abs(point.y - sy) <= tolerance):
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        if now >= correction_at and not corrected:
+            contact = POINTER_TOUCH_INFO()
+            contact.pointerInfo.pointerType = PT_TOUCH
+            contact.pointerInfo.pointerId = 0
+            contact.pointerInfo.pointerFlags = 0x00020002  # UPDATE | INRANGE: hover sem pressionar
+            contact.pointerInfo.ptPixelLocation = wintypes.POINT(sx, sy)
+            u32.InjectTouchInput(1, ctypes.byref(contact))
+            corrected = True
+        time.sleep(min(0.004, max(0.0, deadline - time.monotonic())))
+    return point
+
+
+def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=None, log=None, is_admin=False, test_mode=False, target_point=None, cursor_tolerance=3, **kwargs):
     """Executa exatamente a mesma sequência Win32 de 9e1ac16:
     1. InjectTouchInput para posicionar o cursor real.
     2. 45ms hover delay para reconhecimento pelo Ragexe.exe.
@@ -347,6 +386,7 @@ def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=N
        quanto para todas as janelas filhas (D3DProxyWindow) do Ragexe.exe.
     """
     global LAST_BOT_CLICK_TS, _BOT_CLICKING
+    _TOUCH_CLICK_LOCK.acquire()
     _BOT_CLICKING = True
     LAST_BOT_CLICK_TS = time.monotonic()
     try:
@@ -369,20 +409,41 @@ def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=N
 
         sx, sy = int(sx), int(sy)
 
-        # 1. Posiciona o ponteiro real em (sx, sy) via InjectTouchInput
-        _move_pointer_with_touch(sx, sy)
-        pt_cur = wintypes.POINT()
-        u32.GetCursorPos(ctypes.byref(pt_cur))
-        if abs(pt_cur.x - sx) > 4 or abs(pt_cur.y - sy) > 4:
+        # Atualiza a mira de sprites móveis depois do hover, antes de pressionar.
+        for attempt in range(3):
+            if callable(target_point):
+                point = target_point(0.075)
+                if point is None:
+                    return False
+                sx, sy = map(int, point)
             _move_pointer_with_touch(sx, sy)
-            u32.GetCursorPos(ctypes.byref(pt_cur))
-
-        # 2. Aguarda 45ms para o Ragexe.exe registrar o hover sobre o sprite
-        time.sleep(0.045)
+            pt_cur = _wait_cursor_arrival(sx, sy, tolerance=cursor_tolerance)
+            time.sleep(0.045)
+            if not callable(target_point):
+                break
+            point = target_point(0.022)
+            if point is None:
+                return False
+            if math.dist((sx, sy), point) <= 5:
+                click_point = tuple(map(int, point))
+                if cursor_tolerance == 1 and math.dist((sx, sy), click_point) > 1:
+                    _move_pointer_with_touch(*click_point)
+                    pt_cur = _wait_cursor_arrival(*click_point, tolerance=1)
+                    time.sleep(0.045)
+                    latest = target_point(0.022)
+                    if latest is None:
+                        return False
+                    if math.dist(click_point, latest) > 5:
+                        continue
+                sx, sy = click_point
+                break
+        else:
+            return False
 
         # 3. Micro-deslocamento relativo ((1,0) -> (-1,0)) para sincronizar o ponteiro dentro do DirectX
         try:
             u32.mouse_event(0x0001, 1, 0, 0, 0)
+            time.sleep(0.004)
             u32.mouse_event(0x0001, -1, 0, 0, 0)
         except Exception:
             pass
@@ -409,6 +470,7 @@ def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=N
 
             u32.EnumChildWindows(top_hwnd or game_hwnd, collect_child, 0)
 
+        clicked = False
         for target in targets:
             pt = wintypes.POINT(sx, sy)
             if not u32.ScreenToClient(target, ctypes.byref(pt)):
@@ -428,6 +490,7 @@ def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=N
             ctypes.set_last_error(0)
             r_up = int(u32.PostMessageW(target, 0x0202, 0, lparam))
             err_up = ctypes.get_last_error()
+            clicked |= bool(r_down and r_up)
 
         msg = f"touch_postmsg ({sx},{sy}) targets={len(targets)} cur=({pt_cur.x},{pt_cur.y})"
         if callable(log):
@@ -435,10 +498,11 @@ def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=N
                 log(msg)
             else:
                 log(f"[ClickDebug] {msg}")
-        return True
+        return clicked
     finally:
         LAST_BOT_CLICK_TS = time.monotonic()
         _BOT_CLICKING = False
+        _TOUCH_CLICK_LOCK.release()
 
 
 move_and_click = patrol_move_and_click = touch_postmsg
@@ -492,49 +556,63 @@ def activate_game_window(hwnd):
         time.sleep(0.030)
     return u32.GetForegroundWindow() == hwnd
 
-def _send_game_key(hwnd, vk_code: int, *, restore_focus=False) -> bool:
-    """Envia tecla de jogo usando Win32 SendInput com Hardware ScanCode."""
-    down_arrow = vk_code == 0x28
-    if restore_focus or u32.IsIconic(hwnd) or u32.GetForegroundWindow() != hwnd:
-        focused = activate_game_window(hwnd)
-    else:
-        focused = True
-    if not focused:
-        if down_arrow:
-            print("[SendInput] Foco do Ragexe.exe ainda não confirmado. Enviando ↓.", flush=True)
-        else:
+def _send_game_key(hwnd=None, vk_code: int = None, hold_ms: int = 110, *, restore_focus=False) -> bool:
+    """Envia tecla de jogo usando Win32 SendInput com Hardware ScanCode e fallback para keybd_event."""
+    if vk_code is None and hwnd is not None:
+        vk_code = hwnd
+        hwnd = None
+    if vk_code is None:
+        return False
+
+    root_hwnd = u32.GetAncestor(hwnd, 2) if hwnd else 0
+    root_hwnd = root_hwnd or hwnd or u32.GetForegroundWindow()
+    if root_hwnd:
+        if restore_focus or u32.IsIconic(root_hwnd) or u32.GetForegroundWindow() != root_hwnd:
+            activate_game_window(root_hwnd)
+        u32.SetForegroundWindow(root_hwnd)
+        time.sleep(0.060)
+        if u32.GetForegroundWindow() != root_hwnd:
             return False
 
-    mapped = u32.MapVirtualKeyW(vk_code, 0 if down_arrow else 4)
-    if not mapped:
-        return False
-    scan = mapped & 0xFF
-    extended = down_arrow or (mapped >> 8) == 0xE0
-    flags = 0x0008 | int(extended)  # KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY
-    key = INPUT(type=INPUT_KEYBOARD)
-    key.ki.wVk = 0
-    key.ki.wScan = scan
-    key.ki.dwFlags = flags
+    scan_codes = {0x2D: 0x52, 0x28: 0x50, 0x1B: 0x01, 0x0D: 0x1C}
+    scan = scan_codes.get(vk_code)
+    if scan is None:
+        scan = u32.MapVirtualKeyW(vk_code, 0)
+
+    ext_flag = 0x0001 if vk_code in {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E} else 0x0000
+
+    key_down = INPUT(type=INPUT_KEYBOARD)
+    key_down.ki.wVk = 0
+    key_down.ki.wScan = scan & 0xFF
+    key_down.ki.dwFlags = 0x0008 | ext_flag  # KEYEVENTF_SCANCODE | ext_flag
+    key_down.ki.time = 0
+    key_down.ki.dwExtraInfo = 0
     size = ctypes.sizeof(INPUT)
 
-    def send(phase):
-        ctypes.set_last_error(0)
-        if u32.SendInput(1, ctypes.byref(key), size):
-            return True
-        error = ctypes.get_last_error()
-        hint = " Verifique se o Python e o Ragexe.exe têm o mesmo nível de privilégio." if error == 5 else ""
-        print(f"[SendInput] VK=0x{vk_code:02X} {phase} retornou 0. Erro Win32={error}.{hint}", flush=True)
-        return False
+    ctypes.set_last_error(0)
+    sent = u32.SendInput(1, ctypes.byref(key_down), size)
+    if sent == 1:
+        method = "SendInput"
+    else:
+        u32.keybd_event(vk_code, scan & 0xFF, ext_flag, 0)
+        method = "keybd_event"
 
-    if send("keydown"):
-        time.sleep(0.045 if down_arrow else 0.040)
-        key.ki.dwFlags |= 0x0002  # KEYEVENTF_KEYUP
-        return send("keyup")
+    time.sleep(max(hold_ms, 1) / 1000.0)
 
-    if down_arrow:
-        return False
-    lparam = 1 | (scan << 16) | (int(extended) << 24)
-    if not u32.PostMessageW(hwnd, 0x0100, vk_code, lparam):
-        return False
-    time.sleep(0.040)
-    return bool(u32.PostMessageW(hwnd, 0x0101, vk_code, lparam | (3 << 30)))
+    key_up = INPUT(type=INPUT_KEYBOARD)
+    key_up.ki.wVk = 0
+    key_up.ki.wScan = scan & 0xFF
+    key_up.ki.dwFlags = 0x0008 | 0x0002 | ext_flag  # KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP | ext_flag
+    key_up.ki.time = 0
+    key_up.ki.dwExtraInfo = 0
+
+    if method == "SendInput":
+        if u32.SendInput(1, ctypes.byref(key_up), size) != 1:
+            u32.keybd_event(vk_code, scan & 0xFF, ext_flag | 0x0002, 0)
+    else:
+        u32.keybd_event(vk_code, scan & 0xFF, ext_flag | 0x0002, 0)
+
+    global LAST_BOT_KEY_TS
+    LAST_BOT_KEY_TS = time.monotonic()
+    print(f"[Teclado] VK=0x{vk_code:02X} ({method}=1).", flush=True)
+    return True

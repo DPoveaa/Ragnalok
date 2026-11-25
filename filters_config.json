@@ -31,7 +31,7 @@
     "Asa de Borboleta"
   ],
   "restock_items": {},
-  "survival_hp_pct": 90,
+  "survival_hp_pct": 30,
   "survival_resume_pct": 100,
   "survival_danger_radius": 8
 }

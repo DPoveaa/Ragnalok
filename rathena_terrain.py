@@ -10,6 +10,8 @@ import random
 import re
 import struct
 import sys
+from threading import Lock
+import time
 import unicodedata
 import zlib
 
@@ -299,6 +301,107 @@ class Gat:
         return None
 
 
+# Permutations and substitution tables for the legacy GRF DES round.
+_GRF_DES_IP = (
+    58, 50, 42, 34, 26, 18, 10, 2, 60, 52, 44, 36, 28, 20, 12, 4,
+    62, 54, 46, 38, 30, 22, 14, 6, 64, 56, 48, 40, 32, 24, 16, 8,
+    57, 49, 41, 33, 25, 17, 9, 1, 59, 51, 43, 35, 27, 19, 11, 3,
+    61, 53, 45, 37, 29, 21, 13, 5, 63, 55, 47, 39, 31, 23, 15, 7,
+)
+_GRF_DES_FP = tuple(_GRF_DES_IP.index(bit) + 1 for bit in range(1, 65))
+_GRF_DES_E = (
+    32, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 8, 9, 10, 11, 12, 13,
+    12, 13, 14, 15, 16, 17, 16, 17, 18, 19, 20, 21, 20, 21, 22, 23, 24, 25,
+    24, 25, 26, 27, 28, 29, 28, 29, 30, 31, 32, 1,
+)
+_GRF_DES_P = (
+    16, 7, 20, 21, 29, 12, 28, 17, 1, 15, 23, 26, 5, 18, 31, 10,
+    2, 8, 24, 14, 32, 27, 3, 9, 19, 13, 30, 6, 22, 11, 4, 25,
+)
+_GRF_DES_SBOXES = (
+    bytes.fromhex(
+        "ef 03 41 fd d8 74 1e 47 26 ef fb 22 b3 d8 84 1e "
+        "39 ac a7 60 62 c1 cd ba 5c 96 90 59 05 3b 7a 85 "
+        "40 fd 1e c8 e7 8a 8b 21 da 43 64 9f 2d 14 b1 72 "
+        "f5 5b c8 b6 9c 37 76 ec 39 a0 a3 05 52 6e 0f d9"),
+    bytes.fromhex(
+        "a7 dd 0d 78 9e 0b e3 95 60 36 36 4f f9 60 5a a3 "
+        "11 24 d2 87 c8 52 75 ec bb c1 4c ba 24 fe 8f 19 "
+        "da 13 66 af 49 d0 90 06 8c 6a fb 91 37 8d 0d 78 "
+        "bf 49 11 f4 23 e5 ce 3b 55 bc a2 57 e8 22 74 ce"),
+    bytes.fromhex(
+        "2c ea c1 bf 4a 24 1f c2 79 47 a2 7c b6 d9 68 15 "
+        "80 56 5d 01 33 fd f4 ae de 30 07 9b e5 83 9b 68 "
+        "49 b4 2e 83 1f c2 b5 7c a2 19 d8 e5 7c 2f 83 da "
+        "f7 6b 90 fe c4 01 5a 97 61 a6 3d 40 0b 58 e6 3d"),
+    bytes.fromhex(
+        "4d d1 b2 0f 28 bd e4 78 f6 4a 0f 93 8b 17 d1 a4 "
+        "3a ec c9 35 93 56 7e cb 55 20 a0 fe 6c 89 17 62 "
+        "17 62 4b b1 b4 de d1 87 c9 14 3c 4a 7e a8 e2 7d "
+        "a0 9f f6 5c 6a 09 8d f0 0f e3 53 25 95 36 28 cb"),
+)
+_GRF_SHUFFLE_SWAP = {
+    byte: partner
+    for a, b in ((0x00, 0x2B), (0x6C, 0x80), (0x01, 0x68), (0x48, 0x77),
+                 (0x60, 0xFF), (0xB9, 0xC0), (0xFE, 0xEB))
+    for byte, partner in ((a, b), (b, a))
+}
+
+
+def _grf_permute(value, width, order):
+    result = 0
+    for bit in order:
+        result = (result << 1) | ((value >> (width - bit)) & 1)
+    return result
+
+
+def _grf_decode_block(block):
+    value = _grf_permute(int.from_bytes(block, "big"), 64, _GRF_DES_IP)
+    expanded = _grf_permute(value & 0xFFFFFFFF, 32, _GRF_DES_E)
+    substituted = 0
+    for index, table in enumerate(_GRF_DES_SBOXES):
+        pair = (expanded >> (36 - 12 * index)) & 0xFFF
+        byte = (table[pair >> 6] & 0xF0) | (table[pair & 0x3F] & 0x0F)
+        substituted = (substituted << 8) | byte
+    value ^= _grf_permute(substituted, 32, _GRF_DES_P) << 32
+    return _grf_permute(value, 64, _GRF_DES_FP).to_bytes(8, "big")
+
+
+def _grf_decode_entry(raw, compressed_size, flags):
+    if not flags & 0x06:
+        return raw[:compressed_size]
+    data = bytearray(raw)
+    mixed = bool(flags & 0x02)
+    digits = len(str(compressed_size))
+    if digits < 3:
+        cycle = 1
+    elif digits < 5:
+        cycle = digits + 1
+    elif digits < 7:
+        cycle = digits + 9
+    else:
+        cycle = digits + 15
+
+    block_count = len(data) // 8
+    for index in range(min(block_count, 20)):
+        offset = index * 8
+        data[offset:offset + 8] = _grf_decode_block(data[offset:offset + 8])
+    if mixed:
+        plaintext_index = 0
+        for index in range(20, block_count):
+            offset = index * 8
+            if index % cycle == 0:
+                data[offset:offset + 8] = _grf_decode_block(data[offset:offset + 8])
+                continue
+            if plaintext_index and plaintext_index % 7 == 0:
+                block = data[offset:offset + 8]
+                last = _GRF_SHUFFLE_SWAP.get(block[7], block[7])
+                data[offset:offset + 8] = bytes((block[3], block[4], block[6], block[0],
+                                                 block[1], block[2], block[5], last))
+            plaintext_index += 1
+    return data[:compressed_size]
+
+
 class PureGrfArchive:
     """Leitor 100% Python puro (struct + zlib) para arquivos .grf (v0x200 e v0x300).
     Elimina dependências de C/mmap e previne qualquer falha de access violation.
@@ -385,7 +488,12 @@ class PureGrfArchive:
         with open(self.path, "rb") as f:
             f.seek(46 + off)
             raw = f.read(ca)
-            return zlib.decompress(raw[:c])
+        if c > ca or len(raw) != ca:
+            raise ValueError(f"Entrada GRF truncada: {path}")
+        data = zlib.decompress(_grf_decode_entry(raw, c, fl))
+        if len(data) != u:
+            raise ValueError(f"Tamanho incorreto na entrada GRF: {path}")
+        return data
 
     def close(self):
         pass
@@ -406,6 +514,9 @@ class Terrain:
         self.archive = None
         self.aliases = {}
         self.cached_gats = {}
+        self._unavailable_until = {}
+        self._map_lock = Lock()
+        self._extra_archives = {}
         self.name = None
         self.gat = None
         self._init_grf()
@@ -428,84 +539,65 @@ class Terrain:
         if not name:
             return None
         norm_name = name.lower().removesuffix(".gat").removesuffix(".rsw").removesuffix(".gnd")
-        if norm_name in self.cached_gats:
-            self.name = norm_name
-            self.gat = self.cached_gats[norm_name]
-            return self.gat
+        with self._map_lock:
+            gat = self.cached_gats.get(norm_name)
+            retry_at = self._unavailable_until.get(norm_name)
+            if gat is None and (retry_at is None or time.monotonic() >= retry_at):
+                gat = self._load_gat(norm_name)
+                if gat is None:
+                    self._unavailable_until[norm_name] = time.monotonic() + 30.0
+                    if retry_at is None:
+                        print(f"[Terrain] .gat indisponivel para {norm_name}; usando terreno plano.", flush=True)
+                else:
+                    self._unavailable_until.pop(norm_name, None)
+                    self.cached_gats[norm_name] = gat
+            self.name, self.gat = norm_name, gat
+            return gat
 
+    def _load_gat(self, norm_name):
         key = f"{norm_name}.gat"
-        candidates = list(dict.fromkeys((key, self.aliases.get(key, key))))
-
-        # 1. Procura em cache local (.gat_cache) e arquivos .gat locais
-        search_dirs = [
-            self.cache_dir,
-            self.local_maps_dir,
-            Path(__file__).parent / "maps",
-            self.client_data_dir,
-            self.client_data_dir / "maps",
-        ]
-
+        candidates = tuple(dict.fromkeys((key, self.aliases.get(key, key))))
+        search_dirs = (
+            self.cache_dir, self.local_maps_dir, Path(__file__).parent / "maps",
+            self.client_data_dir, self.client_data_dir / "maps",
+        )
         for cand in candidates:
-            for sdir in search_dirs:
-                file_path = sdir / cand
-                if file_path.is_file():
-                    try:
-                        data = file_path.read_bytes()
-                        gat = Gat(data, name=norm_name)
-                        self.cached_gats[norm_name] = gat
-                        self.name = norm_name
-                        self.gat = gat
-                        return gat
-                    except Exception as exc:
-                        print(f"[Terrain] Erro ao carregar .gat local {file_path}: {exc}", flush=True)
-
-        # 2. Leitura direta do .grf principal via PureGrfArchive (struct + zlib)
-        if self.archive is not None:
-            for cand in candidates:
-                for grf_key in (f"data/{cand}", cand):
-                    try:
-                        data = self.archive.read(grf_key)
-                        try:
-                            self.cache_dir.mkdir(parents=True, exist_ok=True)
-                            (self.cache_dir / f"{norm_name}.gat").write_bytes(data)
-                        except Exception:
-                            pass
-                        gat = Gat(data, name=norm_name)
-                        self.cached_gats[norm_name] = gat
-                        self.name = norm_name
-                        self.gat = gat
-                        return gat
-                    except (FileNotFoundError, KeyError):
-                        continue
-                    except Exception as exc:
-                        print(f"[Terrain] Erro ao ler {cand} do GRF: {exc}", flush=True)
-
-        # 3. Fallback adicional para outros .grf na pasta do jogo
-        game_dir = Path("D:/Jogos/Ragnarok")
-        if game_dir.is_dir():
-            for other_grf in game_dir.glob("*.grf"):
-                if other_grf.resolve() == self.grf_path.resolve():
-                    continue
+            for folder in search_dirs:
                 try:
-                    with PureGrfArchive(other_grf) as extra_arc:
-                        for cand in candidates:
-                            for grf_key in (f"data/{cand}", cand):
-                                if grf_key in extra_arc:
-                                    data = extra_arc.read(grf_key)
-                                    try:
-                                        self.cache_dir.mkdir(parents=True, exist_ok=True)
-                                        (self.cache_dir / f"{norm_name}.gat").write_bytes(data)
-                                    except Exception:
-                                        pass
-                                    gat = Gat(data, name=norm_name)
-                                    self.cached_gats[norm_name] = gat
-                                    self.name = norm_name
-                                    self.gat = gat
-                                    return gat
-                except Exception:
-                    pass
+                    return Gat((folder / cand).read_bytes(), name=norm_name)
+                except (OSError, ValueError, struct.error):
+                    continue
 
-        raise ValueError(f"Mapa {name!r} (.gat) não encontrado em locais nem no GRF.")
+        gat = self._load_gat_from_archive(self.archive, candidates, norm_name)
+        if gat is not None:
+            return gat
+        for path in self.client_data_dir.parent.glob("*.grf"):
+            if path.resolve() == self.grf_path.resolve():
+                continue
+            archive = self._extra_archives.get(path)
+            if archive is None:
+                archive = self._extra_archives[path] = PureGrfArchive(path)
+            gat = self._load_gat_from_archive(archive, candidates, norm_name)
+            if gat is not None:
+                return gat
+        return None
+
+    def _load_gat_from_archive(self, archive, candidates, norm_name):
+        if archive is None:
+            return None
+        for cand in candidates:
+            try:
+                data = archive.read(f"data/{cand}")
+                gat = Gat(data, name=norm_name)
+            except (OSError, ValueError, struct.error, zlib.error):
+                continue
+            try:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                (self.cache_dir / f"{norm_name}.gat").write_bytes(data)
+            except OSError:
+                pass
+            return gat
+        return None
 
     def close(self):
         if self.archive is not None:
@@ -1677,7 +1769,7 @@ def get_mob_catalog(json_path="monstros-pt-br.json") -> dict:
         Path("./monstros-pt-br.json"),
     ]
     for cand in candidates:
-        if cand.is_file():
+        if cand and cand.is_file():
             try:
                 raw_dict = json.loads(cand.read_text(encoding="utf-8"))
                 break
