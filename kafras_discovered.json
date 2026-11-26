@@ -24,10 +24,10 @@
     "job": 116
   },
   "moc_para0a": {
-    "x": 27,
-    "y": 35,
-    "name": "Oficial do Éden",
-    "job": 952
+    "x": 41,
+    "y": 22,
+    "name": "Kafra",
+    "job": 860
   },
   "prontera": {
     "x": 146,
@@ -72,10 +72,10 @@
     "job": 860
   },
   "moc_para0c": {
-    "x": 27,
-    "y": 35,
-    "name": "Oficial do Éden",
-    "job": 952
+    "x": 41,
+    "y": 22,
+    "name": "Kafra",
+    "job": 860
   },
   "payon": {
     "x": 181,
@@ -88,5 +88,11 @@
     "y": 134,
     "name": "Kafra",
     "job": 115
+  },
+  "izlude": {
+    "x": 128,
+    "y": 148,
+    "name": "Kafra",
+    "job": 117
   }
 }

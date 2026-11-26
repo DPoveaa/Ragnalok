@@ -221,6 +221,17 @@
       "mobs": "Marina, Plankton"
     },
     {
+      "map_name": "izlude_in",
+      "label": "izlude_in",
+      "aliases": [],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
+    },
+    {
       "map_name": "moc_para01",
       "label": "Grupo Éden (moc_para01)",
       "aliases": [
@@ -388,6 +399,17 @@
       "ry": 0.48,
       "radius": 0.055,
       "mobs": "Munak, Bongun"
+    },
+    {
+      "map_name": "prt_in",
+      "label": "prt_in",
+      "aliases": [],
+      "region": "dungeons_submaps",
+      "layer": "submap",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
     },
     {
       "map_name": "prt_sewb1",
@@ -1241,6 +1263,17 @@
       "ry": 0.41,
       "radius": 0.05,
       "mobs": "Rocker, Zangão, Besouro-Ladrão"
+    },
+    {
+      "map_name": "prt_fild06",
+      "label": "prt_fild06",
+      "aliases": [],
+      "region": "rune_midgarts",
+      "layer": "field",
+      "rx": 0.47,
+      "ry": 0.45,
+      "radius": 0.045,
+      "mobs": ""
     },
     {
       "map_name": "prt_fild07",

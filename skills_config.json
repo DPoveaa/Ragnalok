@@ -1,18 +1,1 @@
-[
-  {
-    "enabled": true,
-    "name": "Skill 1",
-    "hotkey": "F2",
-    "mode": "Repetir até Confirmar no Alvo",
-    "skill_id": 0,
-    "status_id": 0,
-    "cooldown_sec": 1.0,
-    "cast_time_sec": 0.0,
-    "min_sp_pct": 10,
-    "min_mobs_3x3": 1,
-    "max_attempts": 5,
-    "max_range": 9.0,
-    "whitelist": [],
-    "blacklist": []
-  }
-]
+[]

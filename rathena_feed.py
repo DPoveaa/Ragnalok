@@ -3,9 +3,11 @@
 from argparse import ArgumentParser
 import base64
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+from queue import Empty, Full, Queue
 import re
 import struct
 from threading import Event, Lock, Thread
@@ -127,7 +129,9 @@ KNOWN_PACKET_SIZES = {
     0x0BC9: 10,
     0x0B14: 21,
     0x0B15: 21,
+    0x0A36: 7,   # Barra de HP resumida do mob, em faixas de 5%
     0x0ADD: 24,  # ZC_ITEM_FALL_ENTRY (24 bytes no PACKETVER atual)
+    0x0ADF: 58,  # Informações do ator
     0x0AFE: -1,  # ZC_NOTIFY_NEWENTRY (comprimento dinâmico)
     0x0AFD: -1,  # ZC_NOTIFY_MOVE
     0x0AFF: -1,  # ZC_NOTIFY_STANDENTRY
@@ -180,6 +184,9 @@ KAFRA_MENU_TOKENS = {
     "1Ga0AQ": "Informações",
     "1Wa0AQ": "Cancelar",
     "g2e0AQ": "Bazar",
+    "iWe0AQ": "Armazém 1",  # 0x01B46789
+    "ime0AQ": "Armazém 2",  # 0x01B4678A
+    "i2e0AQ": "Armazém 3",  # 0x01B4678B
 }
 _KAFRA_MENU_LABELS_BY_ID = {
     int.from_bytes(base64.b64decode(token + "=="), "little"): label
@@ -293,12 +300,131 @@ def packet_lengths(path):
     return lengths
 
 
+class TcpCaptureLog:
+    """Record one file per activation, with disk I/O isolated from capture."""
+
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.path = None
+        self.error = None
+        self._active = None
+        self._latest = None
+        self._lock = Lock()
+        self._writers = []
+
+    @property
+    def enabled(self):
+        return self._active is not None
+
+    @property
+    def dropped(self):
+        session = self._latest
+        return session[2][0] if session else 0
+
+    def set_enabled(self, enabled):
+        with self._lock:
+            if self.enabled == enabled:
+                return
+            if not enabled:
+                _, stopped, _ = self._active
+                self._active = None
+                stopped.set()
+                return
+            stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+            path = self.directory / f"tcp-{stamp}.log"
+            session = (Queue(maxsize=16384), Event(), [0])
+            writer = Thread(target=self._write, args=(session, path), name="tcp-capture-log", daemon=True)
+            self.path, self.error, self._active = path, None, session
+            self._latest = session
+            self._writers = [thread for thread in self._writers if thread.is_alive()]
+            try:
+                writer.start()
+            except RuntimeError as exc:
+                self._active = None
+                self.error = str(exc)
+            else:
+                self._writers.append(writer)
+
+    def record(self, direction, endpoints, kind, state, payload, decoded=None, tcp=None):
+        session = self._active
+        if session is None:
+            return
+        queue, _, lost = session
+        record = (time.time(), direction, endpoints, kind, state, bytes(payload), decoded, tcp)
+        with self._lock:
+            if self._active is not session:
+                return
+            try:
+                queue.put_nowait(record)
+            except Full:
+                lost[0] += 1
+
+    def close(self):
+        self.set_enabled(False)
+        deadline = time.monotonic() + 5.0
+        for writer in self._writers:
+            writer.join(max(0.0, deadline - time.monotonic()))
+        if any(writer.is_alive() for writer in self._writers):
+            print("[TCP Log] Encerramento com escrita ainda pendente.", flush=True)
+
+    def _write(self, session, path):
+        queue, stopped, lost = session
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("x", encoding="utf-8", buffering=65536) as log:
+                log.write("# TCP do jogo. len e Hex descrevem o payload. TCPHeader contém o cabeçalho do segmento. "
+                          "Em segmentos, RawOp é indicativo.\n")
+                flush_at = time.monotonic() + 0.5
+                reported_lost = 0
+                while not stopped.is_set() or not queue.empty():
+                    try:
+                        record = queue.get(timeout=0.2)
+                    except Empty:
+                        pass
+                    else:
+                        ts, direction, endpoints, kind, state, payload, decoded, tcp = record
+                        when = datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="milliseconds")
+                        raw = f"0x{u16(payload):04X}" if len(payload) >= 2 else "N/D"
+                        dec = f"0x{decoded:04X}" if decoded is not None else "N/D"
+                        client, server = endpoints
+                        connection = f"[{client[0]}]:{client[1]} <-> [{server[0]}]:{server[1]}"
+                        transport = ""
+                        if tcp is not None:
+                            seq, ack, flags, header = tcp
+                            transport = (f" | seq={seq} ack={ack} flags=0x{flags:02X}"
+                                         f" | TCPHeader: {header.hex(' ').upper()}")
+                        log.write(f"{when} | {direction} | {connection} | {kind} | len={len(payload)} | "
+                                  f"RawOp={raw} | DecOp={dec} | estado={state}{transport} | "
+                                  f"Hex: {payload.hex(' ').upper()}\n")
+                    if time.monotonic() >= flush_at:
+                        if lost[0] != reported_lost:
+                            reported_lost = lost[0]
+                            log.write(f"# Sobrecarga da fila: {reported_lost} registros perdidos até aqui.\n")
+                        log.flush()
+                        flush_at = time.monotonic() + 0.5
+                log.write(f"# Fim da captura | registros_perdidos={lost[0]}\n")
+        except OSError as exc:
+            with self._lock:
+                if self.path == path:
+                    self.error = str(exc)
+                if self._active is session:
+                    self._active = None
+            print(f"[TCP Log] Falha ao gravar {path}: {exc}", flush=True)
+
+
 class PacketStream:
-    def __init__(self, lengths, consume, world=None):
+    def __init__(self, lengths, consume, world=None, *, traffic_log=None, endpoints=None):
         self.lengths = lengths
         self.consume = consume
         self.world = world
         self.buffer = bytearray()
+        self.traffic_log = traffic_log
+        self.endpoints = endpoints
+        self.after_resync = False
+
+    def _trace(self, kind, state, start, end, decoded=None):
+        if self.traffic_log and self.traffic_log.enabled:
+            self.traffic_log.record("S->C", self.endpoints, kind, state, self.buffer[start:end], decoded)
 
     def feed(self, data):
         self.buffer.extend(data)
@@ -330,23 +456,29 @@ class PacketStream:
 
                 if found != -1:
                     skipped = found - start
-                    if self.world:
+                    next_opcode = u16(self.buffer, found)
+                    reason = "opcode desconhecido" if size is None else "tamanho variável inválido"
+                    self._trace("descarte", f"resync: {reason}, próximo=0x{next_opcode:04X}", start, found)
+                    self.after_resync = True
+                    if self.world and not (self.traffic_log and self.traffic_log.enabled):
                         cand_data = bytes(self.buffer[start:found])
                         self.world._log_unknown_packet(opcode, cand_data)
                     op_desc = f"0x{opcode:04X}" if size is None else "tamanho variável inválido"
                     print(
                         f"[Resync] Descartados {skipped} bytes no buffer ({op_desc}). "
-                        f"Ressincronizado no opcode 0x{u16(self.buffer, found):04X}.",
+                        f"Ressincronizado no opcode 0x{next_opcode:04X}.",
                         flush=True,
                     )
                     start = found
                     continue
                 else:
-                    if self.world:
+                    if self.world and not (self.traffic_log and self.traffic_log.enabled):
                         cand_data = bytes(self.buffer[start:min(len(self.buffer), start + 32)])
                         self.world._log_unknown_packet(opcode, cand_data)
                     # Nenhum opcode conhecido no buffer atual; mantém últimos bytes e aguarda
                     if len(self.buffer) - start > 1024:
+                        self._trace("descarte", "resync: sem limite de quadro conhecido", start, len(self.buffer) - 2)
+                        self.after_resync = True
                         start = len(self.buffer) - 2
                     break
 
@@ -360,12 +492,18 @@ class PacketStream:
                 break
 
             try:
-                self.consume(opcode, self.buffer[start:end])
+                handled = self.consume(opcode, self.buffer[start:end])
                 if self.world:
                     self.world.inc_packets_ok()
+                state = "sem ação" if handled is False else "processado"
             except Exception as exc:
+                state = f"erro no parser ({type(exc).__name__})"
                 print(f"[PacketStream] Erro ao processar 0x{opcode:04X}: {exc}", flush=True)
 
+            if self.after_resync:
+                state = f"pós-resync: {state}"
+                self.after_resync = False
+            self._trace("quadro", state, start, end, opcode)
             start = end
         del self.buffer[:start]
 
@@ -406,7 +544,8 @@ class TcpStream:
 class _OutboundOpcodes:
     """Track the packet key on the reassembled client stream."""
 
-    def __init__(self, sequence, lengths, keys, on_combat_packet, on_dialog_packet=None):
+    def __init__(self, sequence, lengths, keys, on_combat_packet, on_dialog_packet=None, *,
+                 traffic_log=None, endpoints=None):
         seed, self.multiplier, self.increment = keys or (0, 1, 0)
         self.encrypted = bool(keys)
         self.key = (seed * self.multiplier + self.increment) & MASK
@@ -416,7 +555,13 @@ class _OutboundOpcodes:
         self.on_combat_packet = on_combat_packet
         self.on_dialog_packet = on_dialog_packet
         self.last_dialog_sequence = None
+        self.traffic_log = traffic_log
+        self.endpoints = endpoints
         self.stream = TcpStream(sequence, self._consume)
+
+    def _trace(self, kind, state, data, opcode):
+        if self.traffic_log and self.traffic_log.enabled:
+            self.traffic_log.record("C->S", self.endpoints, kind, state, data, opcode)
 
     def _record_dialog(self, sequence, opcode, data):
         if self.last_dialog_sequence is not None:
@@ -445,6 +590,9 @@ class _OutboundOpcodes:
                 if size < 4 or size > 32768:
                     size = None
             if size is None or size < 2:
+                if self.traffic_log and self.traffic_log.enabled:
+                    self._trace("descarte", "opcode ou tamanho inválido; decodificador perdeu alinhamento",
+                                self.buffer[offset:], opcode)
                 self.key = None
                 self.buffer.clear()
                 return
@@ -452,8 +600,14 @@ class _OutboundOpcodes:
                 break
             if opcode in (0x0437, 0x035F, 0x0438):
                 self.on_combat_packet(opcode, self.buffer[offset:offset + size])
+                state = "processado pelo manipulador de combate"
             elif opcode in CLIENT_DIALOG_SIZES:
                 self._record_dialog((sequence + offset) & MASK, opcode, self.buffer[offset:offset + size])
+                state = "processado pelo manipulador de diálogo"
+            else:
+                state = "sem ação"
+            if self.traffic_log and self.traffic_log.enabled:
+                self._trace("quadro", state, self.buffer[offset:offset + size], opcode)
             offset += size
             self.key = (self.key * self.multiplier + self.increment) & MASK
         del self.buffer[:offset]
@@ -463,6 +617,7 @@ class _OutboundOpcodes:
             try:
                 self.stream.feed(sequence, payload)
             except ValueError:
+                self._trace("evento", "lacuna TCP; decodificador perdeu alinhamento", self.buffer, None)
                 self.key = None
                 self.buffer.clear()
         if self.key is None and not self.encrypted and len(payload) >= 2:
@@ -471,6 +626,7 @@ class _OutboundOpcodes:
             opcode = u16(payload)
             if opcode in CLIENT_DIALOG_SIZES and len(payload) >= CLIENT_DIALOG_SIZES[opcode]:
                 self._record_dialog(sequence, opcode, payload)
+                self._trace("quadro", "sem alinhamento: fallback de diálogo", payload, opcode)
         return self.decoded.get(sequence)
 
 
@@ -688,6 +844,7 @@ class World:
         self.packets_ok = 0
         self.active_server = None
         self.active_port = None
+        self.last_map_server_transition_ts = 0.0
         self.unknown_log_count = 0
         self.aid_to_gid = {}
         self._entity_speed_cache: dict[int, int] = {}
@@ -1035,6 +1192,8 @@ class World:
 
     def set_active_connection(self, server, port):
         with self.lock:
+            if self.active_server is not None and (self.active_server, self.active_port) != (server, port):
+                self.last_map_server_transition_ts = time.monotonic()
             self.active_server = server
             self.active_port = port
 
@@ -1121,6 +1280,9 @@ class World:
 
     def reset(self, preserve_transfer=False):
         with self.lock:
+            if getattr(self, "entities", None):
+                reason = "reinício do feed durante transferência" if preserve_transfer else "reinício do feed"
+                self._clear_map_entities(reason)
             if not preserve_transfer:
                 self._map_loading_until = 0.0
                 self.account_id = None
@@ -1141,6 +1303,7 @@ class World:
                 self.last_map_warp_ts = 0.0
                 self.last_map_warp = None
                 self.last_map_arrival = None
+                self.last_map_server_transition_ts = 0.0
                 self.skill_info = {}
                 self.learned_skill_sp_cost = {}
                 self.active_status_ids = set()
@@ -1173,6 +1336,7 @@ class World:
             self.pending_pickup = None
             self.last_pickup_ack = None
             self.farm_target_gid = None
+            self.last_removed_farm_target = None
             self.player_sp = 0
             self.player_max_sp = 0
             self.entities = {}
@@ -1222,14 +1386,35 @@ class World:
     def _is_local_player_id(self, entity_id):
         return self.player_id is not None and self.player_id >= 100000 and entity_id == self.player_id
 
-    def _remove_entity(self, entity_id):
+    def _remove_entity(self, entity_id, *, reason=None):
         self._entity_speed_cache.pop(entity_id, None)
         ent = self.entities.pop(entity_id, None)
         if ent is not None:
             for alias in (entity_id, ent.gid):
                 if self.aid_to_gid.get(alias) == entity_id:
                     self.aid_to_gid.pop(alias)
+            if ent.kind == "mob" and reason is not None:
+                if entity_id in (self.farm_target_gid, self.locked_combat_mob_gid, self.last_mob_attack[0]):
+                    self.last_removed_farm_target = (entity_id, time.monotonic(), reason)
+                self._clear_entity_combat(entity_id)
+                print(f"[Feed] Mob #{entity_id} removido ({reason}).", flush=True)
         return ent
+
+    def _clear_entity_combat(self, entity_id):
+        if self.last_mob_attack[0] == entity_id:
+            self.last_mob_attack = (None, None, 0.0)
+        if self.locked_combat_mob_gid == entity_id:
+            self.locked_combat_mob_gid = None
+        if self.farm_target_gid == entity_id:
+            self.farm_target_gid = None
+
+    def _clear_map_entities(self, reason):
+        for entity_id, entity in tuple(self.entities.items()):
+            if entity.kind == "mob":
+                self._remove_entity(entity_id, reason=reason)
+        self.entities.clear()
+        self.aid_to_gid.clear()
+        self._entity_speed_cache.clear()
 
     def get_npcs(self):
         with self.lock:
@@ -1311,13 +1496,9 @@ class World:
                         and not (entity.kind == "drop"
                                  and (entity.suspected_other_owner or entity.retry_after
                                       or (self.drop_is_priority and self.drop_is_priority(entity.catalog_id))))):
-                    self._remove_entity(entity_id)
-                    if self.last_mob_attack[0] == entity_id:
-                        self.last_mob_attack = (None, None, 0.0)
-                    if self.locked_combat_mob_gid == entity_id:
-                        self.locked_combat_mob_gid = None
-                    if self.farm_target_gid == entity_id:
-                        self.farm_target_gid = None
+                    self._remove_entity(entity_id, reason="fora do raio de acompanhamento (22 células)")
+                    if entity.kind != "mob":
+                        self._clear_entity_combat(entity_id)
             entities = tuple(
                 (key, entity) for key, entity in self.entity_items()
                 if not self._is_local_player_id(key[1])
@@ -1445,10 +1626,11 @@ class World:
             self._log_unknown_packet(opcode, data)
         try:
             with self.lock:
-                self._apply(opcode, data)
+                handled = self._apply(opcode, data)
                 if opcode in MAP_ACTIVITY:
                     self._map_loading_until = 0.0
                 self._maybe_save_heatmap()
+                return handled is not False or opcode in MAP_ACTIVITY
         except (struct.error, IndexError, UnicodeError) as exc:
             raise ValueError(f"Layout inválido para 0x{opcode:04X}.") from exc
 
@@ -1546,15 +1728,13 @@ class World:
                 self._sync_player_status()
             self.pending_pickup = None
             self.last_pickup_ack = None
+            self._clear_map_entities("mudança de mapa ou teleporte (0x0091)")
             self.farm_target_gid = None
             self.recent_dead_mobs.clear()
             self.mobs_damaged_by_me.clear()
             self.mobs_damaged_by_others.clear()
             self._player_attacked_mobs.clear()
             self.locked_combat_mob_gid = None
-            self.entities.clear()
-            self.aid_to_gid.clear()
-            self._entity_speed_cache.clear()
             self.last_attack_target_id = self.last_attack_action = None
             self.last_attack_ts = self.last_move_ts = 0.0
             self.last_mob_attack = (None, None, 0.0)
@@ -1602,9 +1782,7 @@ class World:
             self.current_map = f"{name}.gat" if name else None
             self.pending_pickup = None
             self.last_pickup_ack = None
-            self.entities.clear()
-            self.aid_to_gid.clear()
-            self._entity_speed_cache.clear()
+            self._clear_map_entities(f"transferência de mapa (0x{opcode:04X})")
             self.last_attack_target_id = self.last_attack_action = None
             self.last_attack_ts = self.last_move_ts = 0.0
             self.last_mob_attack = (None, None, 0.0)
@@ -2048,14 +2226,18 @@ class World:
                     for entity_id in ids:
                         self.mobs_damaged_by_me.pop(entity_id, None)
                         self.mobs_damaged_by_others.pop(entity_id, None)
-                    if getattr(self, "locked_combat_mob_gid", None) in (gid, real_gid):
-                        self.locked_combat_mob_gid = None
-                    if self.farm_target_gid in (gid, real_gid):
-                        self.farm_target_gid = None
-                    self._remove_entity(real_gid)
+                    vanish_reason = {
+                        0: "saída de visão",
+                        1: "morte confirmada",
+                        2: "desconexão",
+                        3: "teleporte",
+                        4: "morte simulada",
+                    }.get(vanish_type, "desaparecimento informado pelo servidor")
+                    self._remove_entity(real_gid, reason=f"{vanish_reason}, 0x0080 tipo {vanish_type}")
+                    self._clear_entity_combat(real_gid)
+                    if gid != real_gid:
+                        self._clear_entity_combat(gid)
                     self.entity_names.pop(real_gid, None)
-                    if self.last_mob_attack[0] == real_gid:
-                        self.last_mob_attack = (None, None, 0.0)
                 else:
                     # 0x00A1 ZC_ITEM_DISAPPEAR: registra posição do drop antes de removê-lo
                     # para permitir cruzamento com 0x00A0 (item coletado a <= 2.5 células)
@@ -2222,6 +2404,8 @@ class World:
             self._drop(opcode, data)
         elif opcode in UNIT:
             self._unit(opcode, data)
+        else:
+            return False
 
     def _drop(self, opcode, data):
         now = time.monotonic()
@@ -2472,11 +2656,16 @@ class World:
             previous_id = self.aid_to_gid.get(alias, alias)
             if previous_id != entity_id:
                 previous_speed = self._entity_speed_cache.get(previous_id)
-                previous = self._remove_entity(previous_id)
+                previous = self._remove_entity(
+                    previous_id, reason=f"identificador substituído por #{entity_id} (0x{opcode:04X})")
                 if old_ent is None and previous is not None and previous.kind == kind:
                     old_ent = previous
                     cached_speed = previous_speed
-        self._remove_entity(entity_id)
+        prior = self.entity("mob", entity_id)
+        if prior is not None and kind != "mob":
+            self._remove_entity(entity_id, reason=f"entidade passou a ser classificada como {kind} (0x{opcode:04X})")
+        else:
+            self._remove_entity(entity_id)
         for alias in aliases:
             self.aid_to_gid[alias] = entity_id
 
@@ -2677,7 +2866,8 @@ def _capture_packet_keys(packet_keys):
     return packet_keys if any(packet_keys) else None
 
 
-def capture(world, lengths, interface, server, port, local_port, stop, ready, ragexe_pid=None, *, packet_keys=None):
+def capture(world, lengths, interface, server, port, local_port, stop, ready, ragexe_pid=None, *,
+            packet_keys=None, traffic_log=None):
     packet_keys = _capture_packet_keys(packet_keys)
     IP, IPv6, TCP, conf, sniff = scapy_capture()
     target = ConnectionTarget(server, port, local_port)
@@ -2713,7 +2903,8 @@ def capture(world, lengths, interface, server, port, local_port, stop, ready, ra
                 if active == peer:
                     world.record_client_dialog_packet(opcode, data)
 
-            return _OutboundOpcodes(sequence, lengths, packet_keys, record, record_dialog)
+            return _OutboundOpcodes(sequence, lengths, packet_keys, record, record_dialog,
+                                    traffic_log=traffic_log, endpoints=(peer, (current_server, current_port)))
 
         def receive(packet):
             nonlocal active, stream, diag_count
@@ -2735,6 +2926,12 @@ def capture(world, lengths, interface, server, port, local_port, stop, ready, ra
                 if 0 < padding_size <= len(payload):
                     payload = payload[:-padding_size]
 
+            logging = traffic_log is not None and traffic_log.enabled
+            transport = None
+            if logging:
+                original = tcp.original or bytes(tcp)
+                header = original[:(original[12] >> 4) * 4] if len(original) >= 20 else original
+                transport = (tcp.seq, tcp.ack, flags, header)
             if not from_server:
                 peer = ip.src, tcp.sport
                 sequence = (tcp.seq + bool(flags & 0x02)) & MASK
@@ -2743,16 +2940,30 @@ def capture(world, lengths, interface, server, port, local_port, stop, ready, ra
                 if payload:
                     raw_op = u16(payload) if len(payload) >= 2 else None
                     decoder = outbound.get(peer)
-                    dec_op = decoder.feed(sequence, payload) if decoder else None
-                    if not packet_keys:
-                        dec_op = raw_op
-                    raw_text = f"0x{raw_op:04X}" if raw_op is not None else "N/D"
-                    dec_text = f"0x{dec_op:04X}" if dec_op is not None else "N/D"
-                    print(
-                        f"[TCP C->S] len={len(payload)} | RawOp={raw_text} | "
-                        f"DecOp={dec_text} | Hex: {payload.hex(' ').upper()}",
-                        flush=True,
-                    )
+                    dec_op = None
+                    state = "sem decodificador para a conexão"
+                    try:
+                        if decoder is not None:
+                            dec_op = decoder.feed(sequence, payload)
+                            state = ("decodificador alinhado" if decoder.key is not None
+                                     else "decodificador sem alinhamento")
+                    finally:
+                        if logging:
+                            traffic_log.record("C->S", (peer, (current_server, current_port)),
+                                               "segmento", state, payload, dec_op, transport)
+                    if not logging:
+                        if not packet_keys:
+                            dec_op = raw_op
+                        raw_text = f"0x{raw_op:04X}" if raw_op is not None else "N/D"
+                        dec_text = f"0x{dec_op:04X}" if dec_op is not None else "N/D"
+                        print(
+                            f"[TCP C->S] len={len(payload)} | RawOp={raw_text} | "
+                            f"DecOp={dec_text} | Hex: {payload.hex(' ').upper()}",
+                            flush=True,
+                        )
+                elif logging:
+                    traffic_log.record("C->S", (peer, (current_server, current_port)),
+                                       "segmento", "sem payload", payload, tcp=transport)
                 if flags & 0x05:
                     outbound.pop(peer, None)
                     if active == peer:
@@ -2766,12 +2977,22 @@ def capture(world, lengths, interface, server, port, local_port, stop, ready, ra
             # Inicializa o stream tanto em nova conexão (SYN) quanto em conexão já ativa
             if active is None:
                 active = peer
-                frames = PacketStream(lengths, world.consume, world)
+                frames = PacketStream(lengths, world.consume, world,
+                                      traffic_log=traffic_log, endpoints=(peer, (current_server, current_port)))
                 initial_seq = (tcp.seq + 1) if (flags & 0x02) else tcp.seq
                 stream = TcpStream(initial_seq, frames.feed)
                 if flags & 0x02:
                     world.reset(preserve_transfer=True)
 
+            if logging:
+                if not payload:
+                    state = "sem payload"
+                elif active != peer:
+                    state = "conexão fora do parser ativo"
+                else:
+                    state = "para remontagem TCP" if stream else "parser pausado"
+                traffic_log.record("S->C", (peer, (current_server, current_port)),
+                                   "segmento", state, payload, tcp=transport)
             if active != peer:
                 return
 
@@ -2780,10 +3001,10 @@ def capture(world, lengths, interface, server, port, local_port, stop, ready, ra
                 world.add_tcp_bytes(len(payload))
 
                 op = u16(payload, 0) if len(payload) >= 2 else None
-                hex_prefix = payload[:4].hex(" ").upper() if len(payload) >= 2 else payload.hex(" ").upper()
 
                 # Diagnóstico rápido do stream TCP: imprime apenas os primeiros 15 pacotes recebidos
-                if diag_count < 15:
+                if not logging and diag_count < 15:
+                    hex_prefix = payload[:4].hex(" ").upper()
                     diag_count += 1
                     if op is not None:
                         if op in KNOWN_SYNC_OPCODES:
@@ -2806,7 +3027,7 @@ def capture(world, lengths, interface, server, port, local_port, stop, ready, ra
                         print("[TCP] Diagnóstico inicial dos 15 primeiros pacotes concluído.", flush=True)
 
                 # Diagnóstico contínuo de pacotes de chão/candidatos (16 a 26 bytes) conhecidos mas sem ação
-                if op is not None and op not in KNOWN_SYNC_OPCODES and op in lengths:
+                if not logging and op is not None and op not in KNOWN_SYNC_OPCODES and op in lengths:
                     if 16 <= len(payload) <= 26:
                         print(
                             f"[TCP Chão/Candidato] {len(payload)} bytes | "
@@ -2818,6 +3039,9 @@ def capture(world, lengths, interface, server, port, local_port, stop, ready, ra
                     if stream:
                         stream.feed((tcp.seq + bool(flags & 0x02)) & MASK, payload)
                 except ValueError as exc:
+                    if logging:
+                        traffic_log.record("S->C", (peer, (current_server, current_port)), "evento",
+                                           "lacuna TCP; parser pausado", b"")
                     print(f"Captura pausada para esta conexão. {exc}", flush=True)
                     stream = None
                     world.reset()
