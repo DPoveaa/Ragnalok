@@ -2,7 +2,8 @@
 
 from argparse import ArgumentParser
 import base64
-from dataclasses import dataclass, replace
+from collections import deque
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import json
 import math
@@ -10,6 +11,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 import re
 import struct
+import sys
 from threading import Event, Lock, Thread
 import time
 
@@ -88,7 +90,7 @@ PICKUP_ACK = {
     0x0990: (6, 41), 0x0A0C: (31, 66), 0x0A37: (34, 69), 0x0B41: (36, 70),
 }
 UNIT = {
-    0x0078: "idle", 0x007B: "walk", 0x007C: "spawn", 0x022C: "spawn",
+    0x0078: "idle", 0x0079: "spawn", 0x007B: "walk", 0x007C: "spawn", 0x022A: "idle", 0x022B: "spawn", 0x022C: "spawn",
     0x02EC: "walk", 0x02ED: "spawn", 0x02EE: "idle",
     0x07F7: "walk", 0x07F8: "spawn", 0x07F9: "idle",
     0x0856: "walk", 0x0858: "spawn", 0x0857: "idle",
@@ -96,6 +98,14 @@ UNIT = {
     0x09DB: "walk", 0x09DC: "spawn", 0x09DD: "idle",
     0x09FD: "walk", 0x09FE: "spawn", 0x09FF: "idle",
     0x0AFD: "walk", 0x0AFE: "spawn", 0x0AFF: "idle",
+}
+MOB_SPAWN_OPCODES = {
+    0x09FF, 0x09FE, 0x09FD,
+    0x0078, 0x0079, 0x007B, 0x007C,
+    0x022A, 0x022B, 0x022C,
+    0x0856, 0x0857, 0x0858,
+    0x0914, 0x0915,
+    0x09DC, 0x09DD,
 }
 CANONICAL_UNIT_TYPES = {
     0: "player", 1: "npc", 5: "mob", 6: "npc",
@@ -130,6 +140,7 @@ KNOWN_PACKET_SIZES = {
     0x0B14: 21,
     0x0B15: 21,
     0x0A36: 7,   # Barra de HP resumida do mob, em faixas de 5%
+    0x0977: 14,  # ZC_HP_INFO
     0x0ADD: 24,  # ZC_ITEM_FALL_ENTRY (24 bytes no PACKETVER atual)
     0x0ADF: 58,  # Informações do ator
     0x0AFE: -1,  # ZC_NOTIFY_NEWENTRY (comprimento dinâmico)
@@ -163,18 +174,430 @@ KNOWN_PACKET_SIZES = {
     0x00D7: -1,  # variable
     0x00D8: 6,
     0x00A0: 33,  # ZC_ITEM_PICKUP_ACK
+    0x0B41: 70,  # ZC_ADD_ITEM_TO_INVENTORY3
     0x011C: 68,  # ZC_WARPLIST
     0x0438: 10,  # CZ_USE_SKILL
+    0x043D: 8,   # ZC_SKILL_POSTDELAY
+    0x0985: -1,  # ZC_SKILL_COOLDOWN
+    0x09CF: 64,  # ZC_GAMEGUARD_REQ
+    0x09D0: -1,  # CZ_GAMEGUARD_RES
     0x010F: -1,  # ZC_SKILLINFO_LIST
     0x011A: 15,  # ZC_USE_SKILL
     0x09CB: 17,  # ZC_USE_SKILL (variante)
-    0x0110: 10,  # ZC_ACK_TOUSESKILL
+    0x0110: 14,  # ZC_ACK_TOUSESKILL / ZC_SKILL_FAILED (PACKETVER >= 20220406: 14 bytes)
+    0x00C0: 8,   # ZC_EMOTION (8 bytes neste servidor)
+    0x00E6: 4,   # 4 bytes neste servidor
+    0x01AC: 7,   # 7 bytes neste servidor
+    0x0100: 8,   # 8 bytes neste servidor
+    0x001D: 10,  # opcode 2B + GID 4B + tick 4B
+    0x01B0: 16,  # ZC_NPCSPRITE_CHANGE
     0x019B: 10,  # ZC_NOTIFY_EFFECT / cancelamento
     0x0196: 9,   # ZC_MSG_STATE_CHANGE
     0x043F: 25,  # ZC_MSG_STATE_CHANGE (com RemainMS)
     0x0983: 29,  # ZC_MSG_STATE_CHANGE (com total/left)
 }
 NPC_DIALOG_TEXT_OPCODES = (0x00B4, 0x00B7)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARTE 1-2: Catálogo de opcodes, logs semânticos e autocalibragem TCP
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Opções de log configuráveis
+log_keepalive_packets: bool = False   # oculta 0x0360, 0x007F, 0x0B1C por padrão
+log_sc_packets: bool = True           # exibe pacotes S->C traduzidos
+
+KEEPALIVE_OPCODES = frozenset({0x0360, 0x007F, 0x0B1C})
+
+# Âncoras usadas pelo auto-aprendizado de tamanhos desconhecidos
+ANCHOR_OPCODES = frozenset({0x007F, 0x0080, 0x0086, 0x00B0, 0x00B1, 0x08C8, 0x09FF})
+
+# Catálogo abrangente de opcodes rAthena (CZ_* C->S | ZC_* S->C)
+OPCODE_CATALOG: dict[int, dict] = {
+    # ── Movimento ─────────────────────────────────────────────────────────────
+    0x035F: {"dir": "C->S", "name": "CZ_REQUEST_MOVE2",        "desc_pt": "Solicitar movimento (pré-RE)"},
+    0x0085: {"dir": "C->S", "name": "CZ_REQUEST_MOVE",         "desc_pt": "Solicitar movimento"},
+    0x0086: {"dir": "S->C", "name": "ZC_NOTIFY_PLAYERMOVE",    "desc_pt": "Notificar movimento de entidade"},
+    0x0087: {"dir": "S->C", "name": "ZC_NOTIFY_MOVE",          "desc_pt": "Mover jogador"},
+    # ── Ataque / Ação ─────────────────────────────────────────────────────────
+    0x0437: {"dir": "C->S", "name": "CZ_REQUEST_ACT2",         "desc_pt": "Ação de combate (ataque)"},
+    0x008A: {"dir": "S->C", "name": "ZC_NOTIFY_ACT",           "desc_pt": "Notificar ação (ataque/dano)"},
+    0x02E1: {"dir": "S->C", "name": "ZC_NOTIFY_ACT2",          "desc_pt": "Dano / Ação de combate",
+             "fields": ("src_id@2:u32", "dst_id@6:u32", "damage@22:u32", "div@26:u16", "type@28:u8")},
+    0x08C8: {"dir": "S->C", "name": "ZC_NOTIFY_ACT3",          "desc_pt": "Notificar ação extendida (dano 32b)"},
+    0x0088: {"dir": "S->C", "name": "ZC_STOPMOVE",             "desc_pt": "Parar movimento de entidade"},
+    # ── Habilidades ───────────────────────────────────────────────────────────
+    0x0438: {"dir": "C->S", "name": "CZ_USE_SKILL",            "desc_pt": "Usar habilidade em alvo",
+             "fields": ("skill_lv@2:u16", "skill_id@4:u16", "target_id@6:u32")},
+    0x0436: {"dir": "C->S", "name": "CZ_USE_SKILL_TOGROUND",   "desc_pt": "Usar habilidade no chão",
+             "fields": ("skill_lv@2:u16", "skill_id@4:u16", "x@6:u16", "y@8:u16")},
+    0x0110: {"dir": "S->C", "name": "ZC_SKILL_FAILED",         "desc_pt": "Falha de uso de habilidade",
+             "fields": ("skill_id@2:u16", "fail@12:u8", "cause@13:u8")},
+    0x0114: {"dir": "S->C", "name": "ZC_NOTIFY_SKILL",         "desc_pt": "Notificar habilidade usada"},
+    0x011A: {"dir": "S->C", "name": "ZC_USE_SKILL",            "desc_pt": "Habilidade executada",
+             "fields": ("skill_id@2:u16", "dst_id@6:u32", "src_id@10:u32", "result@14:u8")},
+    0x013E: {"dir": "S->C", "name": "ZC_USESKILL_ACK",         "desc_pt": "Iniciou conjuração (ack)",
+             "fields": ("src_id@2:u32", "dst_id@6:u32", "x@10:u16", "y@12:u16", "skill_id@14:u16", "cast_time@16:u32")},
+    0x01DE: {"dir": "S->C", "name": "ZC_NOTIFY_SKILL2",        "desc_pt": "Dano de habilidade em alvo",
+             "fields": ("skill_id@2:u16", "src_id@4:u32", "dst_id@8:u32", "damage@24:u32")},
+    0x043D: {"dir": "S->C", "name": "ZC_SKILL_POSTDELAY",      "desc_pt": "Delay pós-habilidade",
+             "fields": ("skill_id@2:u16", "delay_ms@4:u32")},
+    0x0985: {"dir": "S->C", "name": "ZC_SKILL_COOLDOWN",       "desc_pt": "Cooldown de habilidades"},
+    0x07FB: {"dir": "S->C", "name": "ZC_USE_SKILL2",           "desc_pt": "Habilidade alvo com feedback",
+             "fields": ("src_id@2:u32", "dst_id@6:u32", "x@10:u16", "y@12:u16", "skill_id@14:u16", "cast_time@16:u32", "result@24:u8")},
+    0x09CB: {"dir": "S->C", "name": "ZC_USE_SKILL_v2",         "desc_pt": "Habilidade executada (variante)",
+             "fields": ("skill_id@2:u16", "dst_id@8:u32", "src_id@12:u32", "result@16:u8")},
+    # ── Spawn / Vanish ────────────────────────────────────────────────────────
+    0x09FF: {"dir": "S->C", "name": "ZC_NOTIFY_STANDENTRY",    "desc_pt": "Entidade em espera (parada)"},
+    0x09FD: {"dir": "S->C", "name": "ZC_NOTIFY_MOVEENTRY",     "desc_pt": "Entidade em movimento"},
+    0x09FE: {"dir": "S->C", "name": "ZC_NOTIFY_NEWENTRY",      "desc_pt": "Nova entidade (spawn)"},
+    0x0080: {"dir": "S->C", "name": "ZC_NOTIFY_VANISH",        "desc_pt": "Entidade removida",
+             "fields": ("gid@2:u32", "type@6:u8")},
+    0x00A1: {"dir": "S->C", "name": "ZC_ITEM_DISAPPEAR",       "desc_pt": "Item desapareceu do chão"},
+    # ── Itens / Loot / Equip ──────────────────────────────────────────────────
+    0x0362: {"dir": "C->S", "name": "CZ_ITEM_PICKUP2",         "desc_pt": "Coletar item do chão"},
+    0x009E: {"dir": "S->C", "name": "ZC_ITEM_FALL_ENTRY",      "desc_pt": "Item caiu no chão"},
+    0x0ADD: {"dir": "S->C", "name": "ZC_ITEM_FALL_ENTRY5",     "desc_pt": "Item caiu no chão (moderno)"},
+    0x00A0: {"dir": "S->C", "name": "ZC_ITEM_PICKUP_ACK",      "desc_pt": "Confirmação de coleta de item",
+             "fields": ("index@2:u16", "count@4:u16", "item_id@6:u16")},
+    0x0B41: {"dir": "S->C", "name": "ZC_ADD_ITEM_TO_INVENTORY3", "desc_pt": "Item adicionado ao inventário",
+             "fields": ("index@2:u16", "amount@4:u16", "item_id@6:u32")},
+    0x00AF: {"dir": "S->C", "name": "ZC_ITEM_THROW_ACK",       "desc_pt": "Item removido do inventário",
+             "fields": ("index@2:u16", "count@4:u16")},
+    0x01C8: {"dir": "S->C", "name": "ZC_USE_ITEM_ACK2",        "desc_pt": "Uso de item confirmado"},
+    # ── Status / HP / SP ──────────────────────────────────────────────────────
+    0x00B0: {"dir": "S->C", "name": "ZC_PAR_CHANGE",           "desc_pt": "Mudança de atributo (curto)",
+             "fields": ("var_id@2:u16", "value@4:u32")},
+    0x00B1: {"dir": "S->C", "name": "ZC_LONGPAR_CHANGE",       "desc_pt": "Mudança de atributo (longo)",
+             "fields": ("var_id@2:u16", "value@4:u32")},
+    0x0196: {"dir": "S->C", "name": "ZC_MSG_STATE_CHANGE",     "desc_pt": "Mudança de estado/status",
+             "fields": ("status_id@2:u16", "aid@4:u32", "state@8:u8")},
+    0x0983: {"dir": "S->C", "name": "ZC_MSG_STATE_CHANGE3",    "desc_pt": "Mudança de status com tempo"},
+    0x0119: {"dir": "S->C", "name": "ZC_STATE_CHANGE",         "desc_pt": "Mudança de estado de opções"},
+    # ── NPC / Chat / Mapa ─────────────────────────────────────────────────────
+    0x0090: {"dir": "C->S", "name": "CZ_CONTACTNPC",           "desc_pt": "Interagir com NPC"},
+    0x00B4: {"dir": "S->C", "name": "ZC_SAY_DIALOG",           "desc_pt": "Diálogo do NPC (texto)"},
+    0x00B5: {"dir": "S->C", "name": "ZC_WAIT_DIALOG",          "desc_pt": "Aguardar ação no diálogo"},
+    0x00B6: {"dir": "S->C", "name": "ZC_CLOSE_DIALOG",         "desc_pt": "Fechar diálogo do NPC"},
+    0x00B7: {"dir": "S->C", "name": "ZC_MENU_LIST",            "desc_pt": "Menu de opções do NPC"},
+    0x0091: {"dir": "S->C", "name": "ZC_NPCACK_MAPMOVE",       "desc_pt": "Mudar de mapa (teletransporte)"},
+    0x0AC7: {"dir": "S->C", "name": "ZC_NPCACK_SERVERMOVE",    "desc_pt": "Transferência de servidor de mapa"},
+    # ── Consulta de Nome ──────────────────────────────────────────────────────
+    0x0368: {"dir": "C->S", "name": "CZ_REQNAME2",             "desc_pt": "Solicitar nome de entidade"},
+    0x0095: {"dir": "S->C", "name": "ZC_ACK_REQNAME",          "desc_pt": "Resposta com nome de entidade",
+             "fields": ("aid@2:u32",)},
+    0x0ADF: {"dir": "S->C", "name": "ZC_ACK_REQNAMEALL2",      "desc_pt": "Nome e informações de entidade",
+             "fields": ("gid@2:u32",)},
+    # ── Emoções / GameGuard ───────────────────────────────────────────────────
+    0x00C0: {"dir": "S->C", "name": "ZC_EMOTION",              "desc_pt": "Emoção/emoji de entidade",
+             "fields": ("aid@2:u32", "type@6:u8")},
+    0x09CF: {"dir": "S->C", "name": "ZC_GAMEGUARD_REQ",        "desc_pt": "Verificação periódica GameGuard"},
+    0x09D0: {"dir": "C->S", "name": "CZ_GAMEGUARD_RES",        "desc_pt": "Resposta de verificação GameGuard"},
+    # ── Keep-alive ────────────────────────────────────────────────────────────
+    0x0360: {"dir": "C->S", "name": "CZ_REQUEST_TIME2",        "desc_pt": "Keep-alive / heartbeat"},
+    0x007F: {"dir": "S->C", "name": "ZC_NOTIFY_TIME",          "desc_pt": "Notificação de tempo (pong)"},
+    0x0B1C: {"dir": "S->C", "name": "ZC_PING",                 "desc_pt": "Ping do servidor"},
+    # ── Inventário ────────────────────────────────────────────────────────────
+    0x010F: {"dir": "S->C", "name": "ZC_SKILLINFO_LIST",       "desc_pt": "Lista de habilidades do personagem"},
+}
+
+# Variáveis de parâmetro ZC_PAR_CHANGE
+_PARAM_NAMES = {
+    0: "velocidade", 5: "HP", 6: "HP_max", 7: "SP", 8: "SP_max",
+    11: "nv_base", 20: "zeny", 24: "peso", 25: "peso_max", 55: "nv_job",
+}
+# Tipos de desaparecimento 0x0080
+_VANISH_TYPES = {0: "FoV", 1: "Morte", 2: "Desconexão", 3: "Teleporte", 4: "Morte simulada"}
+
+
+def _decode_packet_summary(opcode: int, data: bytes | bytearray) -> str:
+    """Decodifica campos relevantes de um pacote para exibição no log."""
+    info = OPCODE_CATALOG.get(opcode)
+    if info is None:
+        return ""
+    parts = []
+    for field_spec in info.get("fields", ()):
+        try:
+            name, rest = field_spec.split("@")
+            off_str, fmt = rest.split(":")
+            off = int(off_str)
+            if fmt == "u8"  and len(data) > off:
+                val = data[off]
+            elif fmt == "u16" and len(data) >= off + 2:
+                val = struct.unpack_from("<H", data, off)[0]
+            elif fmt == "u32" and len(data) >= off + 4:
+                val = struct.unpack_from("<I", data, off)[0]
+            else:
+                continue
+            # Anotações especiais
+            if opcode == 0x0080 and name == "type":
+                val = f"{val} ({_VANISH_TYPES.get(val, '?')})"
+            elif opcode in (0x00B0, 0x00B1) and name == "var_id":
+                val = f"{val} ({_PARAM_NAMES.get(val, '?')})"
+            elif name in ("gid", "aid", "dst_id", "src_id", "target_id"):
+                val = f"#{val}"
+            parts.append(f"{name}={val}")
+        except Exception:
+            pass
+    return " ".join(parts)
+
+
+def log_packet(direction: str, opcode: int, data: bytes | bytearray) -> None:
+    """Emite linha de log semântico para um pacote C->S ou S->C."""
+    if opcode in KEEPALIVE_OPCODES and not log_keepalive_packets:
+        return
+    if direction == "S->C" and not log_sc_packets:
+        return
+    info = OPCODE_CATALOG.get(opcode)
+    if info:
+        name = info["name"]
+        desc = info["desc_pt"]
+        summary = _decode_packet_summary(opcode, data)
+        extra = f" | {summary}" if summary else ""
+        print(
+            f"[TCP {direction}] 0x{opcode:04X} ({len(data)}B) | {name} — {desc}{extra}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[TCP {direction}] 0x{opcode:04X} ({len(data)}B) | (desconhecido)",
+            flush=True,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARTE 1: Auto-calibragem de tamanhos via leitura de memória do Ragexe
+# ─────────────────────────────────────────────────────────────────────────────
+
+PACKET_LENGTHS_CACHE_PATH = Path(__file__).with_name("packet_lengths_cache.json")
+PACKET_CATALOG_PATH = Path(__file__).with_name("packet_catalog.json")
+
+# Pares âncora conhecidos para localizar a árvore interna std::map do Ragexe
+_ANCHOR_PAIRS: list[tuple[int, int]] = [
+    (0x007D, 2), (0x0080, 7), (0x0187, 6), (0x0360, 6), (0x0110, 14), (0x00C0, 8),
+]
+
+# Baseline de tamanhos confirmados (sobrescreve cache)
+_BASELINE_SIZES: dict[int, int] = {
+    0x0110: 14, 0x00C0: 8, 0x00E6: 4, 0x01AC: 7,
+    0x0100: 8, 0x001D: 10, 0x01B0: 16,
+}
+
+
+def _rpm_read(h_process, addr: int, size: int) -> bytes | None:
+    """Lê `size` bytes da memória do processo via ReadProcessMemory."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        buf = (ctypes.c_char * size)()
+        read = ctypes.c_size_t(0)
+        ok = k32.ReadProcessMemory(h_process, ctypes.c_void_p(addr), buf, size, ctypes.byref(read))
+        if ok and read.value >= size:
+            return bytes(buf)
+    except Exception:
+        pass
+    return None
+
+
+def _walk_std_map_node(h_process, node_addr: int, result: dict, depth: int = 0) -> None:
+    """Percorre recursivamente nós da árvore std::map<int,int> (Red-Black Tree MSVC/GCC)."""
+    if depth > 40 or not node_addr:
+        return
+    # Layout nó MSVC std::map: [left*8][right*8][parent*8][color4][pad4][key4][value4]
+    raw = _rpm_read(h_process, node_addr, 32)
+    if raw is None:
+        return
+    try:
+        left, right, _parent = struct.unpack_from("<QQQ", raw, 0)
+        key, value = struct.unpack_from("<ii", raw, 24)
+        if 0 <= key <= 0xFFFF and (value == -1 or 2 <= value <= 0xFFFF):
+            result[key] = value
+        _walk_std_map_node(h_process, left, result, depth + 1)
+        _walk_std_map_node(h_process, right, result, depth + 1)
+    except Exception:
+        pass
+
+
+def _scan_ragexe_packet_lengths(pid: int) -> dict[int, int] | None:
+    """
+    Varre memória do Ragexe buscando a árvore std::map de tamanhos de pacotes.
+    Retorna {opcode: length} ou None se não encontrado.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        h = k32.OpenProcess(0x0010, False, int(pid))  # PROCESS_VM_READ
+        if not h:
+            return None
+
+        # VirtualQueryEx para enumerar regiões
+        class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BaseAddress",       ctypes.c_ulonglong),
+                ("AllocationBase",    ctypes.c_ulonglong),
+                ("AllocationProtect", wintypes.DWORD),
+                ("PartitionId",       wintypes.WORD),
+                ("RegionSize",        ctypes.c_ulonglong),
+                ("State",             wintypes.DWORD),
+                ("Protect",           wintypes.DWORD),
+                ("Type",              wintypes.DWORD),
+            ]
+        k32.VirtualQueryEx.argtypes = (wintypes.HANDLE, ctypes.c_void_p,
+                                       ctypes.POINTER(MEMORY_BASIC_INFORMATION), ctypes.c_size_t)
+        k32.VirtualQueryEx.restype = ctypes.c_size_t
+        mbi = MEMORY_BASIC_INFORMATION()
+        addr = 0
+        candidates: list[tuple[int, int]] = []  # (region_base, region_size)
+        while True:
+            ret = k32.VirtualQueryEx(h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi))
+            if not ret:
+                break
+            MEM_COMMIT = 0x1000
+            PAGE_READABLE = {0x02, 0x04, 0x20, 0x40}
+            if (mbi.State == MEM_COMMIT and mbi.Protect in PAGE_READABLE
+                    and 0x1000 <= mbi.RegionSize <= 0x2000000):
+                candidates.append((mbi.BaseAddress, mbi.RegionSize))
+            addr = mbi.BaseAddress + mbi.RegionSize
+            if addr >= 0x7FFFFFFFFFFFFFFF:
+                break
+
+        # Busca padrão: varredura de 4 em 4 bytes procurando âncoras
+        anchor_set = {k: v for k, v in _ANCHOR_PAIRS}
+        for base, size in candidates:
+            chunk = _rpm_read(h, base, min(size, 1 << 20))
+            if chunk is None:
+                continue
+            for i in range(0, len(chunk) - 32, 4):
+                try:
+                    key = struct.unpack_from("<i", chunk, i)[0]
+                    val = struct.unpack_from("<i", chunk, i + 4)[0]
+                except Exception:
+                    continue
+                if key in anchor_set and anchor_set[key] == val:
+                    # Localização provável do nó-raiz: recua até 512 bytes para achar header
+                    for root_offset in range(max(0, i - 512), i + 32, 8):
+                        node_addr = base + root_offset
+                        result: dict[int, int] = {}
+                        _walk_std_map_node(h, node_addr, result, 0)
+                        # Valida: todas âncoras presentes
+                        if all(result.get(k) == v for k, v in _ANCHOR_PAIRS):
+                            k32.CloseHandle(h)
+                            return result
+        k32.CloseHandle(h)
+    except Exception as exc:
+        print(f"[PacketScan] Erro na varredura de memória: {exc}", flush=True)
+    return None
+
+
+def _build_packet_catalog(lengths: dict[int, int]) -> list[dict]:
+    """Gera lista de entradas do catálogo combinando comprimentos e OPCODE_CATALOG."""
+    entries = []
+    all_opcodes = sorted(set(lengths) | set(OPCODE_CATALOG))
+    for op in all_opcodes:
+        info = OPCODE_CATALOG.get(op, {})
+        entries.append({
+            "opcode_hex": f"0x{op:04X}",
+            "opcode": op,
+            "direction": info.get("dir", "S->C"),
+            "length": lengths.get(op, -1),
+            "name": info.get("name", f"UNK_0x{op:04X}"),
+            "description_pt": info.get("desc_pt", ""),
+            "handled_by_bot": op in OPCODE_CATALOG,
+        })
+    return entries
+
+
+def _save_packet_catalog(lengths: dict[int, int]) -> None:
+    """Grava packet_catalog.json com todos os opcodes conhecidos."""
+    catalog = _build_packet_catalog(lengths)
+    tmp = PACKET_CATALOG_PATH.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(catalog, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(PACKET_CATALOG_PATH)
+        print(f"[PacketCatalog] {len(catalog)} opcodes gravados em {PACKET_CATALOG_PATH.name}.", flush=True)
+    except OSError as exc:
+        print(f"[PacketCatalog] Falha ao salvar: {exc}", flush=True)
+
+
+def load_or_autocalibrate_lengths(base_lengths: dict[int, int], ragexe_pid: int | None = None,
+                                   exe_key: str = "ragexe") -> dict[int, int]:
+    """
+    1. Carrega packet_lengths_cache.json (auto-aprendizado anterior).
+    2. Se pid disponível, tenta extrair std::map da memória do Ragexe.
+    3. Mescla com baseline e KNOWN_PACKET_SIZES (baseline tem precedência).
+    4. Salva cache e catálogo atualizados.
+    """
+    merged = dict(base_lengths)
+
+    # Carrega cache existente
+    cache: dict[str, dict[str, int]] = {}
+    if PACKET_LENGTHS_CACHE_PATH.exists():
+        try:
+            cache = json.loads(PACKET_LENGTHS_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+    cached = {int(k, 16) if k.startswith("0x") else int(k): v
+              for k, v in cache.get(exe_key, {}).items()}
+    merged.update(cached)
+
+    # Extração da memória
+    if ragexe_pid:
+        scanned = _scan_ragexe_packet_lengths(ragexe_pid)
+        if scanned:
+            print(f"[PacketScan] {len(scanned)} opcodes extraídos da memória do Ragexe.", flush=True)
+            for op, sz in scanned.items():
+                if op not in _BASELINE_SIZES:
+                    merged[op] = sz
+            # Atualiza cache
+            cache[exe_key] = {f"0x{op:04X}": sz for op, sz in merged.items()}
+            tmp = PACKET_LENGTHS_CACHE_PATH.with_suffix(".json.tmp")
+            try:
+                tmp.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+                tmp.replace(PACKET_LENGTHS_CACHE_PATH)
+            except OSError:
+                pass
+
+    # Baseline sempre sobrescreve
+    merged.update(_BASELINE_SIZES)
+    merged.update(base_lengths)
+
+    # Gera catálogo exportado
+    _save_packet_catalog(merged)
+    return merged
+
+
+def autolearn_unknown_opcode(opcode: int, candidate_len: int,
+                              lengths_cache: dict[int, int]) -> None:
+    """
+    Registra um opcode desconhecido com comprimento inferido via alinhamento
+    com opcodes âncora no cache e no packet_catalog.json.
+    """
+    if opcode in lengths_cache or opcode in _BASELINE_SIZES:
+        return
+    if not (2 <= candidate_len <= 128):
+        return
+    lengths_cache[opcode] = candidate_len
+    print(f"[AutoLearn] 0x{opcode:04X} -> {candidate_len}B (inferido por âncora TCP)", flush=True)
+    # Atualiza packet_lengths_cache.json
+    cache: dict = {}
+    if PACKET_LENGTHS_CACHE_PATH.exists():
+        try:
+            cache = json.loads(PACKET_LENGTHS_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    learned = cache.setdefault("autolearned", {})
+    learned[f"0x{opcode:04X}"] = candidate_len
+    tmp = PACKET_LENGTHS_CACHE_PATH.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+        tmp.replace(PACKET_LENGTHS_CACHE_PATH)
+    except OSError:
+        pass
+    # Atualiza catálogo
+    _save_packet_catalog(lengths_cache)
 CLIENT_DIALOG_SIZES = {0x00B8: 7, 0x00B9: 6}
 KAFRA_MENU_TOKENS = {
     "0Ga0AQ": "Salvar Ponto de Retorno",
@@ -421,10 +844,20 @@ class PacketStream:
         self.traffic_log = traffic_log
         self.endpoints = endpoints
         self.after_resync = False
+        self.last_frame = None
 
     def _trace(self, kind, state, start, end, decoded=None):
         if self.traffic_log and self.traffic_log.enabled:
             self.traffic_log.record("S->C", self.endpoints, kind, state, self.buffer[start:end], decoded)
+
+    def _discard_resync(self, start, end, reason):
+        self.after_resync = True
+        self._trace("descarte", reason, start, end)
+        next_opcode = f"0x{u16(self.buffer, end):04X}" if len(self.buffer) - end >= 2 else "incompleto"
+        print(f"[Resync] Descartados {end - start} bytes no buffer ({reason}). Próximo={next_opcode}. "
+              f"Quadro anterior: {self.last_frame or 'nenhum'}. "
+              f"Início descartado: {self.buffer[start:min(end, start + 16)].hex(' ').upper()}.", flush=True)
+        return end
 
     def feed(self, data):
         self.buffer.extend(data)
@@ -455,21 +888,11 @@ class PacketStream:
                         break
 
                 if found != -1:
-                    skipped = found - start
-                    next_opcode = u16(self.buffer, found)
-                    reason = "opcode desconhecido" if size is None else "tamanho variável inválido"
-                    self._trace("descarte", f"resync: {reason}, próximo=0x{next_opcode:04X}", start, found)
-                    self.after_resync = True
+                    reason = f"opcode desconhecido 0x{opcode:04X}" if size is None else "tamanho variável inválido"
                     if self.world and not (self.traffic_log and self.traffic_log.enabled):
                         cand_data = bytes(self.buffer[start:found])
                         self.world._log_unknown_packet(opcode, cand_data)
-                    op_desc = f"0x{opcode:04X}" if size is None else "tamanho variável inválido"
-                    print(
-                        f"[Resync] Descartados {skipped} bytes no buffer ({op_desc}). "
-                        f"Ressincronizado no opcode 0x{next_opcode:04X}.",
-                        flush=True,
-                    )
-                    start = found
+                    start = self._discard_resync(start, found, reason)
                     continue
                 else:
                     if self.world and not (self.traffic_log and self.traffic_log.enabled):
@@ -477,9 +900,7 @@ class PacketStream:
                         self.world._log_unknown_packet(opcode, cand_data)
                     # Nenhum opcode conhecido no buffer atual; mantém últimos bytes e aguarda
                     if len(self.buffer) - start > 1024:
-                        self._trace("descarte", "resync: sem limite de quadro conhecido", start, len(self.buffer) - 2)
-                        self.after_resync = True
-                        start = len(self.buffer) - 2
+                        start = self._discard_resync(start, len(self.buffer) - 6, "sem limite de quadro conhecido")
                     break
 
             if size == -1:
@@ -495,6 +916,7 @@ class PacketStream:
                 handled = self.consume(opcode, self.buffer[start:end])
                 if self.world:
                     self.world.inc_packets_ok()
+                log_packet("S->C", opcode, self.buffer[start:end])
                 state = "sem ação" if handled is False else "processado"
             except Exception as exc:
                 state = f"erro no parser ({type(exc).__name__})"
@@ -504,6 +926,9 @@ class PacketStream:
                 state = f"pós-resync: {state}"
                 self.after_resync = False
             self._trace("quadro", state, start, end, opcode)
+            head = self.buffer[start:min(start + 8, end)].hex(" ").upper()
+            tail = self.buffer[max(start + 8, end - 16):end].hex(" ").upper()
+            self.last_frame = f"0x{opcode:04X}, len={size}, início={head}, final={tail or head} ({state})"
             start = end
         del self.buffer[:start]
 
@@ -598,9 +1023,13 @@ class _OutboundOpcodes:
                 return
             if len(self.buffer) - offset < size:
                 break
-            if opcode in (0x0437, 0x035F, 0x0438):
+            if opcode in (0x007D, 0x0085, 0x035F, 0x0437, 0x0438, 0x0436):
                 self.on_combat_packet(opcode, self.buffer[offset:offset + size])
+                log_packet("C->S", opcode, self.buffer[offset:offset + size])
                 state = "processado pelo manipulador de combate"
+            elif opcode == 0x09D0:
+                log_packet("C->S", opcode, self.buffer[offset:offset + size])
+                state = "verificação GameGuard"
             elif opcode in CLIENT_DIALOG_SIZES:
                 self._record_dialog((sequence + offset) & MASK, opcode, self.buffer[offset:offset + size])
                 state = "processado pelo manipulador de diálogo"
@@ -624,7 +1053,12 @@ class _OutboundOpcodes:
             # O cliente pode acrescentar um byte ao tamanho da tabela.
             # Após perder o alinhamento, só aceita diálogo no início do segmento.
             opcode = u16(payload)
-            if opcode in CLIENT_DIALOG_SIZES and len(payload) >= CLIENT_DIALOG_SIZES[opcode]:
+            if opcode == 0x007D and len(payload) in (2, 3):
+                self.on_combat_packet(opcode, payload)
+            elif (opcode in (0x0085, 0x035F)
+                  and len(payload) in (5, 6, self.lengths.get(opcode, 0), self.lengths.get(opcode, 0) + 1)):
+                self.on_combat_packet(opcode, payload)
+            elif opcode in CLIENT_DIALOG_SIZES and len(payload) >= CLIENT_DIALOG_SIZES[opcode]:
                 self._record_dialog(sequence, opcode, payload)
                 self._trace("quadro", "sem alinhamento: fallback de diálogo", payload, opcode)
         return self.decoded.get(sequence)
@@ -735,7 +1169,7 @@ class Track:
             return cls.stationary(target, speed_ms=speed)
 
         if path is None and gat is not None and origin != target:
-            path = gat.find_path(origin, target)
+            path = gat.find_path(origin, target, prefer_clearance=False)
         if not path or path[0] != origin or path[-1] != target:
             path = diagonal_first_path(*origin, *target)
 
@@ -822,7 +1256,7 @@ class Entity:
     is_kafra: bool = False
     avoid_until: float = 0.0
     has_vending_shop: bool = False
-    last_seen: float = 0.0
+    last_seen_ts: float = field(default_factory=time.monotonic)
     last_combat_damage: float = 0.0
     gid: int = 0
     move_start_ts: float = 0.0
@@ -847,6 +1281,7 @@ class World:
         self.last_map_server_transition_ts = 0.0
         self.unknown_log_count = 0
         self.aid_to_gid = {}
+        self.vanished_gids = deque(maxlen=256)
         self._entity_speed_cache: dict[int, int] = {}
         self.mobs_damaged_by_me = {}
         self.mobs_damaged_by_others = {}
@@ -882,6 +1317,7 @@ class World:
         self.recent_picked_items = []
         self.recent_seen_drops = []
         self.last_player_move_pkt_time = 0.0
+        self.last_walk_pkt = None
         self.player_move_pkt_count = 0
         self.current_map = f"{self.initial_map}.gat" if self.initial_map else None
         self.npc_dialog_active = False
@@ -1194,6 +1630,7 @@ class World:
         with self.lock:
             if self.active_server is not None and (self.active_server, self.active_port) != (server, port):
                 self.last_map_server_transition_ts = time.monotonic()
+                self._map_loading_pending = True
             self.active_server = server
             self.active_port = port
 
@@ -1285,6 +1722,8 @@ class World:
                 self._clear_map_entities(reason)
             if not preserve_transfer:
                 self._map_loading_until = 0.0
+                self._map_loading_pending = False
+                self.last_map_ready_ts = 0.0
                 self.account_id = None
                 self.player_zeny = None
                 self.zeny_known: bool = False
@@ -1306,12 +1745,19 @@ class World:
                 self.last_map_server_transition_ts = 0.0
                 self.skill_info = {}
                 self.learned_skill_sp_cost = {}
+                self.skill_cooldowns_until = {}
                 self.active_status_ids = set()
             self.last_used_skill = None
             self.last_skill_fail = None
             self.steal_confirmed_targets = set()
             self._pending_skill_sp_sample = None
             self._last_steal_cast = None
+            # ── Eventos de habilidade para a máquina de estados (Parte 3) ────
+            self.last_skill_cast_start = None   # (ts, skill_id, cast_time_ms, dst_gid, x, y)
+            self.last_skill_executed  = None   # (ts, skill_id, dst_gid, result)
+            self.last_skill_failed    = None   # (ts, skill_id, cause)
+            self.last_cs_skill_packet = None   # (ts, opcode, skill_id, target_id)
+            self.last_item_added      = None   # (ts, item_id, amount, index)
             self.map = self.next_map or self.initial_map
             self.current_map = f"{self.map}.gat" if self.map else None
             self.player = None
@@ -1341,6 +1787,7 @@ class World:
             self.player_max_sp = 0
             self.entities = {}
             self.aid_to_gid.clear()
+            self.vanished_gids.clear()
             self._entity_speed_cache.clear()
             self.mobs_damaged_by_me.clear()
             self.mobs_damaged_by_others.clear()
@@ -1353,6 +1800,7 @@ class World:
             self.recent_picked_items.clear()
             self.recent_seen_drops.clear()
             self.last_player_move_pkt_time = 0.0
+            self.last_walk_pkt = None
             self.player_move_pkt_count = 0
             self.npc_dialog_active = False
             self.npc_dialog_opcode = 0
@@ -1386,7 +1834,7 @@ class World:
     def _is_local_player_id(self, entity_id):
         return self.player_id is not None and self.player_id >= 100000 and entity_id == self.player_id
 
-    def _remove_entity(self, entity_id, *, reason=None):
+    def _remove_entity(self, entity_id, *, reason=None, vanish_type=None):
         self._entity_speed_cache.pop(entity_id, None)
         ent = self.entities.pop(entity_id, None)
         if ent is not None:
@@ -1395,7 +1843,9 @@ class World:
                     self.aid_to_gid.pop(alias)
             if ent.kind == "mob" and reason is not None:
                 if entity_id in (self.farm_target_gid, self.locked_combat_mob_gid, self.last_mob_attack[0]):
-                    self.last_removed_farm_target = (entity_id, time.monotonic(), reason)
+                    self.last_removed_farm_target = (
+                        entity_id, time.monotonic(), reason, tuple(map(round, ent.track.cell())), vanish_type,
+                    )
                 self._clear_entity_combat(entity_id)
                 print(f"[Feed] Mob #{entity_id} removido ({reason}).", flush=True)
         return ent
@@ -1414,7 +1864,21 @@ class World:
                 self._remove_entity(entity_id, reason=reason)
         self.entities.clear()
         self.aid_to_gid.clear()
+        self.vanished_gids.clear()
         self._entity_speed_cache.clear()
+
+    def _record_vanished_gid(self, *ids):
+        for entity_id in ids:
+            if entity_id and entity_id not in self.vanished_gids:
+                self.vanished_gids.append(entity_id)
+
+    def _unvanish_gid(self, *ids):
+        for entity_id in ids:
+            if entity_id and entity_id in self.vanished_gids:
+                try:
+                    self.vanished_gids.remove(entity_id)
+                except ValueError:
+                    pass
 
     def get_npcs(self):
         with self.lock:
@@ -1492,13 +1956,12 @@ class World:
             player_cell = self.player.cell(frame_time) if self.player else None
             can_prune = player_cell is not None and min(player_cell) > 0 and not self.is_map_loading
             for entity_id, entity in tuple(self.entities.items()):
-                if (can_prune and math.dist(player_cell, entity.track.cell(frame_time)) > 22.0
+                if (can_prune and entity.kind != "mob" and math.dist(player_cell, entity.track.cell(frame_time)) > 22.0
                         and not (entity.kind == "drop"
                                  and (entity.suspected_other_owner or entity.retry_after
                                       or (self.drop_is_priority and self.drop_is_priority(entity.catalog_id))))):
                     self._remove_entity(entity_id, reason="fora do raio de acompanhamento (22 células)")
-                    if entity.kind != "mob":
-                        self._clear_entity_combat(entity_id)
+                    self._clear_entity_combat(entity_id)
             entities = tuple(
                 (key, entity) for key, entity in self.entity_items()
                 if not self._is_local_player_id(key[1])
@@ -1510,9 +1973,18 @@ class World:
                 result += (dict(self.last_warp_from) if self.last_warp_from else None, self._warp_context)
             return result
 
+    def _touch_entities(self, now, *ids):
+        for aid in ids:
+            target_id = self.aid_to_gid.get(aid, aid)
+            if target_id in self.vanished_gids:
+                continue
+            entity = self.entities.get(target_id)
+            if entity is not None:
+                entity.last_seen_ts = now
+
     @property
     def is_map_loading(self):
-        return time.monotonic() < self._map_loading_until
+        return self._map_loading_pending or time.monotonic() < self._map_loading_until
 
     def client_combat_snapshot(self):
         with self.lock:
@@ -1527,12 +1999,24 @@ class World:
                 "steal_confirmed_targets": set(self.steal_confirmed_targets),
                 "last_skill_fail": dict(self.last_skill_fail) if self.last_skill_fail else None,
                 "active_status_ids": set(self.active_status_ids),
+                # ── Eventos de habilidade (Parte 3) ───────────────────────────
+                "last_skill_cast_start": self.last_skill_cast_start,
+                "last_skill_executed":   self.last_skill_executed,
+                "last_skill_failed":     self.last_skill_failed,
+                "last_cs_skill_packet":  self.last_cs_skill_packet,
+                "last_item_added":       self.last_item_added,
+                "skill_cooldowns_until": dict(self.skill_cooldowns_until),
             }
 
     def record_client_combat_packet(self, opcode, data):
         now = time.monotonic()
         with self.lock:
-            if opcode == 0x0437 and len(data) >= 7:
+            if opcode == 0x007D and self._map_loading_pending:
+                self._clear_map_entities("confirmação de carregamento de mapa (0x007D)")
+                self._map_loading_until = now + 1.0
+                self.last_map_ready_ts = now
+                self._map_loading_pending = False
+            elif opcode == 0x0437 and len(data) >= 7:
                 raw_target = u32(data, 2)
                 self.last_attack_target_id = self.aid_to_gid.get(raw_target, raw_target)
                 self.last_attack_action = data[6]
@@ -1554,15 +2038,31 @@ class World:
                     "target_id": target_id,
                     "ts": time.time(),
                 }
+                # ── Parte 3: registra envio de skill C->S ─────────────────────
+                self.last_cs_skill_packet = (now, opcode, skill_id, target_id)
                 if self.player_max_sp > 0:
                     self._pending_skill_sp_sample = (skill_id, self.player_sp, now)
                 if skill_id == 50:
                     self._last_steal_cast = (target_id, raw_target, now)
-            elif opcode == 0x035F and len(data) >= 5:
+            elif opcode == 0x0436 and len(data) >= 10:
+                # CZ_USE_SKILL (skill em célula/área) — Parte 3
+                skill_lv = u16(data, 2)
+                skill_id = u16(data, 4)
+                self.last_used_skill = {
+                    "skill_id": skill_id,
+                    "skill_lv": skill_lv,
+                    "target_id": 0,
+                    "ts": time.time(),
+                }
+                self.last_cs_skill_packet = (now, opcode, skill_id, 0)
+                if self.player_max_sp > 0:
+                    self._pending_skill_sp_sample = (skill_id, self.player_sp, now)
+            elif opcode in (0x0085, 0x035F) and len(data) >= 5:
                 self.last_move_ts = now
-                self._map_loading_until = 0.0
-                if self.player is not None and not self.player_is_dead and not self.player_is_sitting:
+                if (len(data) in (5, 6) and self.player is not None
+                        and not self.player_is_dead and not self.player_is_sitting):
                     target = position(data, 2)
+                    self.last_walk_pkt = (self.map, target, now)
                     started = time.perf_counter()
                     prediction = self.predicted_player
                     predicting_target = prediction and started < prediction[1] and prediction[0].target == target
@@ -1570,7 +2070,8 @@ class World:
                         self.predicted_player = None
                         origin = tuple(map(round, self.player.cell(started)))
                         gat = self.get_gat()
-                        path = gat.find_path(origin, target) if gat is not None and gat.is_walkable(*target) else None
+                        path = (gat.find_path(origin, target, prefer_clearance=False)
+                                if gat is not None and gat.is_walkable(*target) else None)
                         if path and path[0] == origin and path[-1] == target:
                             self.predicted_player = (Track.walking(
                                 (origin, target), self.player_speed, started, path=path,
@@ -1627,7 +2128,7 @@ class World:
         try:
             with self.lock:
                 handled = self._apply(opcode, data)
-                if opcode in MAP_ACTIVITY:
+                if opcode in MAP_ACTIVITY and self.active_server is None:
                     self._map_loading_until = 0.0
                 self._maybe_save_heatmap()
                 return handled is not False or opcode in MAP_ACTIVITY
@@ -1709,6 +2210,7 @@ class World:
                 except Exception:
                     pass
         elif opcode == 0x0091:
+            self._map_loading_pending = self.active_server is not None
             self._map_loading_until = time.monotonic() + 2.0
             self.predicted_player = None
             raw_name = extract_map_from_packet(data, 2)
@@ -1769,6 +2271,7 @@ class World:
                 self._set_player_track(Track.stationary((x, y)))
                 self.last_map_arrival = (name, (x, y), time.monotonic())
         elif opcode in MAP_TRANSFER:
+            self._map_loading_pending = self.active_server is not None
             self._map_loading_until = time.monotonic() + 2.0
             self.predicted_player = None
             self._player_attacked_mobs.clear()
@@ -1860,11 +2363,11 @@ class World:
                             self.on_player_move_callback(x, y)
                         except Exception:
                             pass
-                elif ent is not None and ent.kind != "drop":
+                elif ent is not None and ent.kind != "drop" and target_id not in self.vanished_gids:
                     previous = ent.track if opcode == 0x0088 else None
                     stopped = Track.stopping(stop_cell, ent.speed, now, previous)
                     self.entities[target_id] = replace(
-                        ent, track=stopped, move_start_ts=stopped.move_start_ts, last_seen=time.monotonic(),
+                        ent, track=stopped, move_start_ts=stopped.move_start_ts, last_seen_ts=time.monotonic(),
                     )
         elif opcode == 0x0ACB:  # ZC_LONGLONGPAR_CHANGE
             if len(data) >= 12:
@@ -1940,15 +2443,18 @@ class World:
                         movement(data, 6), self.player_speed, started,
                         self.get_gat(), previous=self.player,
                     ))
-                elif ent is not None and ent.kind != "drop":
+                elif ent is not None and ent.kind != "drop" and target_id not in self.vanished_gids:
                     speed = self._entity_speed_cache.get(target_id, ent.speed)
                     track = Track.walking(movement(data, 6), speed, started, self.get_gat(), previous=ent.track)
                     self.entities[target_id] = replace(
-                        ent, track=track, speed=speed, move_start_ts=track.move_start_ts, last_seen=time.monotonic(),
+                        ent, track=track, speed=speed, move_start_ts=track.move_start_ts, last_seen_ts=time.monotonic(),
                     )
+        elif opcode in (0x0119, 0x0229, 0x028A, 0x08D2, 0x0977, 0x0A36):
+            if len(data) >= 6:
+                self._touch_entities(time.monotonic(), u32(data, 2))
         elif opcode in (0x00FE, 0x02C6, 0x00E5, 0x01F4, 0x0207):
             self.last_invite_popup_ts = time.monotonic()
-        elif opcode in (0x008A, 0x08C8, 0x02E1, 0x013E, 0x07FB, 0x01DE):  # ZC_NOTIFY_ACT / ZC_USESKILL (ataques/dano/skills)
+        elif opcode in (0x008A, 0x08C8, 0x02E1, 0x013E, 0x07FB, 0x01DE):  # ZC_NOTIFY_ACT / ZC_USESKILL_ACK / ZC_USE_SKILL2
             if len(data) >= 10:
                 offset = 4 if opcode == 0x01DE else 2
                 if len(data) < offset + 8:
@@ -1958,9 +2464,7 @@ class World:
                 real_dst = self.aid_to_gid.get(dst_id, dst_id)
                 real_src = self.aid_to_gid.get(src_id, src_id)
                 now = time.monotonic()
-                for entity_id in (real_src, real_dst):
-                    if (ent := self.entities.get(entity_id)) is not None and ent.kind != "drop":
-                        ent.last_seen = now
+                self._touch_entities(now, src_id, dst_id)
                 dealt_damage = False
                 if opcode in (0x008A, 0x02E1, 0x08C8) and len(data) >= KNOWN_PACKET_SIZES[opcode]:
                     action_offset = {0x008A: 26, 0x02E1: 28, 0x08C8: 29}[opcode]
@@ -1979,7 +2483,7 @@ class World:
                 elif opcode == 0x01DE and len(data) >= KNOWN_PACKET_SIZES[opcode]:
                     dealt_damage = struct.unpack_from("<i", data, 24)[0] > 0
 
-                if (opcode in (0x008A, 0x08C8, 0x01DE) and dealt_damage and src_id >= 100000
+                if (opcode in (0x008A, 0x02E1, 0x08C8, 0x01DE) and dealt_damage and src_id >= 100000
                         and (self.player_id is None or self.player_id < 100000)):
                     requested_at = max(self._player_attacked_mobs.get(dst_id, -math.inf),
                                        self._player_attacked_mobs.get(real_dst, -math.inf))
@@ -1992,7 +2496,7 @@ class World:
                 if dealt_damage:
                     if is_dst_player:
                         self.last_player_damage_ts = now
-                    if opcode in (0x008A, 0x08C8) and (is_src_player or is_dst_player):
+                    if opcode in (0x008A, 0x02E1, 0x08C8) and (is_src_player or is_dst_player):
                         combat_mob = self.entity("mob", real_dst if is_src_player else real_src)
                         if combat_mob:
                             combat_mob.last_combat_damage = now
@@ -2009,11 +2513,21 @@ class World:
                 if is_src_player:
                     if opcode == 0x07FB and len(data) >= 25:
                         skill_id = u16(data, 14)
-                        if skill_id == 50 and data[24] != 0:
+                        if skill_id == 50 and data[24] != 0 and real_dst not in self.vanished_gids:
                             self.steal_confirmed_targets.add(real_dst)
-                    if mob_ent is not None or opcode == 0x01DE:
+                    # ── Parte 3: ZC_USE_SKILL2 / ZC_USESKILL_ACK — registra início de conjuração ──
+                    if opcode in (0x07FB, 0x013E) and len(data) >= 20:
+                        try:
+                            _sk = u16(data, 14)
+                            _cast_ms = struct.unpack_from("<I", data, 16)[0]
+                            _dx = u16(data, 10) if len(data) >= 14 else 0
+                            _dy = u16(data, 12) if len(data) >= 14 else 0
+                            self.last_skill_cast_start = (now, _sk, _cast_ms, real_dst, _dx, _dy)
+                        except Exception:
+                            pass
+                    if mob_ent is not None or (opcode == 0x01DE and real_dst not in self.vanished_gids):
                         self.last_player_attack_ts = now
-                    if dealt_damage:
+                    if dealt_damage and mob_ent is not None:
                         self.mobs_damaged_by_me[real_dst] = now
                         self.mobs_damaged_by_me[dst_id] = now
                     if mob_ent is not None:
@@ -2049,7 +2563,9 @@ class World:
                             pass
         elif opcode == 0x0291 and len(data) >= 4 and u16(data, 2) == 53:
             self._record_pickup_denied(time.monotonic())
-        elif opcode in (0x0095, 0x0195, 0x0A30):  # ZC_ACK_REQNAME / ZC_ACK_REQNAMEALL
+        elif opcode in (0x0095, 0x0195, 0x0A30, 0x0ADF):  # ZC_ACK_REQNAME / ZC_ACK_REQNAMEALL / ZC_ACK_REQNAMEALL2
+            if len(data) >= 6:
+                self._touch_entities(time.monotonic(), u32(data, 2))
             if len(data) >= 30:
                 aid_name = u32(data, 2)
                 raw = data[6:30].split(b"\x00", 1)[0]
@@ -2233,7 +2749,14 @@ class World:
                         3: "teleporte",
                         4: "morte simulada",
                     }.get(vanish_type, "desaparecimento informado pelo servidor")
-                    self._remove_entity(real_gid, reason=f"{vanish_reason}, 0x0080 tipo {vanish_type}")
+                    self._remove_entity(real_gid, reason=f"{vanish_reason}, 0x0080 tipo {vanish_type}",
+                                        vanish_type=vanish_type)
+                    self._record_vanished_gid(*ids)
+                    if vanish_type == 1 and mob is None and (removed := self.last_removed_farm_target):
+                        if removed[0] in ids and removed[4] == 0:
+                            self.last_removed_farm_target = (
+                                removed[0], time.monotonic(), "morte confirmada, 0x0080 tipo 1", removed[3], 1,
+                            )
                     self._clear_entity_combat(real_gid)
                     if gid != real_gid:
                         self._clear_entity_combat(gid)
@@ -2257,7 +2780,10 @@ class World:
                 self.vending_aids.discard(gid)
                 self.vending_aids.discard(real_gid)
                 if opcode == 0x00A1 and drop_ent is not None:
-                    self._remove_entity(real_gid)
+                    drop_gid = real_gid if self.entity("drop", real_gid) is not None else gid
+                    self._remove_entity(drop_gid)
+                    if self.pending_pickup and self.pending_pickup[0] in (gid, real_gid):
+                        self.pending_pickup = None
         elif opcode in PICKUP_ACK:
             trailing, wide_size = PICKUP_ACK[opcode]
             result_offset = len(data) - trailing - 1
@@ -2277,6 +2803,7 @@ class World:
                         self.inventory[index] = (nameid, count, tab, False)
                     self.inventory_slots[index] = self.inventory[index][1]
                     self.highest_inv_index = max(self.highest_inv_index, index)
+                    self.last_item_added = (time.monotonic(), nameid, count, index)
                     if not self.pending_pickup and self._last_steal_cast is not None:
                         steal_target, _, steal_ts = self._last_steal_cast
                         now_steal = time.monotonic()
@@ -2361,26 +2888,67 @@ class World:
                 return
             real_src = self.aid_to_gid.get(src_id, src_id)
             real_dst = self.aid_to_gid.get(dst_id, dst_id)
+            self._touch_entities(time.monotonic(), src_id, dst_id)
             if self.is_self_entity(src_id, real_src):
                 if skill_id == 50 and result != 0:
                     self.steal_confirmed_targets.add(real_dst)
                     self._last_steal_cast = None
+                # ── Parte 3: skill executada (ZC_USE_SKILL) ───────────────────
+                self.last_skill_executed = (time.monotonic(), skill_id, real_dst, result)
+        elif opcode == 0x043D and len(data) >= 8:  # ZC_SKILL_POSTDELAY
+            skill_id = u16(data, 2)
+            delay_ms = u32(data, 4)
+            if skill_id and delay_ms > 0:
+                until = time.monotonic() + delay_ms / 1000.0
+                self.skill_cooldowns_until[skill_id] = max(
+                    self.skill_cooldowns_until.get(skill_id, 0.0), until,
+                )
+        elif opcode == 0x0985 and len(data) >= 10:  # ZC_SKILL_COOLDOWN
+            now_cd = time.monotonic()
+            payload_len = len(data) - 4
+            if payload_len % 10 == 0:
+                for off in range(4, len(data), 10):
+                    sk_id = u16(data, off)
+                    remain_ms = u32(data, off + 6)
+                    if 0 < sk_id < 20000 and 0 < remain_ms <= 600000:
+                        self.skill_cooldowns_until[sk_id] = max(
+                            self.skill_cooldowns_until.get(sk_id, 0.0),
+                            now_cd + remain_ms / 1000.0,
+                        )
+            elif payload_len % 6 == 0:
+                for off in range(4, len(data), 6):
+                    sk_id = u16(data, off)
+                    remain_ms = u32(data, off + 2)
+                    if 0 < sk_id < 20000 and 0 < remain_ms <= 600000:
+                        self.skill_cooldowns_until[sk_id] = max(
+                            self.skill_cooldowns_until.get(sk_id, 0.0),
+                            now_cd + remain_ms / 1000.0,
+                        )
         elif opcode == 0x0110:  # ZC_ACK_TOUSESKILL (falha de uso/cooldown/SP)
-            if len(data) >= 10:
+            if len(data) >= 14:
+                skill_id = u16(data, 2)
+                fail = data[12]
+                cause = data[13]
+            elif len(data) >= 10:
                 skill_id = u16(data, 2)
                 fail = data[8]
                 cause = data[9]
-                if fail == 0:
-                    self.last_skill_fail = {
-                        "skill_id": skill_id,
-                        "reason": cause,
-                        "ts": time.time(),
-                    }
-                    self._pending_skill_sp_sample = None
+            else:
+                skill_id = fail = cause = None
+            if skill_id is not None and fail == 0:
+                self.last_skill_fail = {
+                    "skill_id": skill_id,
+                    "reason": cause,
+                    "ts": time.time(),
+                }
+                # ── Parte 3: skill falhou — registra para o estado pré-combate ─
+                self.last_skill_failed = (time.time(), skill_id, cause)
+                self._pending_skill_sp_sample = None
         elif opcode in (0x019B, 0x0B1A):  # Cancelamento de cast / efeito
             if len(data) >= 6:
                 aid = u32(data, 2)
                 real_aid = self.aid_to_gid.get(aid, aid)
+                self._touch_entities(time.monotonic(), aid)
                 if self.is_self_entity(aid, real_aid):
                     skill_id = self.last_used_skill["skill_id"] if self.last_used_skill else 0
                     self.last_skill_fail = {
@@ -2395,6 +2963,7 @@ class World:
                 aid = u32(data, 4)
                 state = data[8]
                 real_aid = self.aid_to_gid.get(aid, aid)
+                self._touch_entities(time.monotonic(), aid)
                 if self.is_self_entity(aid, real_aid):
                     if state:
                         self.active_status_ids.add(status_id)
@@ -2484,14 +3053,14 @@ class World:
                 cell = (x, y)
                 current = self.entity("drop", aid)
                 if current and current.catalog_id == item and current.track.target == cell:
-                    self.entities[aid] = replace(current, amount=max(1, cnt), last_seen=now)
+                    self.entities[aid] = replace(current, amount=max(1, cnt), last_seen_ts=now)
                     return
                 if current:
                     self._remove_entity(aid)
                 elif aid in self.entities:
                     return
                 drop = Entity("drop", item, Track.stationary(cell), max(1, cnt),
-                              created_at=now, last_seen=now)
+                              created_at=now, last_seen_ts=now)
                 self._update_drop_owner(drop)
                 self.entities[aid] = drop
                 self.recent_seen_drops.append({
@@ -2648,6 +3217,15 @@ class World:
         elif kind is None:
             kind = "mob" if obj_type in (0x05, 0x0D, 0x0E) and not is_kafra(job, name) else "npc"
 
+        if kind == "mob":
+            if opcode not in MOB_SPAWN_OPCODES:
+                return
+            if job <= 0 or job == 45 or obj_type in (0, 1, 6, 7, 8, 9, 10):
+                return
+            if obj_type not in (0x05, 0x0D, 0x0E) and job < 1000:
+                return
+            self._unvanish_gid(entity_id, gid)
+
         # AID é a chave; GID só resolve referências dos outros pacotes.
         old_ent = self.entity(kind, entity_id)
         cached_speed = self._entity_speed_cache.get(entity_id) if old_ent is not None else None
@@ -2719,7 +3297,7 @@ class World:
                         self.heatmap_dirty = True
 
             self.entities[entity_id] = Entity(
-                kind, job, track, speed=speed, last_seen=time.monotonic(), gid=gid,
+                kind, job, track, speed=speed, last_seen_ts=time.monotonic(), gid=gid,
                 move_start_ts=track.move_start_ts, objecttype=obj_type,
                 has_vending_shop=(kind == "player" and
                                   (bool(aliases & self.vending_aids) or bool(old_ent and old_ent.has_vending_shop))),

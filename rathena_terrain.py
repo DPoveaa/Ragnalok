@@ -37,6 +37,168 @@ class Gat:
         expected_len = 14 + 20 * self.width * self.height
         if not self.width or not self.height or len(data) != expected_len:
             raise ValueError("Dimensões .gat inválidas.")
+        cell_height = []
+        cell_types = bytearray(self.width * self.height)
+        row = []
+        idx = 0
+        for sw, se, nw, ne, cell_type in struct.iter_unpack("<ffffB3x", memoryview(self.data)[14:]):
+            cell_types[idx] = cell_type
+            idx += 1
+            if math.isfinite(sw) and math.isfinite(se) and math.isfinite(nw) and math.isfinite(ne):
+                h = (sw + se + nw + ne) * 0.25
+            else:
+                h = 0.0
+            row.append(h)
+            if len(row) == self.width:
+                cell_height.append(row)
+                row = []
+        self.cell_height = cell_height
+        self._wall_clearance = self._build_wall_clearance(cell_types)
+
+    def _build_wall_clearance(self, cell_types=None):
+        """Distância em oito direções até os tipos 1 e 5 e bordas de paredão vertical, limitada a três células."""
+        width, height = self.width, self.height
+        clearance = bytearray([3]) * (width * height)
+        frontier_0 = []
+        frontier_1 = []
+        if cell_types is None:
+            cell_types = (t for (t,) in struct.iter_unpack("<16xB3x", memoryview(self.data)[14:]))
+        for idx, cell_type in enumerate(cell_types):
+            if cell_type in (1, 5):
+                clearance[idx] = 0
+                frontier_0.append(idx)
+
+        # Detecta paredões/degraus verticais (salto > 8.5 entre células vizinhas)
+        cell_height = self.cell_height
+        for y in range(height):
+            row_h = cell_height[y]
+            row_off = y * width
+            next_row_h = cell_height[y + 1] if y + 1 < height else None
+            for x in range(width):
+                h_a = row_h[x]
+                idx_a = row_off + x
+                if x + 1 < width and abs(h_a - row_h[x + 1]) > 8.5:
+                    if clearance[idx_a] > 1:
+                        clearance[idx_a] = 1
+                        frontier_1.append(idx_a)
+                    idx_b = idx_a + 1
+                    if clearance[idx_b] > 1:
+                        clearance[idx_b] = 1
+                        frontier_1.append(idx_b)
+                if next_row_h is not None and abs(h_a - next_row_h[x]) > 8.5:
+                    if clearance[idx_a] > 1:
+                        clearance[idx_a] = 1
+                        frontier_1.append(idx_a)
+                    idx_b = idx_a + width
+                    if clearance[idx_b] > 1:
+                        clearance[idx_b] = 1
+                        frontier_1.append(idx_b)
+
+        for idx in frontier_0:
+            y, x = divmod(idx, width)
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    neighbor = ny * width + nx
+                    if clearance[neighbor] > 1:
+                        clearance[neighbor] = 1
+                        frontier_1.append(neighbor)
+
+        for idx in frontier_1:
+            y, x = divmod(idx, width)
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    neighbor = ny * width + nx
+                    if clearance[neighbor] == 3:
+                        clearance[neighbor] = 2
+        return clearance
+
+    def cell_height_at(self, x, y):
+        cx, cy = int(x), int(y)
+        if 0 <= cx < self.width and 0 <= cy < self.height:
+            return self.cell_height[cy][cx]
+        return 0.0
+
+    def wall_clearance(self, x, y):
+        return self._wall_clearance[y * self.width + x] if 0 <= x < self.width and 0 <= y < self.height else 0
+
+    def wall_faces_camera(self, cell, camera_ground):
+        """Indica parede ou paredão adjacente no sentido da câmera, usando a geometria do .gat."""
+        x, y = cell
+        if self.wall_clearance(x, y) != 1:
+            return False
+        dx, dy = camera_ground[0] - x, camera_ground[1] - y
+        scale = max(abs(dx), abs(dy))
+        if scale < 0.01:
+            return False
+        step_x, step_y = round(dx / scale), round(dy / scale)
+        nx, ny = x + step_x, y + step_y
+        if self.cell_type_at(nx, ny) in (1, 5):
+            return True
+        return self.cell_height_at(nx, ny) < self.cell_height_at(x, y) - 8.5
+
+    def build_screen_occluders(self, center_xy, viewport, project, radius=14):
+        """Coleta projeções 2D de células elevadas e faces de paredão na vizinhança de tela."""
+        px, py = int(round(center_xy[0])), int(round(center_xy[1]))
+        x0 = max(0, px - radius)
+        x1 = min(self.width, px + radius + 1)
+        y0 = max(0, py - radius)
+        y1 = min(self.height, py + radius + 1)
+        if x0 >= x1 or y0 >= y1:
+            return ()
+
+        min_h = float("inf")
+        max_h = float("-inf")
+        cell_height = self.cell_height
+        for cy in range(y0, y1):
+            row_h = cell_height[cy]
+            for cx in range(x0, x1):
+                h = row_h[cx]
+                if h < min_h:
+                    min_h = h
+                if h > max_h:
+                    max_h = h
+        if max_h - min_h <= 8.5:
+            return ()
+
+        left, top, width, height = viewport
+        depth_at = getattr(project, "depth_at", None)
+        occluders = []
+        threshold_h = max_h - 8.5
+        for cy in range(y0, y1):
+            row_h = cell_height[cy]
+            row_off = cy * self.width
+            for cx in range(x0, x1):
+                h_cell = row_h[cx]
+                if h_cell >= threshold_h:
+                    continue
+                u_top, v_top = project(cx, cy, 0.0)
+                if not (-0.1 <= u_top <= 1.1 and -0.1 <= v_top <= 1.1):
+                    continue
+                sx_top = left + u_top * width
+                sy_top = top + v_top * height
+                d_top = depth_at(cx, cy, 0.0) if depth_at is not None else 0.0
+                sy_bot = sy_top
+                if self._wall_clearance[row_off + cx] <= 1:
+                    _, v_bot = project(cx, cy, h_cell - max_h)
+                    sy_bot = max(sy_top, top + v_bot * height)
+                occluders.append((h_cell, sx_top, sy_top, sy_bot, d_top))
+        return tuple(occluders)
+
+    def is_screen_occluded(self, occluders, target_cell, sx, sy, project=None):
+        """Retorna True se (sx, sy) estiver coberto na tela por plataforma superior ou paredão."""
+        if not occluders:
+            return False
+        h_alvo = self.cell_height_at(*target_cell)
+        depth_at = getattr(project, "depth_at", None) if project is not None else None
+        d_alvo = depth_at(*target_cell, 0.0) if depth_at is not None else None
+        for h_alta, sx_top, sy_top, sy_bot, d_top in occluders:
+            if h_alta >= h_alvo - 8.5:
+                continue
+            if d_alvo is not None and d_top >= d_alvo - 1.0:
+                continue
+            if abs(sx - sx_top) <= 22.0 and (sy_top - 14.0) <= sy <= (sy_bot + 14.0):
+                return True
+        return False
 
     def get_elevation(self, fx: float, fy: float) -> float:
         """Elevação 3D contínua por interpolação bilinear dos 4 cantos da célula.
@@ -140,12 +302,36 @@ class Gat:
                 return best
         return None
 
+    def has_walkable_line(self, start, end):
+        """Percorre as células cruzadas pelo segmento, incluindo as quinas."""
+        x, y = map(round, start)
+        end_x, end_y = map(round, end)
+        dx, dy = abs(end_x - x), abs(end_y - y)
+        sx, sy = (1 if x < end_x else -1), (1 if y < end_y else -1)
+        ix = iy = 0
+        while ix < dx or iy < dy:
+            cross_x = (2 * ix + 1) * dy
+            cross_y = (2 * iy + 1) * dx
+            if cross_x == cross_y and not (self.is_walkable(x + sx, y) and self.is_walkable(x, y + sy)):
+                return False
+            if cross_x <= cross_y:
+                x += sx
+                ix += 1
+            if cross_x >= cross_y:
+                y += sy
+                iy += 1
+            if not self.is_walkable(x, y):
+                return False
+        return self.is_walkable(end_x, end_y)
+
     def find_path(self, start_xy, goal_xy, blocked_cells: set[tuple[int, int]] | None = None,
                   max_iterations=7000, *, penalty_cells: dict[tuple[int, int], float] | None = None,
-                  cell_costs=None, goal_test=None):
+                  cell_costs=None, goal_test=None, goal_radius=None, max_cost=None, diagonal_cost=14,
+                  prefer_clearance=True):
         """Busca A* em oito direções com bloqueios, penalidades por célula e sem corte de quinas."""
         start = (int(start_xy[0]), int(start_xy[1]))
-        goal = (int(goal_xy[0]), int(goal_xy[1])) if goal_test is None else None
+        center = tuple(map(int, goal_xy)) if goal_xy is not None else None
+        goal = center if goal_test is None else None
         blocked_set = set(blocked_cells) if blocked_cells else set()
 
         if not self.is_walkable(*start):
@@ -163,23 +349,27 @@ class Gat:
         if start == goal:
             return [start]
 
-        def octile_heuristic(a, b):
-            if b is None:
-                return 0
-            dx = abs(a[0] - b[0])
-            dy = abs(a[1] - b[1])
-            return 10 * (max(dx, dy) - min(dx, dy)) + 14 * min(dx, dy)
+        def heuristic(cell):
+            if goal is not None:
+                dx, dy = abs(cell[0] - goal[0]), abs(cell[1] - goal[1])
+                return 10 * max(dx, dy) + (diagonal_cost - 10) * min(dx, dy)
+            if center is not None and goal_radius is not None:
+                dx, dy = abs(cell[0] - center[0]), abs(cell[1] - center[1])
+                # Distância mínima ao quadrado que contém o anel de aproximação.
+                dx, dy = max(0, dx - goal_radius), max(0, dy - goal_radius)
+                return 10 * max(dx, dy) + (diagonal_cost - 10) * min(dx, dy)
+            return 0
 
-        # 8 direções: 4 diagonais primeiro (custo 14), depois 4 ortogonais (custo 10) - padrão rAthena
+        # O custo padrão é 14 nas diagonais e 10 nas ortogonais.
         neighbors_step = [
-            (1, 1, 14), (1, -1, 14),
-            (-1, 1, 14), (-1, -1, 14),
+            (1, 1, diagonal_cost), (1, -1, diagonal_cost),
+            (-1, 1, diagonal_cost), (-1, -1, diagonal_cost),
             (1, 0, 10), (-1, 0, 10),
             (0, 1, 10), (0, -1, 10),
         ]
 
         open_heap = []
-        h0 = octile_heuristic(start, goal)
+        h0 = heuristic(start)
         heapq.heappush(open_heap, (h0, h0, 0, start))
         g_score = {start: 0}
         came_from = {}
@@ -188,8 +378,10 @@ class Gat:
         counter = 0
 
         while open_heap and iterations < max_iterations:
+            _, _, _, current = heapq.heappop(open_heap)
+            if current in closed_set:
+                continue
             iterations += 1
-            f, h_val, _, current = heapq.heappop(open_heap)
 
             if current == goal or (goal_test is not None and current not in blocked_set and goal_test(current)):
                 # Reconstrói caminho
@@ -200,8 +392,6 @@ class Gat:
                 path.reverse()
                 return path
 
-            if current in closed_set:
-                continue
             closed_set.add(current)
 
             cur_x, cur_y = current
@@ -227,14 +417,18 @@ class Gat:
                         continue
 
                 tentative_g = current_g + step_cost
+                if prefer_clearance:
+                    tentative_g += (0.0, 2.2, 0.6, 0.0)[self._wall_clearance[ny * self.width + nx]]
                 if cell_costs is not None:
                     tentative_g += cell_costs.get(neighbor, 0)
                 if penalty_cells is not None:
                     tentative_g += penalty_cells.get(neighbor, 0.0)
                 if tentative_g < g_score.get(neighbor, float("inf")):
+                    h = heuristic(neighbor)
+                    if max_cost is not None and tentative_g + h > max_cost:
+                        continue
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g
-                    h = octile_heuristic(neighbor, goal)
                     counter += 1
                     heapq.heappush(open_heap, (tentative_g + h, h, counter, neighbor))
 
@@ -941,7 +1135,18 @@ class RagnarokProjector3D:
             u, v = project(fx, fy, sprite_z)
             return vp_x + u * vp_w, vp_y + v * vp_h
 
+        def depth_at(fx, fy, sprite_z=0.0):
+            wx = (fx - cam_x) * CELL_SIZE
+            wy = (fy - cam_y) * CELL_SIZE
+            gz = height_fn(fx, fy) if height_fn is not None else 0.0
+            wz = (gz + sprite_z) - cam_z
+            ry = wx * sin_yaw + wy * cos_yaw
+            return dist + ry * cos_pitch - wz * sin_pitch
+
         project.project_screen = project_screen
+        project.depth_at = depth_at
+        project.camera_ground = (cam_x - sin_yaw * dist * cos_pitch / CELL_SIZE,
+                                 cam_y - cos_yaw * dist * cos_pitch / CELL_SIZE)
         return project
 
 

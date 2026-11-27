@@ -1,8 +1,11 @@
 {
   "map": "xmas_fild01",
   "sectors": {
-    "0,0": 1
+    "0,0": 1,
+    "4,4": 1,
+    "5,4": 1,
+    "4,15": 1
   },
-  "total_spawns": 1,
-  "updated_at": 1795628862.1377661
+  "total_spawns": 4,
+  "updated_at": 1795748860.4617617
 }

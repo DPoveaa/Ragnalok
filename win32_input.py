@@ -21,6 +21,20 @@ if not per_monitor_dpi:
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+kernel32.CloseHandle.restype = wintypes.BOOL
+
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+advapi32.OpenProcessToken.argtypes = (
+    wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE),
+)
+advapi32.OpenProcessToken.restype = wintypes.BOOL
+advapi32.GetTokenInformation.argtypes = (
+    wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+)
+advapi32.GetTokenInformation.restype = wintypes.BOOL
 
 LAST_BOT_CLICK_TS = float("-inf")
 LAST_BOT_KEY_TS = float("-inf")
@@ -193,6 +207,15 @@ u32.PostMessageW.restype = wintypes.BOOL
 u32.PostMessageA.argtypes = u32.SendNotifyMessageW.argtypes = u32.PostMessageW.argtypes
 u32.PostMessageA.restype = u32.SendNotifyMessageW.restype = wintypes.BOOL
 
+u32.SendMessageTimeoutW.argtypes = (
+    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
+)
+u32.SendMessageTimeoutW.restype = wintypes.LPARAM
+
+u32.WindowFromPoint.argtypes = (wintypes.POINT,)
+u32.WindowFromPoint.restype = wintypes.HWND
+
 u32.ScreenToClient.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.POINT))
 u32.ScreenToClient.restype = wintypes.BOOL
 
@@ -283,73 +306,177 @@ def ensure_input_desktop():
         pass
 
 
-def _move_pointer_with_touch(sx: int, sy: int):
-    """Posiciona o cursor físico via InjectTouchInput com interpolação de trajetória suave."""
-    ensure_touch_injection()
-    sx, sy = int(sx), int(sy)
+_pending_touch_release = None
+_touch_mouse_release = None
+_physical_left_state = (0, False)
+_tracks_physical_left = False
 
-    pt_cur = wintypes.POINT()
-    if u32.GetCursorPos(ctypes.byref(pt_cur)):
-        cx, cy = pt_cur.x, pt_cur.y
+
+def track_physical_left(enabled):
+    global _tracks_physical_left, _physical_left_state
+    _tracks_physical_left = enabled
+    _physical_left_state = (_physical_left_state[0] + 1,
+                            bool(enabled and u32.GetAsyncKeyState(0x01) & 0x8000))
+
+
+def observe_physical_left(down):
+    global _physical_left_state
+    _physical_left_state = (_physical_left_state[0] + 1, down)
+
+
+def recover_touch_mouse_release():
+    """Tenta soltar apenas uma pressão criada por toque do bot, sem interferir no mouse físico."""
+    global _touch_mouse_release, _pending_touch_release
+    if not (u32.GetAsyncKeyState(0x01) & 0x8000):
+        _touch_mouse_release = None
+        return False
+    pending = _touch_mouse_release
+    attempts = 0
+    if pending is not None:
+        generation, started, attempts = pending
+        if not _tracks_physical_left or _physical_left_state != (generation, False):
+            _touch_mouse_release = None
+            return False
+        if time.monotonic() - started < 0.12:
+            return False
+        _touch_mouse_release = (generation, time.monotonic(), attempts + 1)
+    elif _tracks_physical_left and not _physical_left_state[1] and not is_bot_clicking(0.25):
+        _touch_mouse_release = (_physical_left_state[0], time.monotonic(), 1)
+        attempts = 1
     else:
-        cx, cy = sx, sy
+        return False
+    if _pending_touch_release is not None:
+        accepted, error = _send_touch_frame(_pending_touch_release, POINTER_FLAG_UP | 0x8000)  # CANCELED
+        if accepted or error == 87:
+            _pending_touch_release = None
+        if not (u32.GetAsyncKeyState(0x01) & 0x8000):
+            _touch_mouse_release = None
+            return True
+    if attempts >= 1:
+        inputs = (INPUT * 2)(INPUT(type=INPUT_MOUSE), INPUT(type=INPUT_MOUSE))
+        inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN
+        inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP
+        if u32.SendInput(2, inputs, ctypes.sizeof(INPUT)) != 2:
+            u32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            u32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    else:
+        release = INPUT(type=INPUT_MOUSE)
+        release.mi.dwFlags = MOUSEEVENTF_LEFTUP
+        if u32.SendInput(1, ctypes.byref(release), ctypes.sizeof(release)) != 1:
+            u32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    if not (u32.GetAsyncKeyState(0x01) & 0x8000):
+        _touch_mouse_release = None
+    return True
 
+
+def _send_touch_frame(point, flags):
+    global _touch_mouse_release
+    track_down = (bool(flags & POINTER_FLAG_DOWN) and _tracks_physical_left
+                  and not _physical_left_state[1] and not u32.GetAsyncKeyState(0x01) & 0x8000)
+    physical_generation = _physical_left_state[0]
     contact = POINTER_TOUCH_INFO()
-    contact.pointerInfo.pointerType = PT_TOUCH  # 2
+    contact.pointerInfo.pointerType = PT_TOUCH
     contact.pointerInfo.pointerId = 0
-    contact.touchFlags = 0
-    contact.touchMask = 0
-
-    dist = math.hypot(sx - cx, sy - cy)
-    r_down = 1
-    err_down = 0
-
-    if dist > 8:
-        # Ponto de controle para curvatura suave (perpendicular à linha direta)
-        nx = -(sy - cy) / dist
-        ny = (sx - cx) / dist
-        curve_mag = min(20.0, max(-20.0, dist * 0.12))
-        ctrl_x = (cx + sx) / 2.0 + nx * curve_mag
-        ctrl_y = (cy + sy) / 2.0 + ny * curve_mag
-
-        # 4 pontos intermediários em curva suave (Bezier quadrática) ~6ms por passo
-        steps_t = (0.2, 0.4, 0.6, 0.8)
-        for i, t in enumerate(steps_t):
-            inv_t = 1.0 - t
-            ix = int(inv_t * inv_t * cx + 2.0 * inv_t * t * ctrl_x + t * t * sx)
-            iy = int(inv_t * inv_t * cy + 2.0 * inv_t * t * ctrl_y + t * t * sy)
-            contact.pointerInfo.ptPixelLocation = wintypes.POINT(ix, iy)
-            if i == 0:
-                contact.pointerInfo.pointerFlags = 0x00010006  # POINTER_FLAG_DOWN | INRANGE | INCONTACT
-                ctypes.set_last_error(0)
-                r_down = int(u32.InjectTouchInput(1, ctypes.byref(contact)))
-                err_down = ctypes.get_last_error()
-            else:
-                contact.pointerInfo.pointerFlags = 0x00020006  # POINTER_FLAG_UPDATE | INRANGE | INCONTACT
-                ctypes.set_last_error(0)
-                u32.InjectTouchInput(1, ctypes.byref(contact))
-            time.sleep(0.006)
-
-        # Finaliza trajetória exatamente em (sx, sy) via UPDATE
-        contact.pointerInfo.ptPixelLocation = wintypes.POINT(sx, sy)
-        contact.pointerInfo.pointerFlags = 0x00020006  # POINTER_FLAG_UPDATE | INRANGE | INCONTACT
-        ctypes.set_last_error(0)
-        u32.InjectTouchInput(1, ctypes.byref(contact))
-        time.sleep(0.006)
-    else:
-        contact.pointerInfo.ptPixelLocation = wintypes.POINT(sx, sy)
-        contact.pointerInfo.pointerFlags = 0x00010006  # POINTER_FLAG_DOWN | INRANGE | INCONTACT
-        ctypes.set_last_error(0)
-        r_down = int(u32.InjectTouchInput(1, ctypes.byref(contact)))
-        err_down = ctypes.get_last_error()
-        time.sleep(0.015)
-
-    contact.pointerInfo.ptPixelLocation = wintypes.POINT(sx, sy)
-    contact.pointerInfo.pointerFlags = 0x00040000  # POINTER_FLAG_UP
+    contact.pointerInfo.pointerFlags = flags
+    contact.pointerInfo.ptPixelLocation = wintypes.POINT(*point)
     ctypes.set_last_error(0)
-    r_up = int(u32.InjectTouchInput(1, ctypes.byref(contact)))
-    err_up = ctypes.get_last_error()
-    return r_down, err_down, r_up, err_up
+    accepted = int(u32.InjectTouchInput(1, ctypes.byref(contact)))
+    error = ctypes.get_last_error()
+    if accepted and track_down:
+        _touch_mouse_release = (physical_generation, time.monotonic(), 0)
+    return accepted, error
+
+
+def release_pending_touch():
+    """Solta um contato da automação no ponto onde foi pressionado."""
+    global _pending_touch_release
+    if _pending_touch_release is None:
+        return True
+    accepted, error = _send_touch_frame(_pending_touch_release, POINTER_FLAG_UP)
+    # O Windows pode já ter cancelado o contato, por exemplo após mudar a resolução.
+    if accepted or error == 87:  # ERROR_INVALID_PARAMETER
+        _pending_touch_release = None
+    return _pending_touch_release is None
+
+
+def move_cursor_with_touch_hover(sx, sy):
+    """Envia apenas hover, sem iniciar um contato pressionado."""
+    initialized, _ = ensure_touch_injection()
+    if not initialized or not release_pending_touch():
+        return False
+    accepted, _ = _send_touch_frame((int(sx), int(sy)), 0x00020002)  # UPDATE | INRANGE
+    return bool(accepted)
+
+
+def _move_pointer_with_touch(sx: int, sy: int):
+    """Move o ponteiro pela trajetória de toque usada nos cliques do mapa."""
+    global _pending_touch_release
+    initialized, error = ensure_touch_injection()
+    if not initialized:
+        return 0, error, 0, 0
+    if not release_pending_touch():
+        return 0, 0, 0, 0
+
+    sx, sy = int(sx), int(sy)
+    cursor = wintypes.POINT()
+    points = [(sx, sy)]
+    if u32.GetCursorPos(ctypes.byref(cursor)):
+        cx, cy = cursor.x, cursor.y
+        dx, dy = sx - cx, sy - cy
+        distance = math.hypot(dx, dy)
+        if distance > 8:
+            curve = min(20.0, distance * 0.12)
+            control_x = (cx + sx) / 2 - dy / distance * curve
+            control_y = (cy + sy) / 2 + dx / distance * curve
+            points[:0] = [
+                (int((1 - t) ** 2 * cx + 2 * (1 - t) * t * control_x + t ** 2 * sx),
+                 int((1 - t) ** 2 * cy + 2 * (1 - t) * t * control_y + t ** 2 * sy))
+                for t in (0.2, 0.4, 0.6, 0.8)
+            ]
+
+    contact_flags = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
+    down, down_error = _send_touch_frame(points[0], POINTER_FLAG_DOWN | contact_flags)
+    if not down:
+        return down, down_error, 0, 0
+    _pending_touch_release = points[0]
+    try:
+        for point in points[1:]:
+            time.sleep(0.006)
+            moved, _ = _send_touch_frame(point, POINTER_FLAG_UPDATE | contact_flags)
+            if not moved:
+                break
+            _pending_touch_release = point
+        time.sleep(0.006)
+    finally:
+        up, up_error = _send_touch_frame(_pending_touch_release, POINTER_FLAG_UP)
+        if up or up_error == 87:
+            _pending_touch_release = None
+    return down, down_error, up, up_error
+
+
+def tap_touch(point, *, hold=0.10):
+    """Conclui um único toque estacionário numa posição já escolhida."""
+    global _pending_touch_release
+    initialized, error = ensure_touch_injection()
+    if not initialized or not release_pending_touch():
+        return 0, error, 0, 0
+    down, down_error = _send_touch_frame(point, 0x00010006)  # DOWN | INRANGE | INCONTACT
+    if not down:
+        return down, down_error, 0, 0
+
+    _pending_touch_release = point
+    try:
+        if hold >= 0.06:
+            time.sleep(hold / 2)
+            _send_touch_frame(point, 0x00020006)  # UPDATE | INRANGE | INCONTACT
+            time.sleep(hold / 2)
+        else:
+            time.sleep(hold)
+    finally:
+        up, up_error = _send_touch_frame(point, 0x00040000)  # UP
+        if up or up_error == 87:
+            _pending_touch_release = None
+    return down, down_error, up, up_error
 
 
 def _wait_cursor_arrival(sx, sy, tolerance=3):
@@ -377,7 +504,7 @@ def _wait_cursor_arrival(sx, sy, tolerance=3):
     return point
 
 
-def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=None, log=None, is_admin=False, test_mode=False, target_point=None, cursor_tolerance=3, **kwargs):
+def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=None, log=None, is_admin=False, test_mode=False, target_point=None, cursor_tolerance=3, pickup_click=False, hover_ms=None, hold_ms=None, **kwargs):
     """Executa exatamente a mesma sequência Win32 de 9e1ac16:
     1. InjectTouchInput para posicionar o cursor real.
     2. 45ms hover delay para reconhecimento pelo Ragexe.exe.
@@ -409,16 +536,56 @@ def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=N
 
         sx, sy = int(sx), int(sy)
 
+        if pickup_click:
+            def aim_is_safe():
+                return ((not callable(is_focused) or is_focused())
+                        and not u32.GetAsyncKeyState(0x01) & 0x8000)
+
+            target = target_point(0.075) if callable(target_point) else (sx, sy)
+            if target is None or not aim_is_safe() or not release_pending_touch():
+                return False
+            target = tuple(map(int, target))
+            if not move_cursor_with_touch_hover(*target):
+                u32.SetCursorPos(*target)
+            _wait_cursor_arrival(*target, tolerance=2)
+            hover_s = (max(0, int(hover_ms)) / 1000.0) if hover_ms is not None else 0.055
+            hold_s = (max(10, int(hold_ms)) / 1000.0) if hold_ms is not None else 0.085
+            time.sleep(hover_s)
+            latest = target_point(0.022) if callable(target_point) else target
+            cursor = wintypes.POINT()
+            if (latest is None or not aim_is_safe() or not u32.GetCursorPos(ctypes.byref(cursor))
+                    or math.dist((cursor.x, cursor.y), latest) > 2):
+                return False
+            latest = tuple(map(int, latest))
+            hit = u32.WindowFromPoint(wintypes.POINT(*latest))
+            if not hit or u32.GetAncestor(hit, 2) != (u32.GetAncestor(game_hwnd, 2) or game_hwnd):
+                return False
+            down, down_error, up, up_error = tap_touch(latest, hold=hold_s)
+            if down:
+                if callable(log):
+                    log(f"[Loot] Toque em {latest}: DOWN={down}/{down_error}, UP={up}/{up_error}.")
+                return bool(up or release_pending_touch())
+            pressed_at, failed, error = click_window_mouse(game_hwnd, latest, ready=aim_is_safe, hold=hold_s)
+            if callable(log):
+                log(f"[Loot] Clique em {latest}: toque recusado ({down_error}), "
+                    f"Win32={failed or 'enviado'}/{error}.")
+            return pressed_at is not None and failed is None
+
         # Atualiza a mira de sprites móveis depois do hover, antes de pressionar.
+        touch_delivered = False
         for attempt in range(3):
+            if u32.GetAsyncKeyState(0x01) & 0x8000:
+                return False
             if callable(target_point):
                 point = target_point(0.075)
                 if point is None:
                     return False
                 sx, sy = map(int, point)
-            _move_pointer_with_touch(sx, sy)
+            down, _, up, _ = _move_pointer_with_touch(sx, sy)
             pt_cur = _wait_cursor_arrival(sx, sy, tolerance=cursor_tolerance)
-            time.sleep(0.045)
+            touch_delivered = bool(down and up and math.dist((pt_cur.x, pt_cur.y), (sx, sy)) <= 5)
+            general_hover_s = (max(0, int(hover_ms)) / 1000.0) if hover_ms is not None else 0.045
+            time.sleep(general_hover_s)
             if not callable(target_point):
                 break
             point = target_point(0.022)
@@ -427,8 +594,11 @@ def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=N
             if math.dist((sx, sy), point) <= 5:
                 click_point = tuple(map(int, point))
                 if cursor_tolerance == 1 and math.dist((sx, sy), click_point) > 1:
-                    _move_pointer_with_touch(*click_point)
+                    if u32.GetAsyncKeyState(0x01) & 0x8000:
+                        return False
+                    down, _, up, _ = _move_pointer_with_touch(*click_point)
                     pt_cur = _wait_cursor_arrival(*click_point, tolerance=1)
+                    touch_delivered |= bool(down and up and math.dist((pt_cur.x, pt_cur.y), click_point) <= 2)
                     time.sleep(0.045)
                     latest = target_point(0.022)
                     if latest is None:
@@ -438,6 +608,8 @@ def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=N
                 sx, sy = click_point
                 break
         else:
+            return False
+        if u32.GetAsyncKeyState(0x01) & 0x8000:
             return False
 
         # 3. Micro-deslocamento relativo ((1,0) -> (-1,0)) para sincronizar o ponteiro dentro do DirectX
@@ -471,6 +643,7 @@ def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=N
             u32.EnumChildWindows(top_hwnd or game_hwnd, collect_child, 0)
 
         clicked = False
+        post_errors = []
         for target in targets:
             pt = wintypes.POINT(sx, sy)
             if not u32.ScreenToClient(target, ctypes.byref(pt)):
@@ -485,20 +658,33 @@ def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=N
             ctypes.set_last_error(0)
             r_down = int(u32.PostMessageW(target, 0x0201, 1, lparam))
             err_down = ctypes.get_last_error()
-            time.sleep(0.050)
+            general_hold_s = (max(10, int(hold_ms)) / 1000.0) if hold_ms is not None else 0.050
+            time.sleep(general_hold_s)
 
             ctypes.set_last_error(0)
             r_up = int(u32.PostMessageW(target, 0x0202, 0, lparam))
             err_up = ctypes.get_last_error()
+            if r_down and not r_up:
+                result = ctypes.c_size_t()
+                ctypes.set_last_error(0)
+                r_up = int(bool(u32.SendMessageTimeoutW(
+                    target, 0x0202, 0, lparam, 0x0002, 250, ctypes.byref(result),
+                )))
+                err_up = ctypes.get_last_error()
             clicked |= bool(r_down and r_up)
+            if not (r_move and r_down and r_up):
+                post_errors.append(f"0x{target:X}: MOVE={r_move}/{err_move}, "
+                                   f"DOWN={r_down}/{err_down}, UP={r_up}/{err_up}")
 
         msg = f"touch_postmsg ({sx},{sy}) targets={len(targets)} cur=({pt_cur.x},{pt_cur.y})"
+        if post_errors:
+            msg += " PostMessageW: " + " | ".join(post_errors)
         if callable(log):
             if getattr(log, "__name__", "") == "log_click_file":
                 log(msg)
             else:
                 log(f"[ClickDebug] {msg}")
-        return clicked
+        return clicked or touch_delivered
     finally:
         LAST_BOT_CLICK_TS = time.monotonic()
         _BOT_CLICKING = False
@@ -506,6 +692,130 @@ def touch_postmsg(sx, sy, hwnd=None, root_hwnd=None, *, is_focused=None, debug=N
 
 
 move_and_click = patrol_move_and_click = touch_postmsg
+
+
+def is_window_process_elevated(hwnd):
+    """Consulta a elevação do processo da janela, ou retorna None se indisponível."""
+    pid = wintypes.DWORD()
+    if not u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)):
+        return None
+    process = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not process:
+        return None
+    token = wintypes.HANDLE()
+    try:
+        if not advapi32.OpenProcessToken(process, 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+            return None
+        elevation = wintypes.DWORD()
+        returned_size = wintypes.DWORD()
+        if advapi32.GetTokenInformation(
+            token, 20, ctypes.byref(elevation), ctypes.sizeof(elevation), ctypes.byref(returned_size),
+        ):  # TokenElevation
+            return bool(elevation.value)
+        return None
+    finally:
+        if token:
+            kernel32.CloseHandle(token)
+        kernel32.CloseHandle(process)
+
+
+def click_window_mouse(hwnd, point, *, ready, hold=0.07):
+    """Envia um clique síncrono para a janela sob o ponto, no cliente do jogo."""
+    root = u32.GetAncestor(hwnd, 2) or hwnd
+    target = u32.WindowFromPoint(wintypes.POINT(*point))
+    if not target or u32.GetAncestor(target, 2) != root:
+        return None, "WindowFromPoint", 0
+
+    client = wintypes.POINT(*point)
+    ctypes.set_last_error(0)
+    if not u32.ScreenToClient(target, ctypes.byref(client)):
+        return None, "ScreenToClient", ctypes.get_last_error()
+
+    wm_move, wm_down, wm_up = 0x0200, 0x0201, 0x0202
+    ht_client, mk_lbutton = 1, 1
+    coords = ((client.y & 0xFFFF) << 16) | (client.x & 0xFFFF)
+    result = ctypes.c_size_t()
+
+    def send(message, wparam, lparam):
+        ctypes.set_last_error(0)
+        delivered = u32.SendMessageTimeoutW(
+            target, message, wparam, lparam, 0x0002, 250, ctypes.byref(result),
+        )  # SMTO_ABORTIFHUNG
+        return bool(delivered), ctypes.get_last_error()
+
+    for message, wparam, lparam in (
+        (0x0021, root, (wm_down << 16) | ht_client),  # WM_MOUSEACTIVATE
+        (0x0020, target, (wm_move << 16) | ht_client),  # WM_SETCURSOR
+        (wm_move, 0, coords),
+    ):
+        delivered, error = send(message, wparam, lparam)
+        if not delivered:
+            return None, f"0x{message:04X}", error
+
+    if not ready() or u32.WindowFromPoint(wintypes.POINT(*point)) != target:
+        return None, "mira", 0
+
+    pressed_at = time.monotonic()
+    try:
+        down, down_error = send(wm_down, mk_lbutton, coords)
+        if down:
+            time.sleep(hold)
+    finally:
+        up, up_error = send(wm_up, 0, coords)
+    if not up and up_error == 5:
+        return pressed_at if down else None, "WM_LBUTTONUP", up_error
+    if not down:
+        return None, "WM_LBUTTONDOWN", down_error
+    if not up:
+        return pressed_at, "WM_LBUTTONUP", up_error
+    return pressed_at, None, 0
+
+
+def send_window_alt_action(hwnd, *, key=None, point=None):
+    """Envia Alt com uma tecla ou botão direito para a janela cliente em foco."""
+    root = u32.GetAncestor(hwnd, 2) or hwnd
+    foreground = u32.GetForegroundWindow()
+    if not foreground or u32.GetAncestor(foreground, 2) != root:
+        return False
+
+    target = hwnd
+    if key is None:
+        target = u32.WindowFromPoint(wintypes.POINT(*point))
+        client = wintypes.POINT(*point)
+        if (not target or u32.GetAncestor(target, 2) != root
+                or not u32.ScreenToClient(target, ctypes.byref(client))):
+            return False
+        coords = ((client.y & 0xFFFF) << 16) | (client.x & 0xFFFF)
+        down, up = (0x0204, 0x0002, coords), (0x0205, 0, coords)  # WM_RBUTTON, MK_RBUTTON
+    else:
+        scan = u32.MapVirtualKeyW(key, 0)
+        if not scan:
+            return False
+        key_info = 1 | (scan << 16) | (1 << 29)
+        down, up = (0x0104, key, key_info), (0x0105, key, key_info | (3 << 30))
+
+    alt_info = 1 | (u32.MapVirtualKeyW(0x12, 0) << 16)
+    result = ctypes.c_size_t()
+
+    def send(message, wparam, lparam):
+        return bool(u32.SendMessageTimeoutW(target, message, wparam, lparam, 0x0002, 250, ctypes.byref(result)))
+
+    try:
+        if not send(0x0104, 0x12, alt_info):  # WM_SYSKEYDOWN, VK_MENU
+            return False
+        if u32.GetForegroundWindow() != foreground:
+            return False
+        if key is None and not send(0x0200, 0, coords):
+            return False
+        try:
+            pressed = send(*down)
+            if pressed:
+                time.sleep(0.04)
+        finally:
+            released = send(*up)
+    finally:
+        alt_released = send(0x0105, 0x12, alt_info | (7 << 29))  # WM_SYSKEYUP
+    return pressed and released and alt_released
 
 
 def move_cursor_relative(sx: int, sy: int) -> tuple[int, int] | None:

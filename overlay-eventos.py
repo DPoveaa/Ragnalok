@@ -533,10 +533,17 @@ def save_filters_config(cfg: dict):
 
 
 SKILL_MODES = (
-    "Ofensiva em Alvo (Unitária / Splash 3x3)",
-    "Repetir até Confirmar no Alvo",
-    "Auto-Buff / Postura",
+    "Pré-Combate (Abertura / Furto)",
+    "Combate (Alvo / Área)",
+    "Auto-Buff / Suporte",
 )
+_LEGACY_SKILL_MODE_MAP = {
+    "Pré-Combate (Abertura)": "Pré-Combate (Abertura / Furto)",
+    "Repetir até Confirmar no Alvo": "Pré-Combate (Abertura / Furto)",
+    "Ofensiva em Alvo (Unitária / Splash 3x3)": "Combate (Alvo / Área)",
+    "Combate / Área": "Combate (Alvo / Área)",
+    "Auto-Buff / Postura": "Auto-Buff / Suporte",
+}
 SKILL_HOTKEYS = tuple(f"F{i}" for i in range(1, 10)) + tuple(str(i) for i in range(1, 10))
 SKILL_HOTKEY_TO_VK = {
     **{f"F{i}": 0x6F + i for i in range(1, 10)},
@@ -550,7 +557,8 @@ def normalize_skill_slot(raw: dict) -> dict:
     hotkey = str(raw.get("hotkey", "F1")).strip().upper()
     if hotkey not in SKILL_HOTKEY_TO_VK:
         hotkey = "F1"
-    mode = str(raw.get("mode", SKILL_MODES[0])).strip()
+    raw_mode = str(raw.get("mode", SKILL_MODES[0])).strip()
+    mode = _LEGACY_SKILL_MODE_MAP.get(raw_mode, raw_mode)
     if mode not in SKILL_MODES:
         mode = SKILL_MODES[0]
     try:
@@ -562,48 +570,42 @@ def normalize_skill_slot(raw: dict) -> dict:
     except (TypeError, ValueError):
         status_id = 0
     try:
-        cooldown_sec = min(300.0, max(0.5, float(raw.get("cooldown_sec", 1.0) or 1.0)))
+        cooldown_sec = min(300.0, max(0.3, float(raw.get("cooldown_sec", 0.8) or 0.8)))
     except (TypeError, ValueError):
-        cooldown_sec = 1.0
+        cooldown_sec = 0.8
     try:
         cast_time_sec = min(30.0, max(0.0, float(raw.get("cast_time_sec", 0.0) or 0.0)))
     except (TypeError, ValueError):
         cast_time_sec = 0.0
+    if "repeat_until_success" in raw:
+        repeat_until_success = bool(raw.get("repeat_until_success"))
+    else:
+        repeat_until_success = str(raw.get("pre_combat_mode", "try_until_works")).strip() != "one_per_mob"
+    is_precombat = mode == "Pré-Combate (Abertura / Furto)"
+    default_range = 2.3 if is_precombat else 9.0
     try:
-        min_sp_pct = min(100, max(0, int(float(raw.get("min_sp_pct", 10) or 0))))
+        skill_range = min(15.0, max(1.0, float(raw.get("skill_range", default_range) or default_range)))
     except (TypeError, ValueError):
-        min_sp_pct = 10
-    try:
-        min_mobs_3x3 = min(20, max(1, int(raw.get("min_mobs_3x3", 1) or 1)))
-    except (TypeError, ValueError):
-        min_mobs_3x3 = 1
-    try:
-        max_attempts = min(20, max(1, int(raw.get("max_attempts", 5) or 5)))
-    except (TypeError, ValueError):
-        max_attempts = 5
-    try:
-        max_range = min(15.0, max(1.0, float(raw.get("max_range", 9.0) or 9.0)))
-    except (TypeError, ValueError):
-        max_range = 9.0
-    wl_raw = raw.get("whitelist", [])
-    bl_raw = raw.get("blacklist", [])
-    whitelist = [str(x).strip().lower() for x in wl_raw if str(x).strip()] if isinstance(wl_raw, list) else []
-    blacklist = [str(x).strip().lower() for x in bl_raw if str(x).strip()] if isinstance(bl_raw, list) else []
+        skill_range = default_range
+    max_attempts = (3 if repeat_until_success else 1) if is_precombat else 5
     return {
         "enabled": bool(raw.get("enabled", True)),
         "name": str(raw.get("name", "")).strip()[:40],
         "hotkey": hotkey,
         "mode": mode,
+        "repeat_until_success": repeat_until_success,
         "skill_id": skill_id,
         "status_id": status_id,
         "cooldown_sec": cooldown_sec,
         "cast_time_sec": cast_time_sec,
-        "min_sp_pct": min_sp_pct,
-        "min_mobs_3x3": min_mobs_3x3,
+        "min_sp_pct": 0,
+        "min_mobs_3x3": 1,
         "max_attempts": max_attempts,
-        "max_range": max_range,
-        "whitelist": whitelist,
-        "blacklist": blacklist,
+        "max_range": skill_range,
+        "whitelist": [],
+        "blacklist": [],
+        "pre_combat_mode": "try_until_works" if repeat_until_success else "one_per_mob",
+        "skill_range": skill_range,
     }
 
 
@@ -1043,9 +1045,18 @@ def find_cheapest_kafra_storage_route(start_map: str, network: dict = None) -> t
 
 BG_KEY = "#010101"
 DEFAULT_CLICK_METHOD = "touch_postmsg"
-CLICK_RETRY_OFFSETS = tuple(
-    (dx, dy) for dx in range(-5, 6) for dy in range(-5, 6)
-    if 9 <= dx * dx + dy * dy <= 25
+PIN_CLICK_METHOD = "SendMessageTimeoutW"
+PIN_UIPI_MESSAGE = "[PIN] Erro 5 (UIPI): execute o overlay-eventos.py como Administrador (mesmo nível do Ragexe.exe)."
+KAFRA_INTERACTION_RANGE = 6.0
+LOOT_CLICK_RADIUS = 5
+LOOT_CLICK_OFFSETS = ((0, -6), (-3, -4), (3, -4))
+LOOT_MAX_ATTEMPTS = 2 * len(LOOT_CLICK_OFFSETS)
+FARM_MAX_PATH_STEPS = 45
+FARM_MAX_DETOUR_RATIO = 2.4
+FARM_LAST_POSITION_TIMEOUT = 4.5
+FARM_IGNORE_DURATION = 1.5
+CLICK_RETRY_OFFSETS = (
+    (5, 0), (4, 3), (0, 5), (-4, 3), (-5, 0), (-4, -3), (0, -5), (4, -3),
 )
 MAX_SNAPSHOT_BYTES = 256_000
 MAX_OBJECTS = 200
@@ -1293,10 +1304,26 @@ class KafraVision:
         return text if len(text) == 1 and "0" <= text <= "9" else None
 
     def pin_field_count(self, panel):
-        # A máscara da senha ocupa várias colunas. O cursor isolado não conta.
-        columns = self.np.any(panel[42:55, 109:211] < 160, axis=0)
-        glyph_columns = columns[:-2] & columns[1:-1] & columns[2:]
-        return int(self.np.count_nonzero(glyph_columns & ~self.np.r_[False, glyph_columns[:-1]]))
+        return self._pin_mask_count(panel[42:55, 109:211])
+
+    def pin_progress(self, viewport, rect, *, with_ink=False):
+        left, top, _, _ = viewport
+        x, y, _, _ = rect
+        strip = self.capture((left + x + 3, top + y + 2, 208, 53))
+        if self._match(strip[:13, :106], self.pin[2:15, 3:109], confidence=0.85) != (0, 0):
+            return None
+        field = strip[40:53, 106:208]
+        count = self._pin_mask_count(field)
+        return (count, int(self.np.count_nonzero(field < 160))) if with_ink else count
+
+    def _pin_mask_count(self, field):
+        dark = field < 160
+        # Asteriscos consecutivos encostam nas laterais. Cada um tem uma
+        # haste vertical própria e uma barra central de três pixels.
+        stems = (dark[:-4, 1:-1] & dark[1:-3, 1:-1] & dark[2:-2, 1:-1]
+                 & dark[3:-1, 1:-1] & dark[4:, 1:-1])
+        crosses = stems & dark[2:-2, :-2] & dark[2:-2, 2:]
+        return int(self.np.count_nonzero(crosses))
 
     def pin_highlight(self, colors):
         # O realce azul marca a tecla mesmo quando a mão aparece fora da borda.
@@ -1365,7 +1392,8 @@ class KafraVision:
             readings[point] = (digit, glyph)
 
         known = [digit for digit, _ in readings.values() if digit is not None]
-        if len(centers) != 10 or not len(known) == len(set(known)) == 9:
+        complete_by_elimination = len(centers) == 10 and len(known) == len(set(known)) == 9
+        if not complete_by_elimination:
             for point, (digit, glyph) in readings.items():
                 if digit is None and glyph is not None and glyph.any():
                     readings[point] = (self._ocr_pin_digit(glyph), glyph)
@@ -1728,6 +1756,8 @@ _keyboard_api.SendInput.restype = wintypes.UINT
 
 u32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
 u32.FindWindowW.restype = wintypes.HWND
+u32.WindowFromPoint.argtypes = (wintypes.POINT,)
+u32.WindowFromPoint.restype = wintypes.HWND
 u32.RealChildWindowFromPoint.argtypes = (wintypes.HWND, wintypes.POINT)
 u32.RealChildWindowFromPoint.restype = wintypes.HWND
 u32.MapWindowPoints.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.POINTER(wintypes.POINT), wintypes.UINT)
@@ -1783,12 +1813,14 @@ class GameViewport:
         if not force and self._cached_viewport is not None and (now - self._last_viewport_time < 0.120):
             return self._cached_viewport
 
-        # Se o handle foi fechado, tenta redetectar a janela do jogo
-        if self.handle and not self.user.IsWindow(self.handle):
-            self.handle = None
-            new_h, _, _ = find_ragnarok_window()
-            if new_h:
-                self.handle = new_h
+        # Se o handle estiver ausente ou foi fechado, tenta redetectar a janela do jogo
+        if not self.handle or not self.user.IsWindow(self.handle):
+            if now - getattr(self, "_last_redetect_time", 0.0) >= 1.0:
+                self._last_redetect_time = now
+                self.handle = None
+                new_h, _, _ = find_ragnarok_window()
+                if new_h:
+                    self.handle = new_h
 
         target = self.handle
         foreground = self.user.GetForegroundWindow()
@@ -2175,6 +2207,7 @@ class CameraTracker:
             return left + u * width, top + v * height
 
         aligned.project_screen = aligned_screen
+        aligned.camera_ground = project.camera_ground
         return aligned
 
     @staticmethod
@@ -2571,6 +2604,8 @@ class CameraTracker:
                 if nCode >= 0 and lParam:
                     try:
                         ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                        if not ms.flags & 0x01 and wParam in (0x0201, 0x0202, 0x0203):
+                            win32_input.observe_physical_left(wParam != 0x0202)
                         if not ms.flags & 0x01 and wParam in (0x0201, 0x0204, 0x0207, 0x020B):
                             self._mouse_click_events.append((ms.pt.x, ms.pt.y, wParam == 0x0201,
                                                              time.monotonic(), u32.GetForegroundWindow(),
@@ -2594,6 +2629,7 @@ class CameraTracker:
             self._wheel_hook_proc = HOOKPROC(_wheel_proc)
             h_mod = kernel32.GetModuleHandleW(None)
             self._wheel_hook = u32.SetWindowsHookExW(WH_MOUSE_LL, self._wheel_hook_proc, h_mod, 0)
+            win32_input.track_physical_left(bool(self._wheel_hook))
         except Exception:
             self._wheel_hook = None
 
@@ -2604,6 +2640,7 @@ class CameraTracker:
             except Exception:
                 pass
             self._wheel_hook = None
+            win32_input.track_physical_left(False)
             self._mouse_events.clear()
             self._mouse_click_events.clear()
 
@@ -2736,6 +2773,25 @@ class InterceptionDriver:
             return True
         except Exception as exc:
             print(f"[HID] Erro ao enviar clique via Interception: {exc}", flush=True)
+            return False
+
+    def send_left_click(self, hold_sec: float = 0.05) -> bool:
+        """Envia clique esquerdo físico na posição atual do cursor (sem mover)."""
+        if not self.is_available or not self.context or not self.mouse_dev:
+            return False
+        try:
+            stroke_down = InterceptionMouseStroke(
+                state=0x0001, flags=0, rolling=0, x=0, y=0, information=0
+            )
+            if self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_down), 1) != 1:
+                return False
+            time.sleep(hold_sec)
+            stroke_up = InterceptionMouseStroke(
+                state=0x0002, flags=0, rolling=0, x=0, y=0, information=0
+            )
+            return self.dll.interception_send(self.context, self.mouse_dev, ctypes.byref(stroke_up), 1) == 1
+        except Exception as exc:
+            print(f"[HID] Erro ao enviar clique atual via Interception: {exc}", flush=True)
             return False
 
     def close(self):
@@ -3065,6 +3121,13 @@ class Overlay:
         self._in_active_combat = False
         self._farm_lock_started_at = 0.0
         self._farm_attack_ts = 0.0
+        self._farm_target_missing_since = None
+        self._farm_progress = None
+        self._farm_route = None
+        self._farm_pursuit = None
+        self._farm_patrol_until = 0.0
+        self.ignored_mobs = {}
+        self._loot_attempts = {}
         self._farm_seen_attack_ts = 0.0
         self._farm_attack_action = None
         self._farm_retry_at = 0.0
@@ -3089,15 +3152,20 @@ class Overlay:
         self._patrol_scan_zone = None
         self._patrol_visibility_key = None
         self._patrol_visible = ()
-        self._patrol_wall_clearance = {}
         self.patrol_waypoint = None
         self.visited_cells = []
         self.temp_blocked_cells = {}
+        self.visual_occluded_cells = {}
+        self._visual_walk_probe = None
+        self._last_visual_failure = None
+        self._plateau_short_step_until = 0.0
         self.stuck_count = 0
         self.patrol_target_route = None  # (map_name, x, y, target_npc_or_warp)
         self.nav_goal = None  # (map_name, x, y) — rota direcionada INDEPENDENTE do auto_patrol
         self.manual_nav_goal = None
         self._minimap_goal = None
+        self._minimap_path_request = None
+        self._minimap_path_worker = None
         self.minimap_nav = True
         self.travel_plan = None
         self._travel_allowed_portal = None
@@ -3111,11 +3179,26 @@ class Overlay:
         self._skill_cooldowns = {}
         self._skill_target_attempts = {}
         self._skill_cast_until = 0.0
+        self._pending_buff_key = None
+        self._pending_skill_target = None
+        self._skill_approach_step = None
         self._skill_cast_started_at = 0.0
         self._skill_cast_target_gid = None
         self._skill_cast_max_range = 9.0
         self._skill_cast_skill_id = 0
         self._active_splash_gid = None
+        # ── Parte 3: estado pré-combate por mob_gid ───────────────────────────
+        # state ∈ {"PENDING", "ARMING", "WAITING", "CASTING", "DONE", "FAILED"}
+        self._precombat_states: dict = {}          # {(mob_gid, idx): state}
+        self._precombat_click_attempts: dict = {}  # {(mob_gid, idx): int}
+        self._precombat_cast_until: float = 0.0    # monotonic: bloqueia ataques durante cast
+        self._precombat_last_cs_ts: float = 0.0    # ts do último C->S de skill
+        self._precombat_wait_until: float = 0.0    # aguarda resposta TCP até este ts
+        self._precombat_active_slot: dict = {}      # slot em execução
+        self._precombat_cursor_armed: bool = False
+        self._precombat_key_future = None
+        self._precombat_need_hover_reset: bool = False
+        self._last_dispatched_skill_slot = None    # (ts_monotonic, idx)
         self._active_splash_until = 0.0
         self.tier1_items = self.filters_config.get("tier1_items", [])
         self.tier3_items = self.filters_config.get("tier3_items", [])
@@ -3238,7 +3321,11 @@ class Overlay:
         self._game_key_closed = False
         self._game_key_queue = collections.deque()
         self._game_key_worker_active = False
+        self._game_key_pending = set()
         self._menu_selection_active = False
+        self._menu_osk_progress = None
+        self._osk_send_lock = threading.RLock()
+        self._osk_retry_after = 0.0
         self._osk_hwnd = None
         self._osk_invoke_cache = {}
         self._osk_fn_keys = set()
@@ -3247,7 +3334,9 @@ class Overlay:
         self._sit_confirmation = None
         self._action_click_used = None
         self._last_patrol_click_target = None
-        self._npc_click_state = {}
+        self._directed_replan_at = 0.0
+        self._directed_failures = 0
+        self._patrol_interaction = None
         self._session_kills = collections.Counter()
         self._session_items = collections.Counter()
         self._session_item_ids = collections.defaultdict(set)
@@ -3501,23 +3590,6 @@ class Overlay:
         self._hud_play_button = button(strip, "▶ Play", self._toggle_hud_run)
         self._hud_play_button.configure(width=14)
         self._set_hud_running(False)
-        self._hud_pin_probe = tk.Frame(strip, bg=bg)
-        probe_digit = tk.StringVar(value="6")
-        probe_modes = ("Comparar", "Toque", "Parado")
-        probe_mode = tk.StringVar(value=probe_modes[0])
-        tk.Spinbox(self._hud_pin_probe, values=tuple("0123456789"), width=2, wrap=True, state="readonly",
-                   textvariable=probe_digit, readonlybackground=surface, fg=fg, font=font).pack(side="left")
-
-        def toggle_probe_mode():
-            next_index = (probe_modes.index(probe_mode.get()) + 1) % len(probe_modes)
-            probe_mode.set(probe_modes[next_index])
-            probe_mode_button.configure(text=probe_mode.get())
-
-        probe_mode_button = button(self._hud_pin_probe, probe_mode.get(), toggle_probe_mode)
-        probe_mode_button.configure(width=8)
-        button(self._hud_pin_probe, "Testar PIN",
-               lambda: self._queue_pin_probe(probe_digit.get(), probe_mode.get()))
-
         for target_kind, widgets in (
             ("panel", (strip, drag_handle, status_label)),
             ("drawer", (drawer_header, drawer_grip)),
@@ -3587,24 +3659,32 @@ class Overlay:
             "name": tk.StringVar(value=""),
             "hotkey": tk.StringVar(value="F1"),
             "mode": tk.StringVar(value=SKILL_MODES[0]),
-            "cooldown_sec": tk.StringVar(value="1.0"),
-            "cast_time_sec": tk.StringVar(value="0.0"),
-            "min_sp_pct": tk.StringVar(value="10"),
-            "min_mobs_3x3": tk.StringVar(value="1"),
-            "max_attempts": tk.StringVar(value="5"),
-            "max_range": tk.StringVar(value="9"),
-            "skill_id": tk.StringVar(value="0"),
-            "status_id": tk.StringVar(value="0"),
-            "whitelist": tk.StringVar(value=""),
-            "blacklist": tk.StringVar(value=""),
+            "repeat_until_success": tk.BooleanVar(value=True),
         }
+
+        repeat_chk = tk.Checkbutton(
+            skills_page,
+            text="Repetir até funcionar / roubar (máx. 3x)",
+            variable=skill_vars["repeat_until_success"],
+            bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
+            selectcolor=surface, font=font, bd=0, highlightthickness=0,
+            anchor="w", takefocus=False,
+        )
+
+        def update_repeat_visibility(*_args):
+            if skill_vars["mode"].get() == "Pré-Combate (Abertura / Furto)":
+                if not repeat_chk.winfo_ismapped():
+                    repeat_chk.pack(anchor="w", pady=(2, 0), before=self._skills_status)
+            elif repeat_chk.winfo_ismapped():
+                repeat_chk.pack_forget()
 
         def refresh_skills_list():
             self._skills_listbox.delete(0, tk.END)
             for idx, slot in enumerate(self.skills_config):
                 flag = "ON" if slot["enabled"] else "OFF"
                 tag = slot["name"] or f"Skill #{idx + 1}"
-                self._skills_listbox.insert(tk.END, f"[{flag}] {slot['hotkey']} • {tag} ({slot['mode'][:12]})")
+                id_tag = f" #{slot['skill_id']}" if slot.get("skill_id") else ""
+                self._skills_listbox.insert(tk.END, f"[{flag}] {slot['hotkey']} • {tag}{id_tag} ({slot['mode'][:11]})")
             if self.skills_config and self._skill_selected_idx is not None and 0 <= self._skill_selected_idx < len(self.skills_config):
                 self._skills_listbox.selection_set(self._skill_selected_idx)
 
@@ -3616,16 +3696,12 @@ class Overlay:
             skill_vars["name"].set(slot["name"])
             skill_vars["hotkey"].set(slot["hotkey"])
             skill_vars["mode"].set(slot["mode"])
-            skill_vars["cooldown_sec"].set(str(slot["cooldown_sec"]))
-            skill_vars["cast_time_sec"].set(str(slot["cast_time_sec"]))
-            skill_vars["min_sp_pct"].set(str(slot["min_sp_pct"]))
-            skill_vars["min_mobs_3x3"].set(str(slot["min_mobs_3x3"]))
-            skill_vars["max_attempts"].set(str(slot["max_attempts"]))
-            skill_vars["max_range"].set(str(slot["max_range"]))
-            skill_vars["skill_id"].set(str(slot["skill_id"]))
-            skill_vars["status_id"].set(str(slot["status_id"]))
-            skill_vars["whitelist"].set(", ".join(slot["whitelist"]))
-            skill_vars["blacklist"].set(", ".join(slot["blacklist"]))
+            skill_vars["repeat_until_success"].set(slot.get("repeat_until_success", True))
+            update_repeat_visibility()
+            learned = slot.get("skill_id", 0)
+            self._skills_status.configure(
+                text=f"Skill ID aprendido via TCP: #{learned}" if learned else "Skill ID e delay detectados automaticamente via TCP."
+            )
 
         def on_skill_select(_evt=None):
             sel = self._skills_listbox.curselection()
@@ -3636,7 +3712,7 @@ class Overlay:
         self._skills_listbox.bind("<<ListboxSelect>>", guard(on_skill_select))
 
         def add_skill_slot():
-            new_slot = normalize_skill_slot({"name": f"Skill {len(self.skills_config) + 1}", "hotkey": "F1"})
+            new_slot = normalize_skill_slot({"name": f"Skill {len(self.skills_config) + 1}", "hotkey": "F2"})
             self.skills_config.append(new_slot)
             self._skill_selected_idx = len(self.skills_config) - 1
             save_skills_config(self.skills_config)
@@ -3656,22 +3732,17 @@ class Overlay:
 
         def save_skill_slot():
             idx = self._skill_selected_idx
+            existing = self.skills_config[idx] if (idx is not None and 0 <= idx < len(self.skills_config)) else {}
             raw = {
+                **existing,
                 "enabled": skill_vars["enabled"].get(),
                 "name": skill_vars["name"].get(),
                 "hotkey": skill_vars["hotkey"].get(),
                 "mode": skill_vars["mode"].get(),
-                "cooldown_sec": skill_vars["cooldown_sec"].get(),
-                "cast_time_sec": skill_vars["cast_time_sec"].get(),
-                "min_sp_pct": skill_vars["min_sp_pct"].get(),
-                "min_mobs_3x3": skill_vars["min_mobs_3x3"].get(),
-                "max_attempts": skill_vars["max_attempts"].get(),
-                "max_range": skill_vars["max_range"].get(),
-                "skill_id": skill_vars["skill_id"].get(),
-                "status_id": skill_vars["status_id"].get(),
-                "whitelist": [s.strip() for s in skill_vars["whitelist"].get().split(",") if s.strip()],
-                "blacklist": [s.strip() for s in skill_vars["blacklist"].get().split(",") if s.strip()],
+                "repeat_until_success": skill_vars["repeat_until_success"].get(),
             }
+            if existing.get("mode") != raw["mode"]:
+                raw.pop("skill_range", None)
             slot = normalize_skill_slot(raw)
             if idx is not None and 0 <= idx < len(self.skills_config):
                 self.skills_config[idx] = slot
@@ -3687,7 +3758,7 @@ class Overlay:
         button(skills_btn_row, "Remover", remove_skill_slot)
         button(skills_btn_row, "Salvar", save_skill_slot)
 
-        tk.Checkbutton(skills_page, text="Skill ativa no Auto-Farm", variable=skill_vars["enabled"],
+        tk.Checkbutton(skills_page, text="Ativa", variable=skill_vars["enabled"],
                        bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
                        selectcolor=surface, font=font, bd=0, highlightthickness=0,
                        anchor="w", takefocus=False).pack(anchor="w")
@@ -3711,25 +3782,10 @@ class Overlay:
         mode_menu["menu"].configure(bg=surface, fg=fg, activebackground=purple, activeforeground=fg, font=font)
         mode_menu.pack(side="left", padx=(4, 0))
 
-        for pairs in (
-            (("cooldown_sec", "CD(s)", 6), ("cast_time_sec", "Cast(s)", 6), ("min_sp_pct", "Min SP%", 5)),
-            (("min_mobs_3x3", "Mobs 3x3", 5), ("max_attempts", "Tent.", 5), ("max_range", "Alcance", 5)),
-            (("skill_id", "Skill ID", 6), ("status_id", "Status ID", 6)),
-        ):
-            r_num = row(skills_page)
-            for key, title, w in pairs:
-                label(r_num, title).pack(side="left")
-                tk.Entry(r_num, textvariable=skill_vars[key], width=w, bg=surface, fg=fg,
-                         insertbackground=fg, relief="flat", font=font).pack(side="left", padx=(3, 8))
-
-        for key, title in (("whitelist", "Whitelist"), ("blacklist", "Blacklist")):
-            r_flt = row(skills_page)
-            label(r_flt, title).pack(side="left")
-            tk.Entry(r_flt, textvariable=skill_vars[key], width=30, bg=surface, fg=fg,
-                     insertbackground=fg, relief="flat", font=font).pack(side="right", fill="x", expand=True, padx=(6, 0))
-
-        self._skills_status = label(skills_page, "Use vírgulas nas listas (ex: poring, #1002).", purple)
-        self._skills_status.pack(fill="x", pady=(2, 0))
+        self._skills_status = label(skills_page, "Skill ID e delay detectados automaticamente via TCP.", purple)
+        self._skills_status.pack(fill="x", pady=(4, 0))
+        skill_vars["mode"].trace_add("write", update_repeat_visibility)
+        update_repeat_visibility()
         refresh_skills_list()
         if self._skill_selected_idx is not None:
             load_slot_into_form(self._skill_selected_idx)
@@ -4084,6 +4140,10 @@ class Overlay:
             field.pack(side="right", fill="x", expand=True, padx=(8, 0))
             self._bind_hud_entry(field, surface)
             field._hud_finish = guard(lambda name=key, entry=field: self._save_kafra_field(name, entry))
+        button(row(kafra), "Testar senha", self._queue_pin_probe)
+        self._pin_test_status = tk.StringVar(value="")
+        tk.Label(kafra, textvariable=self._pin_test_status, bg=bg, fg=fg, font=font,
+                 anchor="w", wraplength=340).pack(fill="x")
         button(row(kafra), "Guardar na Kafra Agora", self._request_kafra_storage)
 
         survival = pages["Sobrevivência"]
@@ -4479,6 +4539,15 @@ class Overlay:
         return any(u32.GetAsyncKeyState(key) & 0x8000 for key in (0x01, 0x02, 0x04))
 
     def _record_hud_click(self, sx, sy, left_button, clicked_at, fg):
+        pin_cycle = getattr(self, "_pin_click_probe", None) or self._kafra_cycle
+        pin_seq = (pin_cycle.get("pin_seq") or pin_cycle.get("pin_rescan")) if pin_cycle else None
+        if pin_seq and left_button and self._is_game_focused(fg):
+            pending = pin_seq.get("pending")
+            press = pending[0] if pending else pin_seq.get("automatic_press")
+            bot_press = press.get("bot_press") if press else None
+            if bot_press is None or not (0 <= clicked_at - bot_press[0] <= 0.15
+                                         and math.dist((sx, sy), bot_press[1]) <= 3):
+                pin_seq["physical_click_at"] = clicked_at
         if (not self._hud_render_foreground or self._click_in_progress
                 or not (self._automation_running or self._hud_edit is not None or self._hud_choice is not None)):
             return
@@ -4653,13 +4722,6 @@ class Overlay:
         self._update_hud_play()
         anchor = game_hwnd or self._hud_render_anchor
         panel_w, panel_h = self._hud_dock_width, 30
-        pin_debug_visible = self.filters_config["kafra_pin_debug"] and getattr(self, "_pin_debug_drawn", None) is not None
-        if pin_debug_visible:
-            if not self._hud_pin_probe.winfo_manager():
-                self._hud_pin_probe.pack(side="left")
-            panel_w += self._hud_pin_probe.winfo_reqwidth()
-        elif self._hud_pin_probe.winfo_manager():
-            self._hud_pin_probe.pack_forget()
         if viewport:
             left, top, vw, _ = viewport
             if self._hud_pos and self._hud_pos[0] is not None and self._hud_pos[1] is not None:
@@ -4702,8 +4764,6 @@ class Overlay:
         for window, visible, width, height, x, y in windows:
             if not window:
                 continue
-            if pin_debug_visible and window is not self._hud_panel:
-                visible = False
             if pin_suppressed and visible:
                 r_left, r_top, r_right, r_bottom = pin_rect
                 if x < r_right and x + width > r_left and y < r_bottom and y + height > r_top:
@@ -4781,6 +4841,7 @@ class Overlay:
     def _stop_hud_actions(self):
         self._set_hud_running(False)
         self._pending_hud_interaction = None
+        self._pin_click_probe = None
         self._hud_npc_line_target = None
         self._kafra_manual = False
         self._kafra_cycle = None
@@ -4823,6 +4884,8 @@ class Overlay:
         self.minimap_nav = not self.minimap_nav
         if self.minimap_nav:
             self._resume_hud_automation()
+        else:
+            self._minimap_path_request = None
 
     def _hud_walk_to(self, x, y):
         try:
@@ -4971,90 +5034,19 @@ class Overlay:
             return
         (kind, aid), _, selected_map, _ = selection
         world = getattr(self.feed, "world", None)
-        if not world:
+        if world is None:
             return
-        now_i = time.monotonic()
         with world.lock:
             target = world.entity(kind, aid)
-            if not target or world.map != selected_map or not world.player:
+            if (target is None or world.map != selected_map or not world.player
+                    or world.npc_dialog.get("open")):
                 return
-            tx, ty = map(int, target.track.target)
-            px_i, py_i = world.player.cell(now_i)
-            dialog_open = world.npc_dialog.get("open")
-
-        if px_i is None or py_i is None:
-            return
-        if dialog_open:
-            self._npc_click_state.pop((aid, tx, ty), None)
-            self.nav_goal = None
-            return
-        dist_i = math.hypot(px_i - tx, py_i - ty)
-        _npc_key = (aid, tx, ty)
-        _npc_st = self._npc_click_state.get(_npc_key, {"clicks": 0, "last_click_ts": 0.0})
-
-        if dist_i > 3.8:
-            self._clear_patrol_route()
-            self.manual_nav_goal = None
-            if kind == "warp":
-                self.manual_nav_goal = (selected_map, tx, ty)
-                self.nav_goal = self.manual_nav_goal
-            self.patrol_target_route = (selected_map, tx, ty, aid)
-            self.active_nav_color = "#A78BFA"
-            return
-
-        terrain = getattr(self.feed, "terrain", None)
-        gat_i = terrain.for_map(selected_map) if terrain else None
-        # Mantém o limite de tentativas e o intervalo mínimo da interação direta.
-        if _npc_st["clicks"] >= 2:
-            # 2 tentativas sem abrir diálogo → desiste
-            self._click_debug(f"INTERAGIR: 2 tentativas sem diálogo para #{aid}. Encerrando.")
-            self._npc_click_state.pop(_npc_key, None)
-            self.nav_goal = None
-            return
-
-        if now_i - _npc_st["last_click_ts"] < 0.950:
-            return  # aguarda intervalo mínimo
-
-        # Projeta e clica no sprite
-        snap_i = self.feed.current()
-        if snap_i and snap_i.map == selected_map:
-            vp_i = snap_i.viewport
-            left_i, top_i, w_i, h_i = vp_i
-            sprite_z_i = 5.5 if kind == "npc" else 1.2
-            h_fn_i = getattr(gat_i, "get_elevation", None) if gat_i else None
-            cam_i = getattr(self.feed, "_cam", None) or (px_i, py_i)
-            proj_i = self.feed.camera.projector(vp_i, cam_i, h_fn_i)
-            u_i, v_i = proj_i(tx, ty, sprite_z_i)
-            sx_i = left_i + int(u_i * w_i)
-            sy_i = top_i + int(v_i * h_i)
-            portal = (tx, ty) if kind == "warp" else None
-            npc = aid if kind == "npc" else None
-            blocked, penalties = self._navigation_obstacles(selected_map, gat_i, portal=portal, npc=npc)
-            resolve = self._safe_click_resolver(snap_i, proj_i, allowed_portal=portal, allowed_npc=npc)
-            g_hwnd_i = self.get_game_hwnd(None)
-            if g_hwnd_i:
-                u32.SetForegroundWindow(g_hwnd_i)
-            if self._is_point_in_game_ui(sx_i, sy_i):
-                self._side_step_to_reveal((tx, ty), px_i, py_i)
-            else:
-                self._click_debug(f"INTERAGIR: clique #{_npc_st['clicks']+1} a {dist_i:.1f} células em ({sx_i},{sy_i})")
-                step = self._navigation_target_step(gat_i, (px_i, py_i), (tx, ty), (u_i, v_i),
-                                                    resolve, blocked, penalties)
-                if not step:
-                    return
-                cell, point, direct = step
-                if not self._navigation_click(snap_i, gat_i, cell, point, hwnd=g_hwnd_i,
-                                              portal=portal, npc=npc, ground=not direct,
-                                              retry_key=(selected_map, kind, aid),
-                                              hover_reset=bool(direct and _npc_st["clicks"] > 0)):
-                    return
-                if not direct:
-                    self.patrol_target_route = (selected_map, tx, ty, aid)
-                    return
-                self._hud_npc_line_target = (f"{kind}:{aid}", selected_map, now_i + 0.950)
-                _npc_st["clicks"] += 1
-                _npc_st["last_click_ts"] = now_i
-                self._npc_click_state[_npc_key] = _npc_st
+            tx, ty = map(round, target.track.target)
+        self._clear_patrol_route()
+        self.manual_nav_goal = None
+        self.patrol_target_route = (selected_map, tx, ty, aid)
+        self.active_nav_color = "#A78BFA"
+        self._focus_hud_game()
 
     def _handle_city_travel(self, snapshot, px, py):
         """Gerencia viagem autônoma para outra cidade via portais a pé ou teleporte Kafra via teclado."""
@@ -5645,55 +5637,26 @@ class Overlay:
         gat = terrain.cached_gats.get(snapshot.map) if terrain else None
         project = self.feed.camera.projector(snapshot.viewport, self.feed._cam or position,
                                              gat.get_elevation if gat else flat_height)
-        blocked, penalties = self._navigation_obstacles(snapshot.map, gat, npc=gid, block_portals=False)
         resolve = self._safe_click_resolver(snapshot, project, allowed_npc=gid)
 
         if "npc_click_at" in leg:
             click_at = self._touch_click_finished_at(leg["npc_click_point"], leg["npc_click_at"])
             if self._automation_click_active() or now - click_at < 1.5:
                 return "waiting"
-            start = tuple(map(round, position))
-            came_closer = math.dist(start, target) < math.dist(leg["npc_click_cell"], target)
-            if gat is not None and not came_closer and math.dist(start, target) > 3.0:
-                failed = {cell for cell, until in leg["blocked"].items() if until > now}
-                retry_blocked = blocked | failed | {target}
-                closer = sorted((cell for cell in self._patrol_cells_in_radius(*start, 2)
-                                 if math.dist(start, cell) <= 1.5 and math.dist(cell, target) < math.dist(start, target)),
-                                key=lambda cell: math.dist(cell, target))
-                for cell in closer:
-                    point = self._walk_ground_point(gat, position, cell, retry_blocked, resolve)
-                    if point is not None:
-                        if self._navigation_click(snapshot, gat, cell, point, hwnd=hwnd, npc=gid):
-                            leg["walk_click"] = now, position, cell, point, False
-                        return "waiting"
+            if leg.get("npc_click_attempts", 0) >= 3:
+                leg.pop("npc_click_at")
+                leg["npc_click_attempts"] = 0
+                leg["reposition_npc_from"] = tuple(map(round, position))
+                self._click_debug(f"[Kafra] NPC {gid} sem resposta após três cliques. Reposicionando.")
+                return "waiting"
             leg.pop("npc_click_at")
 
-        item = next((obj for obj in snapshot.objects if obj.key == f"npc:{gid}"), None)
-        u, v = (item.u, item.v) if item else project(*npc.track.cell(), 5.5)
         target_cell = tuple(map(round, npc.track.target))
-        if math.dist(position, target_cell) <= 3.0:
-            point = self._kafra_safe_click_point(snapshot, project, resolve, npc, gid)
-            if not point:
-                leg["reposition_npc_from"] = tuple(map(round, position))
-                return "waiting"
-            cell = target_cell
-        else:
-            step = self._navigation_target_step(gat, position, target_cell, (u, v), resolve, blocked, penalties)
-            if not step:
-                leg["reposition_npc_from"] = tuple(map(round, position))
-                return "waiting"
-            cell, point, direct = step
-            if not direct:
-                if self._navigation_click(snapshot, gat, cell, point, hwnd=hwnd, npc=gid):
-                    leg["walk_click"] = now, position, cell, point, False
-                else:
-                    leg["reposition_npc_from"] = tuple(map(round, position))
-                return "waiting"
-            safe_point = self._kafra_safe_click_point(snapshot, project, resolve, npc, gid)
-            if not safe_point:
-                leg["reposition_npc_from"] = tuple(map(round, position))
-                return "waiting"
-            point = safe_point
+        point = self._kafra_safe_click_point(snapshot, project, resolve, npc, gid)
+        if point is None:
+            leg["reposition_npc_from"] = tuple(map(round, position))
+            self._click_debug(f"[Kafra] Sem ponto seguro no sprite do NPC {gid}. Reposicionando.")
+            return "waiting"
 
         def aim(_lead):
             if self._is_pin_entry_active():
@@ -5705,18 +5668,15 @@ class Overlay:
                     return point
             return None
 
-        if self._navigation_click(snapshot, gat, cell, point, hwnd=hwnd, target_point=aim, npc=gid,
-                                  ground=False, retry_key=None,
-                                  hover_reset=bool(leg.get("npc_click_attempts", 0) > 0
-                                                   and not world._is_player_walking())):
+        if self._navigation_click(snapshot, gat, target_cell, point, hwnd=hwnd, target_point=aim, npc=gid,
+                                  ground=False, kafra=True, retry_key=(snapshot.map, "kafra", gid),
+                                  hover_reset=leg.get("npc_click_attempts", 0) == 1):
             leg.update(npc_gid=gid, npc_raw_gid=raw_gid, npc_click_at=now, npc_click_seq=seq,
                        npc_click_point=point, npc_click_cell=tuple(map(round, position)),
                        awaiting_npc_click=True,
                        npc_click_attempts=leg.get("npc_click_attempts", 0) + 1)
             print(f"[Kafra] Interação com NPC {gid} em {npc.track.target} ({snapshot.map}).", flush=True)
             return "clicked"
-        if not self._automation_click_active():
-            leg["reposition_npc_from"] = tuple(map(round, position))
         return "waiting"
 
     def _start_kafra_storage(self, world, player, current_map, now, manual):
@@ -5803,7 +5763,7 @@ class Overlay:
             "modes": (self.auto_farm, self.auto_loot, self.auto_patrol),
             "play": self._automation_running, "deadline": now + 180, "next": now,
             "vision": vision, "tabs": [2, 0, 1], "tab": None, "hover": None,
-            "pending": None, "opened_inventory": False,
+            "pending": None,
             "keep": tuple(filter(None, map(normalize_dialog_option, cfg["keep_in_bag"]))),
             "restock": {normalize_dialog_option(name): count for name, count in cfg["restock_items"].items()
                         if type(count) is int and count > 0 and normalize_dialog_option(name)},
@@ -5837,7 +5797,7 @@ class Overlay:
     def _tick_kafra_storage(self, snapshot, world, current_map, px, py, now):
         cycle = self._kafra_cycle
         phase = cycle["phase"]
-        if now >= cycle["deadline"]:
+        if now >= cycle["deadline"] and not (phase == "opening" and "pin_seen_at" in cycle):
             if phase in ("dialog", "closing"):
                 self._send_game_key(0x1B)
             self._finish_kafra_storage(f"tempo limite excedido na etapa {phase}.", current_map)
@@ -5867,7 +5827,13 @@ class Overlay:
             self._finish_kafra_storage("mapa mudou durante a interação.", current_map)
             return
         hwnd = self.get_game_hwnd()
-        if not hwnd or u32.GetForegroundWindow() != hwnd:
+        if phase == "opening":
+            focused, focus = self._pin_window_focus(hwnd)
+            if not focused:
+                cycle.pop("pin_grid_candidate", None)
+                self._click_debug(f"[PIN Debug] Aguardando foco da janela do jogo. {focus}")
+                return
+        elif not hwnd or u32.GetForegroundWindow() != hwnd:
             return
         with world.lock:
             capacity = world.storage_capacity
@@ -5891,13 +5857,11 @@ class Overlay:
             elif phase in ("dialog", "opening"):
                 self._open_kafra_storage(snapshot, hwnd, now, phase, dialog, world, px, py)
             elif phase == "store":
-                if not inventory_ready:
-                    raise ValueError("a lista TCP completa do inventário está indisponível. Reconecte com a captura ativa para transferir automaticamente.")
                 if not dialog["storage_open"]:
                     raise ValueError("armazém fechado durante a transferência.")
                 if capacity is not None and capacity[0] >= capacity[1]:
                     raise ValueError(f"armazém cheio ({capacity[0]}/{capacity[1]}).")
-                self._store_kafra_items(snapshot, hwnd, now, inventory, storage)
+                self._store_kafra_items(snapshot, hwnd, now, inventory, storage, inventory_ready=inventory_ready)
             elif phase == "closing":
                 if dialog["storage_open"]:
                     return
@@ -6001,7 +5965,14 @@ class Overlay:
                     cycle["location"] = alt
                     cycle["position"] = (alt["x"], alt["y"])
                     print(f"[Kafra] Rota até Kafra anterior falhou ({status}); redirecionando para {cycle['position']}.", flush=True)
-                cycle["approach_leg"] = {"blocked": {}, "deadline": cycle["deadline"], "walk_retries": retries}
+                moved_target = cycle["position"] != (location["x"], location["y"])
+                cycle["approach_leg"] = {
+                    "blocked": {} if moved_target else leg["blocked"].copy(),
+                    "deadline": cycle["deadline"], "walk_retries": retries,
+                }
+                if not moved_target and "retry_stride_dist" in leg:
+                    cycle["approach_leg"]["retry_stride_dist"] = leg["retry_stride_dist"]
+                cycle["next"] = now + 0.5
                 self.active_nav_path = None
                 self._clear_locked_nav_path()
                 print(
@@ -6018,25 +5989,37 @@ class Overlay:
         if status == "clicked":
             cycle.update(phase="dialog", npc=leg["npc_gid"], clicked_at=leg["npc_click_at"], next=now + 0.1)
 
-    def _queue_pin_probe(self, digit, mode):
-        if (not self.filters_config["kafra_pin_debug"] or digit not in tuple("0123456789")
-                or getattr(self, "_pin_click_probe", None) is not None):
+    def _report_pin_test(self, message):
+        self._pin_probe_status = message
+        self._pin_test_status.set(message)
+        log_click_file(f"[PIN Teste] {message}")
+
+    @staticmethod
+    def _log_pin_uipi(cycle):
+        if not cycle.get("pin_uipi_logged"):
+            cycle["pin_uipi_logged"] = True
+            log_click_file(PIN_UIPI_MESSAGE)
+
+    def _queue_pin_probe(self):
+        self._finish_hud_edit()
+        pin = str(self.filters_config.get("kafra_pin") or self.filters_config.get("kafra_storage_pin") or "")
+        if not re.fullmatch(r"[0-9]+", pin):
+            self._report_pin_test("Configure uma senha numérica no campo Senha Kafra.")
             return
-        cycle = self._kafra_cycle
-        if self._automation_click_active() or (cycle and (cycle.get("pin_release_pending")
-                                                         or cycle.get("pin_touch_release_pending"))):
-            self._pin_probe_status = "Aguarde a soltura do clique anterior"
+        if self._automation_click_active() or getattr(self, "_pin_click_probe", None) is not None:
+            self._report_pin_test("Aguarde a ação anterior.")
             return
-        self._mark_hud_control_click()
-        self._set_hud_running(False)
+        vision = self._get_ui_vision()
+        if not vision:
+            self._report_pin_test("Leitura da janela de senha indisponível.")
+            return
         now = time.monotonic()
-        stationary = mode == "Parado"
-        self._pin_click_probe = {"digit": digit, "stationary": stationary, "compare": mode == "Comparar",
-                                 "deadline": now + 5.0,
-                                 "ready_at": now + (1.5 if stationary else 0.0)}
-        self._pin_probe_status = ("Posicione o cursor sobre o dígito" if stationary
-                                  else "Teste PIN aguardando o jogo")
+        self._pin_click_probe = {"pin_test": True, "pin": pin, "vision": vision, "next": now,
+                                 "deadline": now + 30.0}
+        self._set_hud_running(False)
+        self._close_hud_drawer()
         self._focus_hud_game()
+        self._report_pin_test("Aguardando a janela Digite a Senha.")
 
     def _tick_pin_probe(self, snapshot):
         probe = getattr(self, "_pin_click_probe", None)
@@ -6045,553 +6028,447 @@ class Overlay:
         now = time.monotonic()
 
         def finish(message):
-            self._pin_probe_status = message
             self._pin_click_probe = None
-            log_click_file(f"[PIN Debug] Teste de um dígito. {message}.")
+            self._report_pin_test(message)
             return True
 
-        if not self._release_pending_pin_touch(probe):
-            self._pin_probe_status = "Soltura de toque pendente no Windows"
+        ok_at = probe.get("pin_ok_sent_at")
+        if ok_at is not None and self.feed.world.storage_open:
+            length = len(probe["pin"])
+            return finish(f"Senha confirmada ({length}/{length}) e OK confirmado pela abertura do armazém.")
+        if now >= probe["deadline"] and "pin_seen_at" not in probe:
+            return finish("Tempo limite aguardando a janela Digite a Senha.")
+        if now < probe["next"]:
             return True
-        if probe.get("pin_release_pending"):
-            ensure_input_desktop()
-            release = INPUT(type=INPUT_MOUSE)
-            release.mi.dwFlags = MOUSEEVENTF_LEFTUP
-            if not u32.SendInput(1, ctypes.byref(release), ctypes.sizeof(INPUT)):
-                self._pin_probe_status = "Soltura pendente no Windows"
-                return True
-            probe.pop("pin_release_pending")
-        if not self.filters_config["kafra_pin_debug"]:
-            return finish("Teste encerrado")
-
         hwnd = self.get_game_hwnd()
-        vision = self._get_ui_vision()
-        if not hwnd or u32.GetForegroundWindow() != hwnd or not vision:
-            return finish("Jogo ou captura indisponível") if now >= probe["deadline"] else True
+        focused, focus = self._pin_window_focus(hwnd)
+        if not self._game_input_ready(hwnd) or not focused:
+            probe.pop("pin_grid_candidate", None)
+            probe["next"] = now + 0.25
+            self._click_debug(f"[PIN Debug] Aguardando foco da janela do jogo. {focus}")
+            return True
+        vision = probe["vision"]
         try:
-            screen, colors = vision.capture_pin(snapshot.viewport)
-        except (OSError, ValueError):
-            return finish("Falha ao capturar a janela de senha")
+            rect, screen, colors = self._pin_frame_for_input(probe, snapshot.viewport)
+            if rect is None:
+                if "pin_seen_at" in probe:
+                    if ok_at is not None:
+                        if now - ok_at >= 5.0:
+                            return finish("A janela fechou após o OK. O feed ainda não confirmou a abertura do armazém.")
+                    elif now - probe["pin_seen_at"] >= 0.35:
+                        return finish("A janela Digite a Senha foi fechada.")
+                probe["next"] = now + 0.35
+                return True
+            probe["pin_seen_at"] = now
+            left, top, _, _ = snapshot.viewport
+            x, y, width, height = rect
+            self._pin_dialog_screen_rect = (left + x - 12, top + y - 12,
+                                            left + x + width + 12, top + y + height + 12)
+            self._pin_hud_suppress_until = now + 2.5
+            if self._hide_overlapping_hud_windows(self._pin_dialog_screen_rect):
+                probe["next"] = now + 0.08
+                return True
+            self._step_kafra_pin(probe, snapshot, hwnd, vision, screen, colors, rect, probe["pin"], now)
+        except OSError as exc:
+            if "pin_seen_at" not in probe:
+                return finish(str(exc))
+            self._click_debug(f"[PIN Debug] Captura indisponível. Nova leitura agendada. {exc}")
+            probe["next"] = now + 0.35
+        except ValueError as exc:
+            return finish(str(exc))
+        return True
+
+    @staticmethod
+    def _pin_frame_for_input(cycle, viewport):
+        seq = cycle.get("pin_seq")
+        vision = cycle["vision"]
+        if (seq and seq["viewport"] == viewport
+                and vision.pin_progress(viewport, seq["rect"]) is not None):
+            return seq["rect"], None, None
+        if seq:
+            cycle.pop("pin_seq")
+            cycle["pin_rescan"] = seq
+        screen, colors = vision.capture_pin(viewport)
         rect = vision.pin_window_rect(screen)
         if rect is None:
-            return finish("Abra Digite a Senha.") if now >= probe["deadline"] else True
-        x, y, width, height = rect
-        panel = screen[y:y + height, x:x + width]
-        count = vision.pin_field_count(panel)
-        if completion := probe.get("completion"):
-            if count == probe["count"] + 1:
-                return finish("Campo Senha avançou em um dígito")
-            if count != probe["count"]:
-                return finish("Campo Senha mudou durante o teste")
-            if completion.done():
-                finished_at, sent = completion.result()
-                if now - finished_at >= 0.8:
-                    if probe["compare"] and not probe["stationary"]:
-                        probe.pop("completion")
-                        probe.update(stationary=True, deadline=now + 2.0, fallback_count=probe["count"])
-                        self._pin_probe_status = "Campo sem avanço · tentando com o cursor parado"
-                        touch_status = "aceito" if sent else "recusado"
-                        log_click_file(f"[PIN Debug] Toque {touch_status}, campo sem avanço. "
-                                       "Testando SendInput sem mover o cursor.")
-                        return True
-                    return finish("Envio aceito, campo sem avanço" if sent else "Envio recusado, campo sem avanço")
-            return True
-        if "fallback_count" in probe and count != probe["fallback_count"]:
-            return finish("Campo Senha avançou em um dígito" if count == probe["fallback_count"] + 1
-                          else "Campo Senha mudou antes da tentativa alternativa")
-        controls = probe.get("controls") if probe.get("rect") == rect else None
-        highlighted, _ = vision.pin_highlight(colors[y:y + height, x:x + width])
-        if controls is not None and vision.pin_grid_changed(panel, controls[2], highlighted):
-            probe.pop("controls")
-            controls = None
-        if controls is None:
-            controls = vision.pin_controls(panel, highlighted)
-            if controls is not None:
-                probe.update(rect=rect, controls=controls)
-        if controls is None:
-            if now >= probe["deadline"]:
-                return finish("Tempo esgotado aguardando o mapa dos dígitos")
-            self._pin_probe_status = "Teste PIN aguardando a grade completa"
-            return True
-        if now < probe["ready_at"]:
-            return True
-        buttons, _, glyphs = controls
-        point = buttons[probe["digit"]]
-        if probe["stationary"]:
-            vx, vy, _, _ = snapshot.viewport
-            cursor = wintypes.POINT()
-            if (not u32.GetCursorPos(ctypes.byref(cursor))
-                    or max(abs(cursor.x - vx - x - point[0]), abs(cursor.y - vy - y - point[1])) > 5):
-                self._pin_probe_status = "Posicione o cursor sobre o dígito"
-                return finish("O cursor não chegou ao dígito") if now >= probe["deadline"] else True
-        if now >= probe["deadline"]:
-            return finish("O clique do teste não foi agendado")
-        if completion := self._kafra_pin_click(probe, snapshot, hwnd, vision, rect, glyphs, count, point, probe=True):
-            probe.update(completion=completion, count=count)
-            self._pin_probe_status = "Teste PIN aguardando o campo Senha"
-        return True
+            cycle.pop("pin_grid_candidate", None)
+        return rect, screen, colors
+
+    def _pin_window_focus(self, hwnd, point=None):
+        foreground = u32.GetForegroundWindow()
+        root = (u32.GetAncestor(hwnd, 2) or hwnd) if hwnd else None
+        fg_root = (u32.GetAncestor(foreground, 2) or foreground) if foreground else None
+        focused = bool(root and root == fg_root and self._window_pid(foreground) == self._window_pid(hwnd))
+        details = f"jogo=0x{int(hwnd or 0):X}, raiz=0x{int(root or 0):X}, primeiro plano=0x{int(foreground or 0):X}"
+        if point is not None:
+            hit = u32.WindowFromPoint(wintypes.POINT(*point))
+            hit_root = (u32.GetAncestor(hit, 2) or hit) if hit else None
+            focused = focused and bool(hit_root == root and self._window_pid(hit) == self._window_pid(hwnd))
+            details += f", sob a tecla=0x{int(hit or 0):X}"
+        return focused, f"{details}, foco correto={focused}"
 
     def _move_pin_cursor_released(self, hwnd, sx, sy):
-        if (self._automation_click_active() or u32.GetForegroundWindow() != hwnd
-                or u32.GetAsyncKeyState(0x01) & 0x8000):
+        if (self._automation_click_active() or not self._pin_window_focus(hwnd)[0]
+                or self._mouse_buttons_down()):
             return False
         ensure_input_desktop()
-        if u32.SetCursorPos(sx, sy):
-            return True
-        left, top = u32.GetSystemMetrics(76), u32.GetSystemMetrics(77)  # Origem da tela virtual.
-        width, height = u32.GetSystemMetrics(78), u32.GetSystemMetrics(79)
-        if width < 2 or height < 2 or not (left <= sx < left + width and top <= sy < top + height):
-            return False
-        move = INPUT(type=INPUT_MOUSE)
-        move.mi.dx = round((sx - left) * 65535 / (width - 1))
-        move.mi.dy = round((sy - top) * 65535 / (height - 1))
-        move.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | 0x4000  # VIRTUALDESK
-        return bool(u32.SendInput(1, ctypes.byref(move), ctypes.sizeof(INPUT)))
+        return self._move_cursor_released(sx, sy)
 
-    def _kafra_pin_click(self, cycle, snapshot, hwnd, vision, rect, glyphs, field_count, point, *, probe=False):
-        rx, ry, rw, rh = rect
-        px, py = point
-        if not (8 <= px <= rw - 8 and 18 <= py <= rh - 8):
-            self._click_debug(f"[Kafra] Ponto de senha fora da janela: {point}.")
-            return None
-        try:
-            sx, sy = self._kafra_screen_point(snapshot, hwnd, (rx + px, ry + py))
-        except ValueError as exc:
-            self._click_debug(f"[Kafra] Clique de senha adiado. {exc}")
-            return None
-        if u32.GetAsyncKeyState(0x01) & 0x8000:  # VK_LBUTTON
-            self._click_debug("[Kafra] Aguardando a soltura do botão esquerdo antes do clique de senha.")
-            return None
-
-        vx, vy, vw, vh = snapshot.viewport
-        left, top = max(0, rx - 4), max(0, ry - 4)
-        right, bottom = min(vw, rx + rw + 4), min(vh, ry + rh + 4)
-        bounds = (vx + left, vy + top, right - left, bottom - top)
-        debug = self.filters_config["kafra_pin_debug"]
-        if debug:
-            cycle["pin_debug_aim"] = (sx, sy)
-
+    def _prepare_pin_click(self, target, aim, press):
         cursor = wintypes.POINT()
-        aligned = bool(u32.GetCursorPos(ctypes.byref(cursor))
-                       and max(abs(cursor.x - sx), abs(cursor.y - sy)) <= (5 if probe else 3))
-        method = ("mouse" if cycle["stationary"] else "direto") if probe else cycle.get("pin_click_method", "direto")
-        if not probe and method == "mouse":
-            now = time.monotonic()
-            if now < cycle.get("pin_pointer_ready_at", 0):
-                return None
-            if not aligned and not cycle.get("pin_move_unavailable"):
-                if cycle.get("pin_move_target") != (sx, sy) and self._move_pin_cursor_released(hwnd, sx, sy):
-                    cycle["pin_move_target"] = (sx, sy)
-                    cycle["pin_pointer_ready_at"] = now + 0.09
-                    cycle["next"] = cycle["pin_pointer_ready_at"]
-                    return None
-                cycle["pin_move_unavailable"] = True
-                log_click_file("[Kafra] Movimento sem pressionar indisponível para este botão.")
-            if aligned:
-                cycle.pop("pin_move_target", None)
-        if method == "mouse" and not aligned:
-            if probe:
-                return None
-            method = "direto"
-        if not probe:
-            cycle["pin_click_method"] = method
+        actual = None
 
-        def aim(lead, *, touch_hover=False):
-            after_hover = touch_hover or lead <= 0.05
-            if after_hover and method == "postmsg":
-                # O fluxo de toque já aguardou 45 ms. Completa os 90 ms antes de reler.
-                time.sleep(0.045)
-            active = getattr(self, "_pin_click_probe", None) if probe else self._kafra_cycle
-            if active is not cycle or not self._game_is_foreground():
+        def centered():
+            nonlocal actual
+            actual = (cursor.x, cursor.y) if u32.GetCursorPos(ctypes.byref(cursor)) else None
+            return actual is not None and math.dist(actual, target) <= 2
+
+        if not centered():
+            if aim(0.075) != target or self._mouse_buttons_down():
+                return False
+            if not self._position_cursor(*target):
+                self._move_cursor_released(*target)
+            deadline = time.monotonic() + 0.24
+            while not centered() and time.monotonic() < deadline:
+                if aim(0.075) != target or self._mouse_buttons_down():
+                    return False
+                time.sleep(0.015)
+        if not centered():
+            press["positioning_failed"] = True
+            log_click_file(f"[PIN Debug] LEFTDOWN não enviado: cursor={actual}, centro={target}.")
+            return False
+        time.sleep(0.05)
+        return aim(0.075) == target and centered() and not self._mouse_buttons_down()
+
+    @staticmethod
+    def _pin_auto_digit_matches(seq, field_count, now):
+        press = seq.get("automatic_press") or {}
+        pressed_at = press.get("pressed_at")
+        return (press.get("kind") == "digit" and press.get("step") == seq["step"]
+                and field_count == press.get("before", -1) + 1
+                and pressed_at is not None and now - pressed_at <= 6.0
+                and seq.get("physical_click_at", 0.0) < pressed_at)
+
+    def _kafra_pin_click(self, cycle, snapshot, hwnd, seq, point, press):
+        x, y, width, height = seq["rect"]
+        px, py = point
+        debug = cycle.get("pin_test") or self.filters_config["kafra_pin_debug"]
+        if not (8 <= px <= width - 8 and 18 <= py <= height - 1):
+            if debug:
+                self._click_debug(f"[PIN Debug] Ponto {point} fora da janela reconhecida.")
+            return None
+        focused, focus = self._pin_window_focus(hwnd)
+        if not focused or not self._game_input_ready(hwnd):
+            self._click_debug(f"[PIN Debug] Clique adiado. {focus}")
+            return None
+        if not self.is_admin and win32_input.is_window_process_elevated(hwnd):
+            self._log_pin_uipi(cycle)
+            cycle["next"] = time.monotonic() + 1.0
+            return None
+        vx, vy, vw, vh = snapshot.viewport
+        if not (0 <= x + px < vw and 0 <= y + py < vh):
+            return None
+        target = vx + x + px, vy + y + py
+        if self._is_point_in_hud(*target, margin=2):
+            self._click_debug("[PIN Debug] Clique adiado: HUD sobre a tecla.")
+            return None
+        if self._automation_click_active() or self._mouse_buttons_down():
+            if debug:
+                self._click_debug("[PIN Debug] Clique adiado enquanto o botão está pressionado ou a entrada está ocupada.")
+            return None
+        if debug:
+            cycle["pin_debug_aim"] = target
+
+        def aim(_lead):
+            active = getattr(self, "_pin_click_probe", None) if cycle.get("pin_test") else self._kafra_cycle
+            if (active is not cycle or cycle.get("pin_seq") is not seq
+                    or self.current_viewport != snapshot.viewport):
                 return None
-            if not after_hover and u32.GetAsyncKeyState(0x01) & 0x8000:
-                self._click_debug("[Kafra] Clique de senha adiado. O botão esquerdo ainda está pressionado.")
+            focused, focus = self._pin_window_focus(hwnd, target)
+            if not focused:
+                log_click_file(f"[PIN Debug] Mira cancelada. {focus}")
                 return None
-            try:
-                screen, colors = vision.capture_pin(bounds)
-            except (OSError, ValueError):
-                self._click_debug("[Kafra] Clique de senha adiado. A captura da janela falhou.")
-                return None
-            current_rect = vision.pin_window_rect(screen)
-            if current_rect is None:
-                self._click_debug("[Kafra] Clique de senha adiado. A janela mudou de posição ou sumiu.")
-                return None
-            x, y, width, height = current_rect
-            panel = screen[y:y + height, x:x + width]
-            if vision.pin_field_count(panel) != field_count:
-                self._click_debug("[Kafra] Clique de senha adiado. O campo Senha mudou.")
-                return None
-            if not after_hover:
-                highlighted, _ = vision.pin_highlight(colors[y:y + height, x:x + width])
-                if vision.pin_grid_changed(panel, glyphs, highlighted):
-                    cycle["pin_layout_changed"] = True
-                    self._click_debug("[Kafra] Clique de senha adiado. A grade mudou antes do toque.")
+            if _lead <= 0.05:
+                field = cycle["vision"].pin_progress(seq["viewport"], seq["rect"], with_ink=True)
+                if field != press["field_state"]:
+                    log_click_file("[PIN Debug] Pressão cancelada: a janela ou o campo mudou após o agendamento.")
                     return None
-            target = (bounds[0] + x + px, bounds[1] + y + py)
-            if after_hover and not touch_hover:
                 cursor = wintypes.POINT()
-                if (not u32.GetCursorPos(ctypes.byref(cursor))
-                        or max(abs(cursor.x - target[0]), abs(cursor.y - target[1])) > 6):
-                    self._click_debug("[Kafra] Clique de senha adiado. O cursor não chegou ao botão.")
-                    return None
-                if not probe and u32.GetAsyncKeyState(0x01) & 0x8000:
-                    self._click_debug("[Kafra] Clique de senha adiado. Aguardando a soltura após posicionar.")
+                actual = (cursor.x, cursor.y) if u32.GetCursorPos(ctypes.byref(cursor)) else None
+                if actual is None or math.dist(actual, target) > 3:
+                    log_click_file(f"[PIN Debug] Pressão cancelada: cursor={actual}, centro={target}. {focus}")
                     return None
                 if debug:
-                    cycle["pin_debug_aim"] = target
+                    log_click_file(f"[PIN Debug] Antes da pressão: centro={target}, cursor={actual}. {focus}")
+                if press["kind"] == "digit":
+                    vision = cycle["vision"]
+                    try:
+                        _, colors = vision.capture_pin((vx + x, vy + y, 106, 140))
+                        highlight, _ = vision.pin_highlight(colors)
+                    except (OSError, ValueError):
+                        highlight = None
+                    if debug:
+                        log_click_file(f"[PIN Debug] Realce no painel: tecla esperada={point}, visto={highlight}.")
+                    if highlight is None or math.dist(highlight, point) > 10:
+                        log_click_file("[PIN Debug] Pressão cancelada: o realce da tecla esperada não foi confirmado.")
+                        return None
             return target
 
-        completion = Future()
-        if method != "postmsg":
-            if not self._dispatch_pin_click(cycle, aim, completion, direct_touch=method == "direto"):
-                return None
-        elif not self._schedule_game_click(sx, sy, hwnd, target_point=aim, completion=completion):
+        if not self._position_render_window(None):
             return None
-        if debug:
-            def report_click(result):
-                _, sent = result.result()
-                status = "enviado" if sent else "não enviado"
-                target = cycle.get("pin_debug_aim", (sx, sy))
-                label = {"direto": "por toque direto", "mouse": "por SendInput com o cursor parado",
-                         "postmsg": "pelo toque com PostMessageW"}[method]
-                log_click_file(f"[PIN Debug] Clique {status} {label}. Alvo {target} (tela).")
+        self._pin_render_suspended = True
+        completion = Future()
+        def restore_render(_result):
+            self._pin_render_suspended = False
 
-            completion.add_done_callback(report_click)
-        return completion
+        completion.add_done_callback(restore_render)
 
-    def _dispatch_pin_click(self, cycle, aim, completion, *, direct_touch):
-        if self._automation_click_active():
-            return False
-
-        def click():
-            down = INPUT(type=INPUT_MOUSE)
-            down.mi.dwFlags = MOUSEEVENTF_LEFTDOWN
-            up = INPUT(type=INPUT_MOUSE)
-            up.mi.dwFlags = MOUSEEVENTF_LEFTUP
-            size = ctypes.sizeof(INPUT)
-            pressed = released = False
+        def click_at(aimed_point):
+            if not self._prepare_pin_click(aimed_point, aim, press):
+                return False
+            win32_input.begin_bot_click()
             try:
-                ensure_input_desktop()
-                target = aim(0.075 if direct_touch else 0.022)
-                if (target is None or not self._game_is_foreground()
-                        or u32.GetAsyncKeyState(0x01) & 0x8000):
-                    return
-                if direct_touch:
-                    released = self._tap_pin_control(cycle, target, aim)
-                    return
-                ctypes.set_last_error(0)
-                pressed = bool(u32.SendInput(1, ctypes.byref(down), size))
-                if pressed:
-                    time.sleep(0.04)
-                else:
-                    log_click_file(f"[PIN Debug] SendInput recusou o pressionar (erro {ctypes.get_last_error()}).")
+                pressed_at, failed, error = win32_input.click_window_mouse(
+                    hwnd, aimed_point,
+                    ready=lambda: aim(0.022) == aimed_point and not self._mouse_buttons_down(),
+                )
             finally:
-                if pressed:
-                    released = bool(u32.SendInput(1, ctypes.byref(up), size))
-                    if not released:
-                        cycle["pin_release_pending"] = True
-                    self._last_click_ts = self.last_bot_click_ts = time.perf_counter()
-                completion.set_result((time.monotonic(), released if direct_touch else pressed and released))
-                self._click_in_progress = False
+                win32_input.finish_bot_click()
+            if error == 5:
+                self._log_pin_uipi(cycle)
+            elif failed:
+                log_click_file(f"[PIN Debug] {PIN_CLICK_METHOD} falhou em {failed}: erro={error}.")
+            if pressed_at is not None:
+                press["pressed_at"] = pressed_at
+                seq["automatic_press"] = press
+                if press["kind"] == "ok":
+                    cycle["pin_ok_sent_at"] = pressed_at
+            return failed is None
 
-        self._click_in_progress = True
+        scheduled = False
         try:
-            Thread(target=click, daemon=True, name="kafra-pin-click").start()
-        except RuntimeError as exc:
-            self._click_in_progress = False
-            self._click_debug(f"[Kafra] Não foi possível iniciar o clique de senha. {exc}")
-            return False
-        return True
-
-    def _tap_pin_control(self, cycle, target, aim):
-        initialized, error = ensure_touch_injection()
-        if not initialized:
-            log_click_file(f"[PIN Debug] Toque direto indisponível (erro {error}).")
-            return False
-        contact = POINTER_TOUCH_INFO()
-        contact.pointerInfo.pointerType = PT_TOUCH
-        contact.pointerInfo.pointerId = 0
-        contact.pointerInfo.ptPixelLocation = wintypes.POINT(*target)
-        in_range, in_contact, down, update, up = 0x02, 0x04, 0x10000, 0x20000, 0x40000
-
-        def send_frame(flags):
-            contact.pointerInfo.pointerFlags = flags
-            ctypes.set_last_error(0)
-            accepted = bool(u32.InjectTouchInput(1, ctypes.byref(contact)))
-            return accepted, ctypes.get_last_error()
-
-        hovered, hover_error = send_frame(in_range | update)
-        if not hovered:
-            log_click_file(f"[PIN Debug] Posicionamento por toque recusado em {target} (erro {hover_error}).")
-            return False
-        pressed = updated = released = False
-        down_error = update_error = up_error = 0
-        try:
-            time.sleep(0.09)
-            confirmed_target = aim(0.022, touch_hover=True)
-            if confirmed_target is None:
-                return False
-            if confirmed_target != target:
-                log_click_file(f"[PIN Debug] Janela moveu o alvo de {target} para {confirmed_target} antes do toque.")
-                return False
-            if not self._game_is_foreground() or u32.GetAsyncKeyState(0x01) & 0x8000:
-                log_click_file("[PIN Debug] Toque adiado após posicionar. Foco perdido ou botão esquerdo pressionado.")
-                return False
-            pressed, down_error = send_frame(in_range | in_contact | down)
-            if pressed:
-                time.sleep(0.03)
-                updated, update_error = send_frame(in_range | in_contact | update)
-                time.sleep(0.03)
+            scheduled = self._schedule_game_click(
+                *target, hwnd, target_point=aim, completion=completion,
+                allow_offsets=False, trace_touch=debug,
+                click_action=click_at,
+            )
+            return completion if scheduled else None
         finally:
-            if pressed:
-                released, up_error = send_frame(up)
-                self._last_click_ts = self.last_bot_click_ts = time.perf_counter()
-                if not released:
-                    cycle["pin_touch_release_pending"] = target
-            else:
-                send_frame(update)
-            if self.filters_config["kafra_pin_debug"] or not (pressed and released):
-                log_click_file(f"[PIN Debug] Toque no mesmo ponto {target}. "
-                               f"Pressionar={int(pressed)} ({down_error}), manter={int(updated)} ({update_error}), "
-                               f"soltar={int(released)} ({up_error}).")
-        return pressed and released
-
-    def _release_pending_pin_touch(self, cycle):
-        point = cycle.get("pin_touch_release_pending")
-        if point is None:
-            return True
-        ensure_input_desktop()
-        release = POINTER_TOUCH_INFO()
-        release.pointerInfo.pointerType = PT_TOUCH
-        release.pointerInfo.pointerId = 0
-        release.pointerInfo.pointerFlags = 0x00040000  # POINTER_FLAG_UP
-        release.pointerInfo.ptPixelLocation = wintypes.POINT(*point)
-        ctypes.set_last_error(0)
-        if not u32.InjectTouchInput(1, ctypes.byref(release)):
-            self._click_debug(f"[Kafra] Aguardando a soltura do toque direto (erro {ctypes.get_last_error()}).")
-            return False
-        cycle.pop("pin_touch_release_pending")
-        return True
+            if not scheduled:
+                self._pin_render_suspended = False
 
     def _step_kafra_pin(self, cycle, snapshot, hwnd, vision, screen, colors, rect, pin, now):
-        max_digit_attempts = 6
-        max_cycle_attempts = 5
-        click_confirm_delay = 0.55
-        reset_confirm_delay = 0.50
-        ok_confirm_delay = 2.0
-
         if not re.fullmatch(r"[0-9]+", pin):
             if not cycle.get("pin_missing_logged"):
                 cycle["pin_missing_logged"] = True
-                print("[Kafra] Janela de senha aberta. Configure uma senha numérica no HUD.", flush=True)
-            cycle.pop("pin_seq", None)
-            cycle.pop("pin_attempts", None)
+                print("[Kafra] Configure uma senha numérica no HUD.", flush=True)
             cycle["next"] = now + 1.0
             return
 
         cycle["next"] = now + 0.08
+        debug = cycle.get("pin_test") or self.filters_config["kafra_pin_debug"]
         x, y, width, height = rect
         vx, vy, _, _ = snapshot.viewport
-        neutral = (vx + x + width - 10, vy + y + height // 2)
-        if (park_after := cycle.get("pin_park_after")) is not None:
-            if now < park_after or u32.GetAsyncKeyState(0x01) & 0x8000:
-                cycle["next"] = max(cycle["next"], park_after)
-                return
-            cycle.pop("pin_park_after")
-            if not cycle.get("pin_move_unavailable"):
-                if self._move_pin_cursor_released(hwnd, *neutral):
-                    cycle["pin_check_layout"] = True
-                    cycle["pin_pointer_ready_at"] = time.monotonic() + 0.08
-                    cycle["next"] = cycle["pin_pointer_ready_at"]
-                    return
-                cycle["pin_move_unavailable"] = True
-                log_click_file("[Kafra] O cursor não pôde ser afastado sem pressionar. Mantendo o mapa da rodada.")
-        panel = screen[y:y + height, x:x + width]
-        field_count = vision.pin_field_count(panel)
-        highlighted, reset_point = vision.pin_highlight(colors[y:y + height, x:x + width])
+        neutral = vx + x + width - 10, vy + y + height // 2
         seq = cycle.get("pin_seq")
-
-        def retry_with_other_click():
-            next_method = {"direto": "postmsg", "postmsg": "mouse", "mouse": "direto"}
-            cycle["pin_click_method"] = next_method[cycle.get("pin_click_method", "direto")]
-
-        def restart_sequence(reason, *, count_attempt=True):
-            cycle.pop("pin_seq", None)
-            cycle.pop("pin_debug_aim", None)
-            if not count_attempt:
-                return
-            attempts = cycle.get("pin_attempts", 0) + 1
-            if attempts >= max_cycle_attempts:
-                raise ValueError(
-                    f"falha na janela de senha após {max_cycle_attempts} ciclos ({reason})."
-                )
-            cycle["pin_attempts"] = attempts
-            print(
-                f"[Kafra] {reason}; relendo grade e reiniciando senha "
-                f"(ciclo {attempts + 1}/{max_cycle_attempts}).",
-                flush=True,
-            )
-
-        rect_moved = (
-            seq is not None
-            and (abs(seq["rect"][0] - rect[0]) > 2 or abs(seq["rect"][1] - rect[1]) > 2
-                 or seq["rect"][2:] != rect[2:])
-        )
-        layout_changed = cycle.pop("pin_layout_changed", False)
-        if seq and cycle.pop("pin_check_layout", False):
-            cursor = wintypes.POINT()
-            if u32.GetCursorPos(ctypes.byref(cursor)) and cursor.x - vx - x >= 106:
-                layout_changed |= vision.pin_grid_changed(panel, seq["glyphs"], highlighted)
-        if seq and rect_moved:
-            # A posição da janela mudou. O mapa da rodada é relativo ao próprio painel.
-            layout_changed |= vision.pin_grid_changed(panel, seq["glyphs"], highlighted)
-            seq["rect"] = rect
-        if seq and (seq["pin"] != pin or layout_changed):
-            if seq["pin"] != pin:
-                restart_sequence("senha alterada", count_attempt=False)
-            else:
-                restart_sequence("grade numérica reembaralhada")
-            seq = None
-
+        if seq is not None and seq["pin"] != pin:
+            cycle.pop("pin_seq")
+            cycle.pop("pin_rescan", None)
+            return
         if seq is None:
-            controls = vision.pin_controls(panel, highlighted)
-            if controls is None:
-                self._click_debug("[Kafra] Aguardando o mapa completo dos dígitos e o botão OK.")
-                cursor = wintypes.POINT()
-                if (cycle.get("pin_read_park_rect") != rect and u32.GetCursorPos(ctypes.byref(cursor))
-                        and 0 <= cursor.x - vx - x < 106 and 18 <= cursor.y - vy - y < 140):
+            panel = screen[y:y + height, x:x + width]
+            field_count = vision.pin_field_count(panel)
+            highlighted, reset = vision.pin_highlight(colors[y:y + height, x:x + width])
+            needed = set(pin)
+            buttons, ok, _ = vision.pin_controls(panel, highlighted, partial=True)
+            needs_reset = field_count and cycle.get("pin_rescan") is None
+            reset_point = vision.pin_reset_point(panel, reset) if field_count else None
+            if len(buttons) != 10 or not needed <= buttons.keys() or ok is None or (needs_reset and reset_point is None):
+                cycle.pop("pin_grid_candidate", None)
+                self._click_debug(f"[PIN Debug] Grade incompleta: {len(buttons)}/10 teclas, "
+                                  f"{len(needed & buttons.keys())}/{len(needed)} necessárias, "
+                                  f"OK={ok is not None}, campo={field_count}.")
+                if cycle.get("pin_read_park_rect") != rect and self._move_pin_cursor_released(hwnd, *neutral):
                     cycle["pin_read_park_rect"] = rect
-                    cycle["pin_park_after"] = now + 0.09
-                cycle["next"] = now + 0.5
+                cycle["next"] = now + 0.30
                 return
-            buttons, ok, glyphs = controls
+            candidate = (snapshot.viewport, rect, buttons, ok, reset_point, field_count)
+            last_candidate, last_read_at = cycle.get("pin_grid_candidate", (None, 0.0))
+            read_at = time.monotonic()
+            if last_candidate != candidate or read_at - last_read_at > 2.0:
+                cycle["pin_grid_candidate"] = candidate, read_at
+                if debug:
+                    self._click_debug("[PIN Debug] Grade completa; aguardando uma segunda leitura igual.")
+                cycle["next"] = read_at + 0.18
+                return
+            cycle.pop("pin_grid_candidate", None)
             cycle.pop("pin_read_park_rect", None)
-            seq = {"rect": rect, "pin": pin, "glyphs": glyphs, "buttons": buttons,
-                   "ok": ok, "step": 0, "field_count": field_count,
-                   "digit_attempts": 0}
+            seq = {"rect": rect, "viewport": snapshot.viewport, "pin": pin, "buttons": buttons,
+                   "ok": ok, "reset": reset_point, "step": 0, "field_count": field_count, "attempt": 0}
+            previous = cycle.pop("pin_rescan", None)
+            if previous and previous["pin"] == pin:
+                if field_count == previous["field_count"] + 1 and previous["step"] < len(pin):
+                    after = vision.pin_progress(snapshot.viewport, rect, with_ink=True)
+                    if (not self._pin_auto_digit_matches(previous, field_count, now)
+                            or after is None or after[0] != field_count
+                            or after[1] <= previous["automatic_press"]["field_state"][1]):
+                        log_click_file("[PIN] Avanço incerto na releitura. Voltando à leitura inicial do campo.")
+                        return
+                    seq["step"] = previous["step"] + 1
+                    log_click_file(f"[PIN] Resposta tardia do clique automático confirmada em {seq['step']}/{len(pin)}.")
+                elif field_count == previous["field_count"]:
+                    seq["step"] = previous["step"]
+                    seq["attempt"] = previous["attempt"]
+                    if previous.get("automatic_press"):
+                        seq["automatic_press"] = previous["automatic_press"]
+                        seq["physical_click_at"] = previous.get("physical_click_at", 0.0)
+                        if seq["automatic_press"].get("pressed_at") is not None:
+                            seq["attempt"] = max(1, seq["attempt"])
+                elif field_count:
+                    log_click_file("[PIN] Contagem inesperada na releitura. Voltando à leitura inicial do campo.")
+                    return
             cycle["pin_seq"] = seq
+            if debug:
+                log_click_file(f"[PIN Debug] Grade estável em duas leituras: 10/10 teclas, "
+                               f"{len(needed)} necessárias, campo={field_count}.")
 
         if pending := seq.get("pending"):
-            kind, completion = pending
+            press, completion = pending
             if not completion.done():
                 return
             finished_at, sent = completion.result()
-            if kind == "digit":
-                if field_count == seq["field_count"] + 1:
-                    seq.pop("pending")
-                    seq["step"] += 1
-                    seq["field_count"] = field_count
-                    seq["digit_attempts"] = 0
-                    cycle["pin_park_after"] = finished_at + 0.09
-                    if self.filters_config["kafra_pin_debug"]:
-                        log_click_file(f"[PIN Debug] Campo Senha avançou para {seq['step']}/{len(pin)}.")
-                    return
-                elif field_count == 0 and seq["field_count"] > 0:
-                    restart_sequence("campo Senha zerado")
-                    return
-                elif field_count != seq["field_count"]:
-                    restart_sequence("alteração inesperada no campo Senha")
-                    return
-                else:
-                    wait_until = finished_at + (click_confirm_delay if sent else 0.12)
-                    if now < wait_until:
-                        return
-                    seq.pop("pending")
-                    retry_with_other_click()
-                    seq["digit_attempts"] = seq.get("digit_attempts", 0) + 1
-                    if seq["digit_attempts"] >= max_digit_attempts:
-                        refreshed = vision.pin_controls(panel, highlighted)
-                        if refreshed and any(math.dist(center, seq["buttons"][digit]) > 3
-                                             for digit, center in refreshed[0].items()):
-                            restart_sequence("grade numérica reembaralhada")
-                            return
-                        seq["waiting_for_reset"] = True
-                        log_click_file(f"[Kafra] Campo Senha não avançou na posição {seq['step'] + 1}. "
-                                       "Mantendo o campo preenchido e aguardando um reset da grade.")
-                        return
-                    cycle["next"] = now + 0.22
-                    return
-            elif kind == "reset":
-                if field_count == 0:
-                    restart_sequence("campo limpo", count_attempt=False)
-                    cycle["pin_park_after"] = finished_at + 0.09
-                    if self.filters_config["kafra_pin_debug"]:
-                        log_click_file("[PIN Debug] Resetar confirmado. Campo Senha vazio.")
-                    return
-                elif not sent or now >= finished_at + reset_confirm_delay:
-                    if seq.get("retried_control") == kind:
-                        restart_sequence("botão Reset não zerou o campo Senha")
-                    else:
-                        seq.pop("pending")
-                        seq["retried_control"] = kind
-                        retry_with_other_click()
-                    return
-                else:
-                    return
-            else:
-                if field_count == 0 and seq["field_count"] > 0:
-                    restart_sequence("campo Senha zerado após confirmação")
-                    return
-                if not sent or now >= finished_at + ok_confirm_delay:
-                    if seq.get("retried_control") == kind:
-                        restart_sequence("janela de senha não fechou após clicar em OK")
-                    else:
-                        seq.pop("pending")
-                        seq["retried_control"] = kind
-                        retry_with_other_click()
-                    return
+            if now < finished_at + 0.15:
+                cycle["next"] = finished_at + 0.15
                 return
-
-        if seq.get("waiting_for_reset"):
-            if field_count == 0 and seq["field_count"] > 0:
-                restart_sequence("campo Senha zerado")
-            elif vision.pin_grid_changed(panel, seq["glyphs"], highlighted):
-                restart_sequence("grade numérica reembaralhada")
+            after = vision.pin_progress(snapshot.viewport, rect, with_ink=True)
+            field_count, ink = after if after is not None else (None, None)
+            kind, method, before = press["kind"], press["method"], press["field_state"]
+            expected = before[0] + 1 if kind == "digit" else 0 if kind == "reset" else None
+            pressed = press.get("pressed_at") is not None
+            confirmed_press = (seq["automatic_press"] if self._pin_auto_digit_matches(seq, field_count, now)
+                               else None)
+            if confirmed_press is not None:
+                previous_read = confirmed_press.get("field_confirmation")
+                if ink <= confirmed_press["field_state"][1] or previous_read != after:
+                    if now - finished_at >= 1.5:
+                        cycle["pin_rescan"] = seq
+                        cycle.pop("pin_seq")
+                        return
+                    confirmed_press["field_confirmation"] = after
+                    cycle["next"] = now + 0.15
+                    return
+            elif automatic_press := seq.get("automatic_press"):
+                automatic_press.pop("field_confirmation", None)
+            wait_limit = 3.0 if kind == "ok" else 1.5
+            if (pressed and now - finished_at < wait_limit
+                    and (field_count == before[0] or (kind == "ok" and after is None))):
+                cycle["next"] = now + 0.15
+                return
+            _, focus = self._pin_window_focus(hwnd)
+            if after is None:
+                reason = "painel saiu da posição lida ou fechou"
+            elif field_count == expected:
+                reason = ("campo confirmou a ação" if pressed or confirmed_press is not None
+                          else "campo mudou sem pressão confirmada")
+            elif field_count == before[0]:
+                reason = "pressão não confirmada e campo sem avanço"
+                if pressed:
+                    reason = ("cliente não confirmou a abertura do armazém" if kind == "ok"
+                              else "cliente não confirmou mudança no campo")
+                if ink != before[1]:
+                    reason += "; pixels do campo variaram"
             else:
-                cycle["next"] = now + 0.35
+                reason = "contagem inesperada no campo"
+            log_click_file(f"[PIN Debug] {kind} posição={seq['step'] + 1}, tentativa={seq['attempt'] + 1}, "
+                           f"via={method}, enviado={sent}, campo antes={before[0]}, depois={field_count}, "
+                           f"esperado={expected}, pixels escuros={before[1]}→{ink}. {reason}. {focus}")
+            seq.pop("pending")
+            if (press.get("positioning_failed") and not pressed and field_count == before[0]
+                    and not seq.get("positioning_retried")):
+                seq["positioning_retried"] = True
+                log_click_file("[PIN Debug] Retentativa de posicionamento antes de qualquer LEFTDOWN.")
+                cycle["next"] = now + 0.18
+                return
+            if field_count is None:
+                seq["attempt"] += 1
+                cycle["pin_rescan"] = seq
+                cycle.pop("pin_seq")
+                return
+            if kind == "digit" and field_count == expected:
+                if confirmed_press is None:
+                    cycle["pin_rescan"] = seq
+                    cycle.pop("pin_seq")
+                    return
+                seq.pop("automatic_press", None)
+                seq.pop("physical_click_at", None)
+                seq["step"] += 1
+                seq["field_count"] = field_count
+                seq["attempt"] = 0
+                seq.pop("positioning_retried", None)
+                return
+            if kind == "reset" and field_count == 0:
+                cycle.pop("pin_seq")
+                return
+            if field_count != seq["field_count"]:
+                cycle["pin_rescan"] = seq
+                cycle.pop("pin_seq")
+                return
+            seq["attempt"] += 1
+            cycle["pin_rescan"] = seq
+            cycle.pop("pin_seq")
+            cycle["next"] = now + 0.25
             return
 
-        if field_count != seq["field_count"]:
-            reason = "campo Senha zerado" if field_count == 0 else "alteração inesperada no campo Senha"
-            restart_sequence(reason)
-            return
-        if seq["step"] == 0 and field_count:
-            point = vision.pin_reset_point(panel, reset_point)
+        if seq["step"] == 0 and seq["field_count"]:
+            kind, point = "reset", seq["reset"]
             if point is None:
-                self._click_debug("[Kafra] Aguardando reconhecimento de Resetar para limpar o campo Senha.")
-                cycle["next"] = now + 0.22
+                cycle.pop("pin_seq")
+                cycle["next"] = now + 0.30
                 return
-            kind = "reset"
         elif seq["step"] < len(pin):
             kind, point = "digit", seq["buttons"][pin[seq["step"]]]
         else:
             kind, point = "ok", seq["ok"]
 
-        if completion := self._kafra_pin_click(
-            cycle, snapshot, hwnd, vision, rect, seq["glyphs"], field_count, point,
-        ):
-            seq["pending"] = (kind, completion)
-            if kind == "ok":
-                cycle["pin_ok_sent_at"] = now
-
+        before = vision.pin_progress(snapshot.viewport, rect, with_ink=True)
+        if before is None:
+            cycle["pin_rescan"] = seq
+            cycle.pop("pin_seq")
+            self._click_debug("[PIN Debug] Clique adiado: painel não localizado antes da tentativa.")
+            return
+        if before[0] != seq["field_count"]:
+            if self._pin_auto_digit_matches(seq, before[0], now):
+                original_field = seq["automatic_press"]["field_state"]
+                if before[1] <= original_field[1] or seq.get("late_field") != before:
+                    seq["late_field"] = before
+                    cycle["next"] = now + 0.15
+                    return
+                seq.pop("late_field", None)
+                seq["step"] += 1
+                seq["field_count"] = before[0]
+                seq["attempt"] = 0
+                seq.pop("automatic_press", None)
+                seq.pop("physical_click_at", None)
+                log_click_file(f"[PIN] Resposta tardia do clique automático confirmada em {seq['step']}/{len(pin)}.")
+                return
+            cycle["pin_rescan"] = seq
+            cycle.pop("pin_seq")
+            return
+        method = PIN_CLICK_METHOD
+        press = {"kind": kind, "step": seq["step"], "before": before[0], "field_state": before, "method": method}
+        completion = self._kafra_pin_click(cycle, snapshot, hwnd, seq, point, press)
+        if completion is not None:
+            seq["pending"] = press, completion
+            _, focus = self._pin_window_focus(hwnd)
+            log_click_file(f"[PIN Debug] Agendado {kind}, posição={seq['step'] + 1}, "
+                           f"tentativa={seq['attempt'] + 1}, via={method}, "
+                           f"campo antes={before[0]}, centro={point}. {focus}")
 
     def _open_kafra_storage(self, snapshot, hwnd, now, phase, dialog, world, px, py):
         cycle = self._kafra_cycle
-        if cycle.get("pin_touch_release_pending"):
-            self._release_pending_pin_touch(cycle)
-            cycle["next"] = now + 0.18
-            return
-        if cycle.get("pin_release_pending"):
-            ensure_input_desktop()
-            release = INPUT(type=INPUT_MOUSE)
-            release.mi.dwFlags = MOUSEEVENTF_LEFTUP
-            if u32.SendInput(1, ctypes.byref(release), ctypes.sizeof(INPUT)):
-                cycle.pop("pin_release_pending")
-            else:
-                self._click_debug("[Kafra] Aguardando a soltura do clique de senha.")
-            cycle["next"] = now + 0.18
-            return
         if dialog["storage_open"]:
+            if cycle.get("pin_ok_sent_at") is not None:
+                log_click_file("[PIN] OK confirmado pela abertura do armazém no feed.")
             self._pin_dialog_screen_rect = None
             self._pin_hud_suppress_until = 0.0
             self._pin_overlay_visible_cache = False
@@ -6599,14 +6476,23 @@ class Overlay:
             cycle.pop("pin_ok_sent_at", None)
             cycle.pop("pin_seen_at", None)
             cycle.pop("pin_seq", None)
+            cycle.pop("pin_rescan", None)
+            cycle.pop("pin_grid_candidate", None)
             print("[Kafra] Armazém aberto. Iniciando depósito.", flush=True)
             cycle.update(phase="store", deadline=now + 180, next=now + 0.25)
             return
 
         if phase == "opening":
             vision = cycle["vision"]
-            screen, colors = vision.capture_pin(snapshot.viewport)
-            if pin_rect := vision.pin_window_rect(screen):
+            try:
+                pin_rect, screen, colors = self._pin_frame_for_input(cycle, snapshot.viewport)
+            except OSError as exc:
+                if "pin_seen_at" not in cycle:
+                    raise
+                self._click_debug(f"[PIN Debug] Captura indisponível. Nova leitura agendada. {exc}")
+                cycle["next"] = now + 0.35
+                return
+            if pin_rect:
                 rx, ry, rw, rh = pin_rect
                 vx, vy, _, _ = snapshot.viewport
                 self._pin_dialog_screen_rect = (vx + rx - 12, vy + ry - 12, vx + rx + rw + 12, vy + ry + rh + 12)
@@ -6621,22 +6507,24 @@ class Overlay:
                        for action in (cycle.get("menu_action"), cycle.get("next_key"))):
                     return
                 pin = str(self.filters_config.get("kafra_pin") or self.filters_config.get("kafra_storage_pin") or "")
-                self._step_kafra_pin(cycle, snapshot, hwnd, vision, screen, colors, pin_rect, pin, now)
+                try:
+                    self._step_kafra_pin(cycle, snapshot, hwnd, vision, screen, colors, pin_rect, pin, now)
+                except OSError as exc:
+                    self._click_debug(f"[PIN Debug] Captura indisponível. Nova leitura agendada. {exc}")
+                    cycle["next"] = now + 0.35
                 return
             cycle.pop("pin_debug_rect", None)
             cycle.pop("pin_debug_aim", None)
             if "pin_seen_at" in cycle:
+                if (ok_at := cycle.get("pin_ok_sent_at")) is not None:
+                    if now - ok_at < 5.0:
+                        cycle["next"] = now + 0.1
+                        return
+                    raise ValueError("a janela fechou após o OK e o feed não confirmou a abertura do armazém.")
                 if now - cycle["pin_seen_at"] < 0.35:
                     cycle["next"] = now + 0.08
                     return
-                cycle.pop("pin_seen_at")
-                cycle.pop("pin_seq", None)
-                self._pin_dialog_screen_rect = None
-                self._pin_hud_suppress_until = 0.0
-                self._pin_overlay_visible_cache = False
-            if (ok_at := cycle.get("pin_ok_sent_at")) and now - ok_at < 2.5:
-                cycle["next"] = now + 0.1
-                return
+                raise ValueError("a janela Digite a Senha foi fechada.")
 
         if self._is_pin_entry_active():
             cycle["next"] = now + 0.1
@@ -6780,24 +6668,38 @@ class Overlay:
     def _kafra_hover(self, snapshot, hwnd, point):
         x, y = self._kafra_screen_point(snapshot, hwnd, point)
         ensure_input_desktop()
-        self._smooth_move_to(x, y)
-        cursor = wintypes.POINT()
-        if not u32.GetCursorPos(ctypes.byref(cursor)) or max(abs(cursor.x - x), abs(cursor.y - y)) > 4:
-            raise ValueError("cursor não alcançou o slot indicado.")
+        if self._automation_click_active() or self._mouse_buttons_down():
+            raise ValueError("clique anterior ainda em andamento.")
+        if self._move_cursor_released(x, y):
+            cursor = wintypes.POINT()
+            if (u32.GetCursorPos(ctypes.byref(cursor))
+                    and max(abs(cursor.x - x), abs(cursor.y - y)) <= 4):
+                return
+            if not self._mouse_buttons_down() and self._position_cursor(x, y):
+                return
+        raise ValueError("cursor não alcançou o slot indicado.")
 
     def _kafra_alt_right(self, snapshot, hwnd, point):
         x, y = self._kafra_screen_point(snapshot, hwnd, point)
         cursor = wintypes.POINT()
         if not u32.GetCursorPos(ctypes.byref(cursor)) or max(abs(cursor.x - x), abs(cursor.y - y)) > 4:
             raise ValueError("cursor saiu do slot antes da transferência.")
-        self._kafra_alt_input()
+        win32_input.begin_bot_click()
+        try:
+            self._kafra_alt_input(hwnd, point=(x, y))
+        finally:
+            win32_input.finish_bot_click()
 
-    def _kafra_alt_input(self, key=None):
-        if not self._game_input_ready(self.get_game_hwnd()):
+    def _kafra_alt_input(self, hwnd, key=None, *, point=None, window_message=False):
+        if not self._game_input_ready(hwnd) or not self._is_game_focused():
             raise ValueError("janela do jogo indisponível para interação com a Kafra.")
         alt = u32.MapVirtualKeyW(0x12, 0)  # VK_MENU
         if not alt or any(u32.GetAsyncKeyState(vk) & 0x8000 for vk in (1, 2, 0x10, 0x11, 0x12)):
             raise ValueError("tecla modificadora ou botão do mouse já pressionado.")
+        if window_message:
+            if win32_input.send_window_alt_action(hwnd, key=key, point=point):
+                return
+            raise ValueError("falha ao enviar o comando com Alt à janela do jogo.")
         events = (INPUT * 4)()
         events[0].type = events[3].type = INPUT_KEYBOARD
         events[0].ki.wScan = events[3].ki.wScan = alt
@@ -6815,6 +6717,10 @@ class Overlay:
         size = ctypes.sizeof(INPUT)
         release = (INPUT * 2)(events[2], events[3])
         sent = u32.SendInput(2, events, size)
+        if not sent:
+            if win32_input.send_window_alt_action(hwnd, key=key, point=point):
+                return
+            raise ValueError("falha ao enviar o comando com Alt por SendInput e pela janela do jogo.")
         released = 0
         try:
             if sent:
@@ -6827,7 +6733,7 @@ class Overlay:
         if sent != 2 or released != 2:
             raise ValueError("falha ao enviar o comando com Alt.")
 
-    def _store_kafra_items(self, snapshot, hwnd, now, inventory, storage):
+    def _store_kafra_items(self, snapshot, hwnd, now, inventory, storage, *, inventory_ready):
         cycle = self._kafra_cycle
         vision = cycle["vision"]
         if pending := cycle["pending"]:
@@ -6842,12 +6748,38 @@ class Overlay:
             print(f"[Kafra] Depósito confirmado para item #{item[0]} (quantidade {item[1]}).", flush=True)
         screen = vision.capture(snapshot.viewport)
         grid = vision.inventory_grid(screen)
+        cycle["inventory_visible"] = grid is not None
+        if opening := cycle.get("inventory_open_action"):
+            if not opening.done():
+                return
+            cycle.pop("inventory_open_action")
+            if (sent_at := opening.result()) is not None:
+                cycle["inventory_open_until"] = sent_at + 2.0
+            else:
+                cycle["inventory_open_until"] = now + 1.3
         if grid is None:
-            if cycle["opened_inventory"]:
-                raise ValueError("cabeçalho ou bordas do Inventário não localizados.")
-            self._kafra_alt_input(ord("E"))
-            cycle.update(opened_inventory=True, next=now + 0.6)
+            if now < cycle.get("inventory_open_until", 0.0):
+                cycle["next"] = now + 0.15
+                return
+            attempts = cycle.get("inventory_open_attempts", 0)
+            if attempts >= 2:
+                raise ValueError("Inventário não localizado após duas tentativas de Alt+E pelo OSK.")
+            opening = Future()
+            if self._send_game_key(ord("E"), osk_alt=True, completion=opening,
+                                   allowed=lambda: (
+                                       self._kafra_cycle is cycle and self.feed.world.storage_open
+                                       and not cycle["inventory_visible"]
+                                   )):
+                cycle.update(inventory_open_action=opening, inventory_open_attempts=attempts + 1)
+                print("[Kafra] Abrindo Inventário com Alt+E via OSK.", flush=True)
+            cycle["next"] = now + 0.15
             return
+        if not inventory_ready:
+            if now >= cycle.setdefault("inventory_sync_until", now + 5.0):
+                raise ValueError("Inventário aberto, mas a lista TCP completa não chegou. Reconecte com a captura ativa para transferir automaticamente.")
+            cycle["next"] = now + 0.2
+            return
+        cycle.pop("inventory_sync_until", None)
         x, y, right, bottom, columns, rows = grid
         if cycle["tab"] is None:
             if not cycle["tabs"]:
@@ -7029,18 +6961,26 @@ class Overlay:
 
     def _kafra_drag_item(self, snapshot, hwnd, source, target):
         self._kafra_hover(snapshot, hwnd, source)
-        self._kafra_screen_point(snapshot, hwnd, target)
+        target_point = self._kafra_screen_point(snapshot, hwnd, target)
         if any(u32.GetAsyncKeyState(key) & 0x8000 for key in (1, 2, 0x10, 0x11, 0x12)):
             raise ValueError("tecla modificadora ou botão do mouse já pressionado.")
         press, release = INPUT(type=INPUT_MOUSE), INPUT(type=INPUT_MOUSE)
         press.mi.dwFlags, release.mi.dwFlags = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
         size = ctypes.sizeof(INPUT)
-        if not u32.SendInput(1, ctypes.byref(press), size):
-            raise ValueError("não foi possível iniciar a reposição por arraste.")
+        self._click_in_progress = True
         try:
-            self._kafra_hover(snapshot, hwnd, target)
+            if not u32.SendInput(1, ctypes.byref(press), size):
+                raise ValueError("não foi possível iniciar a reposição por arraste.")
+            try:
+                if not self._position_cursor(*target_point):
+                    raise ValueError("cursor não alcançou o slot de destino.")
+            finally:
+                if not u32.SendInput(1, ctypes.byref(release), size):
+                    time.sleep(0.015)
+                    if not u32.SendInput(1, ctypes.byref(release), size):
+                        raise ValueError("não foi possível soltar o botão após a reposição.")
         finally:
-            u32.SendInput(1, ctypes.byref(release), size)
+            self._click_in_progress = False
 
     def _travel_route_from(self, world, current_map, position, target, excluded=(), locked_kafras=None):
         with world.lock:
@@ -7085,7 +7025,7 @@ class Overlay:
         self._reset_travel_leg(plan)
         if reason:
             print(f"[Viagem] {reason}", flush=True)
-            if not self._kafra_cycle:
+            if not self._kafra_cycle and not self.feed.world.is_map_loading:
                 self._set_hud_running(False)
             return
         target = self.feed.world.map
@@ -7172,12 +7112,16 @@ class Overlay:
         print(self._travel_caption(plan), flush=True)
 
     def _walk_travel_leg(self, snapshot, world, leg, position, target, *, portal=None, npc_gid=None):
+        if world.is_map_loading:
+            return "waiting"
         terrain = getattr(self.feed, "terrain", None)
         # O feed carrega o GAT do mapa atual. A execução não carrega mapas no loop do HUD.
         gat = terrain.cached_gats.get(snapshot.map) if terrain else None
         now = time.monotonic()
+        approach_range = KAFRA_INTERACTION_RANGE if npc_gid is not None else 4.0
         if gat is None:
-            if not portal and not world._is_player_walking() and math.dist(position, target) <= 4.0:
+            if (not portal and "reposition_npc_from" not in leg and not world._is_player_walking()
+                    and math.dist(position, target) <= approach_range):
                 return "approached"
             missing_since = leg.setdefault("missing_gat_since", now)
             if now - missing_since >= 8.0:
@@ -7190,15 +7134,24 @@ class Overlay:
             leg.pop("reposition_npc_from")
             reposition = None
         visited = leg.setdefault("recent_walk_cells", collections.deque(maxlen=12))
+        ready_ts = world.last_map_ready_ts
+        if leg.get("walk_click") and leg["walk_click"][0] < ready_ts:
+            for key in ("walk_click", "path", "path_job", "failed_walk_step", "retry_walk_hover",
+                        "retry_stride_dist", "walk_failures"):
+                leg.pop(key, None)
+            visited.clear()
         if pending := leg.get("walk_click"):
             clicked_at, old_position, cell, point, enter_portal = pending
             if enter_portal:
                 elapsed = now - self._touch_click_finished_at(point, clicked_at)
-                if not self._touch_click_aborted(point, clicked_at) and (walking or elapsed < 2.0):
+                if (not self._touch_click_aborted(point, clicked_at) and not self._visual_walk_failed(point, clicked_at)
+                        and (walking or elapsed < 2.0)):
                     return "waiting"
                 result = "portal_unconfirmed"
             else:
                 result = self._walk_step_result(world, position, old_position, point, clicked_at, now)
+                if result == "stalled" and now - clicked_at < 0.35 and not self._visual_walk_failed(point, clicked_at):
+                    return "waiting"
                 if result == "waiting":
                     can_chain = (
                         walking
@@ -7211,26 +7164,33 @@ class Overlay:
                         return "waiting"
                     result = "moved"
             leg.pop("walk_click", None)
-            leg.pop("retry_walk_hover", None)
             if result == "portal_unconfirmed":
                 leg["portal_failures"] = leg.get("portal_failures", 0) + 1
                 if leg["portal_failures"] >= 4:
                     return result
             elif result == "stalled":
-                # Um clique recusado invalida o ponto na tela, não uma célula do caminho A*.
-                leg["blocked"][cell] = now + 12.0
-                leg["failed_walk_step"] = (cell, point)
                 leg["walk_failures"] = leg.get("walk_failures", 0) + 1
-                if not self._touch_click_aborted(point, clicked_at):
-                    leg["retry_walk_hover"] = True
-                if leg["walk_failures"] >= 2 and leg.get("path"):
+                leg.setdefault("retry_stride_dist", math.dist(old_position, cell))
+                status = "entrada recusada" if self._touch_click_aborted(point, clicked_at) else "sem movimento confirmado"
+                log_click_file(f"[Viagem] Passo {cell}: {status}.")
+                if leg.get("last_walk_hover"):
+                    leg["blocked"][cell] = now + 12.0
+                    leg["failed_walk_step"] = (cell, point)
+                elif not leg.get("failed_walk_step"):
+                    leg["retry_walk_hover"] = cell
+                else:
+                    leg["blocked"][cell] = now + 12.0
+                    leg["failed_walk_step"] = (cell, point)
+                if leg["walk_failures"] >= 3:
                     leg.pop("path", None)
                     leg.pop("path_job", None)
-                    leg.pop("failed_walk_step", None)
                 if leg["walk_failures"] >= 6:
                     return "movement_unconfirmed"
             else:
+                log_click_file(f"[Viagem] Passo {cell}: movimento confirmado em {start}.")
                 leg.pop("failed_walk_step", None)
+                leg.pop("retry_walk_hover", None)
+                leg.pop("retry_stride_dist", None)
                 if start not in visited:
                     leg["walk_failures"] = 0
                     leg["deadline"] = max(leg["deadline"], now + 25.0)
@@ -7253,19 +7213,30 @@ class Overlay:
         project = self.feed.camera.projector(
             snapshot.viewport, getattr(self.feed, "_cam", None) or position, height,
         )
-        resolve = self._safe_click_resolver(snapshot, project, allowed_portal=portal)
+        resolve = self._safe_click_resolver(snapshot, project, allowed_portal=portal, allowed_npc=npc_gid)
         detour = leg.get("detour", False)
         blocked, penalties = self._navigation_obstacles(
-            snapshot.map, gat, portal=portal, npc=npc_gid, block_portals=False)
+            snapshot.map, gat, portal=portal, npc=npc_gid)
+        target_distance = math.dist(position, target)
+        near_kafra = portal is None and target_distance <= 14.0
         failed_points = {cell for cell, until in leg["blocked"].items() if until > now}
         leg["blocked"] = {cell: leg["blocked"][cell] for cell in failed_points}
 
         def ground_point(cell):
             if cell != portal and (cell in failed_points or cell in visited):
                 return None
-            return self._walk_ground_point(gat, position, cell, blocked, resolve)
+            return self._walk_ground_point(gat, position, cell, blocked, resolve, portal=portal)
 
         def recalculate(reason):
+            if near_kafra and reason in ("no_clickable_step", "no_gat_path"):
+                nearby = sorted(self._patrol_cells_in_radius(*start, 4),
+                                key=lambda cell: (math.dist(cell, target), math.dist(cell, start)))
+                for cell in nearby:
+                    if cell != start and math.dist(cell, target) <= target_distance + 1.0:
+                        if point := ground_point(cell):
+                            click(cell, point)
+                            if "walk_click" in leg:
+                                return "waiting"
             origin = leg.get("detour_origin", start)
             if math.dist(origin, start) >= 8.0:
                 leg["detour_attempts"] = 0
@@ -7282,13 +7253,16 @@ class Overlay:
             self._click_debug(f"VIAGEM: Contornando trecho em {start}, rumo a {target}.")
             return "waiting"
 
-        def click(cell, point, enter_portal=False):
-            retry_hover = bool(leg.get("retry_walk_hover") and not world._is_player_walking())
+        def click(cell, point, enter_portal=False, *, retry_hover=False):
             if self._navigation_click(snapshot, gat, cell, point, portal=portal, npc=npc_gid,
+                                      kafra=npc_gid is not None,
                                       retry_key=(snapshot.map, "ground", cell),
                                       hover_reset=retry_hover):
                 leg["walk_click"] = (now, position, cell, point, enter_portal)
                 leg["last_walk_cell"] = cell
+                leg["last_walk_hover"] = retry_hover
+                if enter_portal:
+                    leg["portal_attempts"] = leg.get("portal_attempts", 0) + 1
                 leg.pop("retry_walk_hover", None)
             return "waiting"
 
@@ -7298,16 +7272,14 @@ class Overlay:
         if portal and math.dist(position, portal) <= 3.0:
             if start != portal:
                 attempts = leg.get("portal_attempts", 0)
-                if attempts and attempts % 2:
+                if attempts >= 2 and attempts % 2 == 0:
                     nearby = sorted(self._patrol_cells_in_radius(*portal, 1),
                                     key=lambda cell: (math.dist(position, cell), cell))
                     for cell in nearby:
                         if cell not in (portal, start) and (point := ground_point(cell)):
-                            leg["portal_attempts"] = attempts + 1
                             return click(cell, point, enter_portal=True)
                 if point := ground_point(portal):
-                    leg["portal_attempts"] = attempts + 1
-                    return click(portal, point, enter_portal=True)
+                    return click(portal, point, enter_portal=True, retry_hover=attempts == 1)
             else:
                 neighbors = self._patrol_cells_in_radius(*start, 2)
                 for cell in neighbors:
@@ -7315,8 +7287,20 @@ class Overlay:
                         return click(cell, point)
                 return recalculate("no_clickable_step")
         elif (not portal and reposition is None
-              and math.dist(position, target) <= (6.0 if npc_gid is not None else 4.0)):
+              and math.dist(position, target) <= approach_range):
             return "approached"
+
+        if (retry_cell := leg.get("retry_walk_hover")) is not None:
+            if point := ground_point(retry_cell):
+                return click(retry_cell, point, retry_hover=True)
+            leg.pop("retry_walk_hover", None)
+
+        if reposition is not None:
+            nearby = sorted(self._patrol_cells_in_radius(*start, 3),
+                            key=lambda cell: (math.dist(start, cell), math.dist(cell, target)))
+            for cell in nearby:
+                if math.dist(cell, reposition) >= 1.5 and (point := ground_point(cell)):
+                    return click(cell, point)
 
         path_target = (target, portal, npc_gid, detour, reposition)
         path = leg.get("path")
@@ -7344,7 +7328,7 @@ class Overlay:
                 path = None
         else:
             path = None
-        path_key = (*path_target, frozenset(blocked), frozenset(penalties.items()))
+        path_key = path_target
         if not path:
             job = leg.get("path_job")
             if job and not job["done"]:
@@ -7355,8 +7339,9 @@ class Overlay:
                 if len(path) <= 1:
                     return recalculate("no_gat_path")
                 closest = min(range(len(path)), key=lambda idx: math.dist(position, path[idx]))
-                if math.dist(position, path[closest]) > 3:
-                    return "waiting"
+                if (math.dist(position, path[closest]) > 3
+                        or any(cell in blocked for cell in path[closest:closest + 4] if cell != start)):
+                    return recalculate("no_clickable_step")
                 leg["path"] = path
                 leg["path_key"] = path_key
                 leg["path_target"] = path_target
@@ -7367,28 +7352,30 @@ class Overlay:
                 self._active_nav_idx = closest
             else:
                 if not portal:
-                    radius = 6 if npc_gid is not None else 4
+                    radius = int(approach_range)
                     goals = sorted(
                         (cell for cell in self._patrol_cells_in_radius(*target, radius)
                          if cell != target and cell != start and cell not in blocked
                          and cell not in failed_points and cell not in visited
-                         and (reposition is None or math.dist(cell, reposition) >= 2.0)
+                         and (reposition is None or math.dist(cell, reposition) >= 1.5)
                          and gat.is_walkable(*cell)),
                         key=lambda cell: (math.dist(start, cell), math.dist(target, cell)),
                     )
-                    approach_goals = []
-                    for cell in goals:
-                        if resolve(cell) is not None:
-                            approach_goals.append(cell)
-                            if len(approach_goals) == 8:
-                                break
+                    if reposition is not None:
+                        occupied = self._entity_occupied_cells(snapshot.map)
+                        goals = [cell for cell in goals if cell not in occupied and resolve(cell) is not None]
+                    elif near_kafra:
+                        occupied = self._entity_occupied_cells(snapshot.map)
+                        goals = [cell for cell in goals if cell not in occupied]
+                        goals.sort(key=lambda cell: resolve(cell) is None)
+                    approach_goals = goals
                 job = {"key": path_key, "done": False, "path": []}
                 leg["path_job"] = job
                 avoided = (*visited, *failed_points, *leg.get("avoid_path_cells", ()))
 
                 def find_path():
                     try:
-                        costs = {cell: 30 for cell in avoided} if detour else None
+                        costs = {cell: 30 for cell in (avoided if detour else failed_points)}
                         if portal:
                             radius = 2
                             candidates = sorted(
@@ -7419,22 +7406,29 @@ class Overlay:
         self._active_nav_idx = nav_idx
         self.active_nav_path = list(path[nav_idx:])
         self.active_nav_color = "#22D3EE"
-        local_path = path[nav_idx:nav_idx + 7]
-        if failed := leg.get("failed_walk_step"):
-            retry = self._pick_walk_retry(local_path, position, failed[0], ground_point,
-                                          previous_point=failed[1], radius=5)
+        local_path = path[nav_idx:nav_idx + 16]
+        arrival = world.last_map_arrival
+        if (ready_ts and now - ready_ts <= 10.0 and arrival and arrival[0] == snapshot.map
+                and math.dist(position, arrival[1]) <= 8.0):
+            spawn_step = self._pick_long_stride_cell(local_path, 5.0, 11.0,
+                                                     position=position, ground_point=ground_point)
+            if spawn_step:
+                return click(*spawn_step)
+        failed = leg.get("failed_walk_step")
+        min_stride = max(4.0, leg.get("retry_stride_dist", 0.0) - 1.5)
+        if failed:
+            retry = self._pick_walk_retry(
+                local_path, position, failed[0], ground_point, previous_point=failed[1], min_dist=min_stride,
+            )
             if retry:
                 return click(*retry)
-        stride = self._pick_walk_stride(path[nav_idx:nav_idx + 16], position, blocked, ground_point)
+        stride = self._pick_walk_stride(local_path, position, blocked, ground_point, min_dist=min_stride)
+        if stride is None and near_kafra:
+            stride = self._pick_walk_stride(local_path, position, blocked, ground_point)
+        if stride is None and reposition is None and "retry_stride_dist" not in leg:
+            stride = self._pick_walk_stride(local_path, position, blocked, ground_point, min_dist=1.0)
         if stride:
-            leg["side_steps"] = 0
             return click(*stride)
-        if len(path) > 1 and leg.get("side_steps", 0) < 3:
-            next_cell = path[min(len(path) - 1, nav_idx + 5)]
-            retry = self._pick_walk_retry(local_path, position, next_cell, ground_point, radius=5)
-            if retry:
-                leg["side_steps"] = leg.get("side_steps", 0) + 1
-                return click(*retry)
         return recalculate("no_clickable_step")
 
     def _execute_travel_kafra(self, snapshot, world, leg, step, position, now):
@@ -7699,14 +7693,59 @@ class Overlay:
         if gat is None:
             self._click_debug(f"PATROL bloqueado: terreno .gat de {map_id} indisponível.")
             return
+        raw = int(rx * gat.width), int((1.0 - ry) * gat.height)
+        self._minimap_path_request = {"map": map_id, "gat": gat, "raw": raw, "result": None}
+
+    def _tick_minimap_route(self, map_id, player):
+        request = self._minimap_path_request
+        if request is None:
+            return False
+        if map_id != request["map"] or player is None or self._kafra_cycle:
+            self._minimap_path_request = None
+            return False
+
+        gat, raw = request["gat"], request["raw"]
         start = tuple(map(round, player.cell()))
-        raw_x, raw_y = int(rx * gat.width), int((1.0 - ry) * gat.height)
-        blocked, penalties = self._navigation_obstacles(map_id, gat, block_portals=False)
-        goal = self._resolve_walkable_cell(gat, raw_x, raw_y, max_radius=15, forbidden_cells=blocked)
-        path = self._find_minimap_path(gat, start, goal, blocked, penalties) if goal else []
+        if request["result"] is None:
+            if self._minimap_path_worker is not None and self._minimap_path_worker.is_alive():
+                return True
+            blocked, penalties = self._navigation_obstacles(map_id, gat, block_portals=True)
+
+            def plan():
+                path = []
+                try:
+                    goal = self._resolve_walkable_cell(gat, *raw, max_radius=15, forbidden_cells=blocked)
+                    if goal is not None:
+                        path = self._find_minimap_path(gat, start, goal, blocked, penalties)
+                    if goal is not None and not path:
+                        path = gat.find_path(
+                            start, raw, blocked_cells=blocked, penalty_cells=penalties,
+                            goal_test=lambda cell: cell != start and math.dist(cell, raw) <= 5,
+                            goal_radius=5, max_iterations=max(7000, gat.width * gat.height),
+                        )
+                except (OSError, ValueError) as exc:
+                    print(f"[Minimapa] Falha ao planejar rota em {map_id}: {exc}", flush=True)
+                finally:
+                    request["result"] = path
+
+            worker = threading.Thread(target=plan, name="minimap-path", daemon=True)
+            try:
+                worker.start()
+            except RuntimeError as exc:
+                self._minimap_path_request = None
+                print(f"[Minimapa] Falha ao iniciar o planejamento: {exc}", flush=True)
+                return False
+            self._minimap_path_worker = worker
+            return True
+
+        self._minimap_path_request = None
+        path = request["result"]
         if not path:
-            self._click_debug(f"PATROL bloqueado: minimapa sem rota caminhável até ({raw_x}, {raw_y}).")
-            return
+            self._click_debug(f"PATROL bloqueado: minimapa sem rota caminhável até {raw}.")
+            return False
+        goal = path[-1]
+        if start in path:
+            path = path[path.index(start):]
         if self.travel_plan:
             self._reset_travel_leg(self.travel_plan)
             self.travel_plan = None
@@ -7714,6 +7753,7 @@ class Overlay:
             self._handle_map_change(map_id)
         self._clear_patrol_route()
         self._reset_patrol(*start)
+        self._city_travel_state = None
         self._minimap_goal = self.manual_nav_goal = self.nav_goal = (map_id, *goal)
         self.current_waypoint = goal
         self.current_patrol_path = path
@@ -7721,11 +7761,14 @@ class Overlay:
         self.active_nav_color = "#A78BFA"
         self._resume_hud_automation()
         print(f"[Minimapa] {map_id} {start} → {goal}.", flush=True)
+        return True
 
     @staticmethod
     def _find_minimap_path(gat, start, goal, blocked, penalties):
+        if goal in blocked or not gat.is_walkable(*goal):
+            return []
         path = gat.find_path(start, goal, blocked_cells=blocked, penalty_cells=penalties,
-                             max_iterations=max(7000, 3 * gat.width * gat.height))
+                             max_iterations=max(7000, gat.width * gat.height))
         return path if path and path[-1] == goal else []
 
     def _start_world_map_travel(self, target, mode):
@@ -7992,6 +8035,13 @@ class Overlay:
             or (mob.track.is_moving and math.dist(mob.track.target, position) <= 2.5)
         )
 
+    def _is_immediate_loot_threat(self, world, gid, mob, position, now):
+        return (
+            (gid == world.last_player_attacker_gid and now - world.last_player_aggro_ts <= 2.5)
+            or (mob.is_aggro and now - mob.last_aggro_ts <= 2.5)
+            or math.dist(position, mob.track.cell()) <= 2.5
+        )
+
     def _reset_survival(self):
         self._survival_state = None
         self._sit_attempts = 0
@@ -8001,10 +8051,10 @@ class Overlay:
         self._retreat_safe_since = None
         self._survival_next_action = 0.0
         self._retreat_click = None
+        self._retreat_retry_step = None
         self._last_retreat_target = None
         self._retreat_goal = None
         self._retreat_portal_attempts = {}
-        self._last_retreat_step_at = 0.0
 
     def _clear_recovery_navigation(self):
         self._clear_patrol_route()
@@ -8161,7 +8211,11 @@ class Overlay:
             return None
 
         stride = None
-        if portal and math.dist(player_cell, portal) <= 4 and (point := ground_point(portal)):
+        retry = self._retreat_retry_step
+        if retry and retry[0] == snapshot.map and (point := ground_point(retry[1])):
+            stride = retry[1], point
+        if (stride is None and portal and tuple(map(round, player_cell)) != portal
+                and math.dist(player_cell, portal) <= 4 and (point := ground_point(portal))):
             stride = (portal, point)
         if stride is None:
             stride = self._pick_long_stride_cell(path, 9, 14, position=player_cell, ground_point=ground_point)
@@ -8195,11 +8249,13 @@ class Overlay:
                             return None
                 return point
 
+            hover_reset = retry == (snapshot.map, cell)
             if self._navigation_click(snapshot, gat, cell, point, target_point=safe_retreat_point,
-                                      portal=portal, retry_key=(snapshot.map, "ground", cell)):
+                                      portal=portal, retry_key=(snapshot.map, "ground", cell),
+                                      hover_reset=hover_reset):
+                self._retreat_retry_step = None
                 self._last_retreat_target = cell
-                self._last_retreat_step_at = now
-                self._retreat_click = (now, player_cell, cell, point, portal == cell)
+                self._retreat_click = (now, player_cell, cell, point, portal == cell, hover_reset)
                 self._click_debug(f"FUGA: Passo para {cell} em {point}")
 
     def _handle_survival(self, snapshot, world, player, current_map, now, hp_pct, entities):
@@ -8244,6 +8300,7 @@ class Overlay:
             self.retreat_return_portal_pos = arrival[1]
             self._survival_state = SURVIVAL_RECOVER
             self._retreat_click = None
+            self._retreat_retry_step = None
             self._last_retreat_target = None
 
         if self._survival_state == SURVIVAL_RECOVER:
@@ -8274,27 +8331,28 @@ class Overlay:
         if world.vending_window_open and self._dismiss_accidental_vending_window(world, player, now):
             return True
         if self._retreat_click:
-            clicked_at, previous, clicked_cell, point, is_portal = self._retreat_click
-            if self._touch_click_aborted(point, clicked_at):
-                self._retreat_click = None
-            elif self._movement_confirmed(world, clicked_at, player_cell, previous):
-                self._retreat_click = None
-                if is_portal:
-                    key = (current_map, clicked_cell)
-                    self._retreat_portal_attempts[key] = self._retreat_portal_attempts.get(key, 0) + 1
-            elif now - self._touch_click_finished_at(point, clicked_at) < 0.85:
-                return True
+            clicked_at, previous, clicked_cell, point, is_portal, retried = self._retreat_click
+            if is_portal:
+                elapsed = now - self._touch_click_finished_at(point, clicked_at)
+                if not self._touch_click_aborted(point, clicked_at) and (walking or elapsed < 1.6):
+                    return True
+                key = current_map, clicked_cell
+                self._retreat_portal_attempts[key] = self._retreat_portal_attempts.get(key, 0) + 1
+                if not retried:
+                    self._retreat_retry_step = key
             else:
-                self._retreat_click = None
-                if is_portal:
-                    key = (current_map, clicked_cell)
-                    self._retreat_portal_attempts[key] = self._retreat_portal_attempts.get(key, 0) + 1
-                else:
-                    self.temp_blocked_cells[clicked_cell] = now + 25.0
+                result = self._walk_step_result(world, player_cell, previous, point, clicked_at, now)
+                if result == "waiting":
+                    return True
+                if result == "stalled":
+                    if retried:
+                        self.temp_blocked_cells[clicked_cell] = now + 12.0
+                    else:
+                        self._retreat_retry_step = current_map, clicked_cell
+            self._retreat_click = None
         if walking:
             self._retreat_safe_since = None
-            if now - self._last_retreat_step_at < 0.65:
-                return True
+            return True
         if now < self._survival_next_action:
             return True
         self._survival_next_action = now + 0.25
@@ -8457,11 +8515,31 @@ class Overlay:
         if not keys:
             self._npc_dismissal = None
             return False
-        key = keys.pop(0)
-        if key == 0x1B and self._dismiss_settings_window(now, force_check=True):
-            self._npc_dismissal = None
+        pending = getattr(self, "_npc_dismissal_key", None)
+        if pending is None or pending[0] != stamp:
+            key = keys[0]
+            if key == 0x1B and self._dismiss_settings_window(now, force_check=True):
+                self._npc_dismissal = None
+                return True
+            completion = Future()
+
+            def allowed():
+                return (self._hud_can_run() and world.map == current_map
+                        and world.npc_dialog.get("seq") == dialog.get("seq"))
+
+            if self._send_game_key(key, completion=completion, allowed=allowed):
+                self._npc_dismissal_key = stamp, completion
+            else:
+                self._npc_dismissal = stamp, keys, now + 0.25
             return True
-        self._send_game_key(key)
+        completion = pending[1]
+        if not completion.done():
+            return True
+        self._npc_dismissal_key = None
+        if completion.result() is None:
+            self._npc_dismissal = stamp, keys, now + 0.5
+            return True
+        keys.pop(0)
         if keys:
             self._npc_dismissal = (stamp, keys, now + 0.075)
         elif opcode in (0x00B5, 0x00B7):
@@ -8709,23 +8787,33 @@ class Overlay:
         return self._click_in_progress or win32_input.is_bot_clicking(0.0)
 
     def _handle_actions(self, snapshot):
+        self._check_visual_walk()
         patrol_requested = self.auto_patrol or self.nav_goal is not None or self.patrol_target_route is not None
         if self._automation_click_active():
             if patrol_requested:
                 self._click_debug("PATROL bloqueado: clique anterior ainda em andamento.")
             return
+        touch_released = win32_input.release_pending_touch()
+        if self._is_game_focused() and win32_input.recover_touch_mouse_release():
+            log_click_file("[Clique] Enviada soltura de recuperação do toque automático.")
+            return
+        if not touch_released:
+            return
         if self._tick_pin_probe(snapshot):
             return
+        world = getattr(self.feed, "world", None)
+        if (self._minimap_path_request is not None and world is not None and not self._hud_can_run()
+                and not world.is_map_loading and not world.player_is_dead and not self._survival_state):
+            map_id, player, _ = world.snapshot()
+            if self._tick_minimap_route(map_id, player):
+                return
         manual_kafra = self._kafra_manual and not self._hud_drawer_paused and self._hud_edit is None
         if not (self._hud_can_run() or manual_kafra):
             if patrol_requested:
                 self._click_debug("PATROL bloqueado: automação pausada ou controle do HUD em edição.")
             return
         now = time.monotonic()
-        world = getattr(self.feed, "world", None)
         if world is None or world.is_map_loading:
-            if world is not None and world.is_map_loading:
-                self._update_map_stabilization(world, None, now, loading=True)
             if patrol_requested:
                 self._click_debug("PATROL bloqueado: transição de mapa.")
             return
@@ -8749,6 +8837,8 @@ class Overlay:
                 sent_at = completion.result()
                 if sent_at is None:
                     self._sit_confirmation = None
+                    if expected:
+                        self._sit_attempts = max(0, self._sit_attempts - 1)
                 elif now >= sent_at + 1.1:
                     self._sit_confirmation = None
                     self._last_sit_attempt_at = sent_at
@@ -8771,6 +8861,8 @@ class Overlay:
             if patrol_requested:
                 self._click_debug("PATROL bloqueado: rotina de sobrevivência em andamento.")
             return
+        if self._minimap_path_request is not None and self._tick_minimap_route(curr_m, player):
+            return
         if self.travel_plan:
             if self._kafra_cycle:
                 self._tick_kafra_storage(snapshot, world, curr_m, px, py, now)
@@ -8781,7 +8873,7 @@ class Overlay:
             if self._kafra_cycle:
                 self._tick_kafra_storage(snapshot, world, curr_m, px, py, now)
             return
-        if (self.auto_farm or self.auto_loot or self.auto_patrol
+        if (self.auto_farm or self.auto_loot or patrol_requested
                 or self._kafra_cycle or self._city_travel_state):
             if self._dismiss_settings_window(now):
                 return
@@ -8811,13 +8903,11 @@ class Overlay:
         if not (self.auto_loot or self.auto_farm or self.auto_patrol or self._has_hud_travel()):
             return
 
-        # ── SEGURANÇA DE MAPA: desativa farm/patrol se o mapa mudar (0x0091) ──
+        # Reinicia as rotas do mapa anterior após o carregamento.
         if curr_m and self.manual_nav_goal and curr_m != self.manual_nav_goal[0]:
             self.manual_nav_goal = None
             self._clear_patrol_route()
         if curr_m and self.farm_map and curr_m != self.farm_map and not travel_or_kafra:
-            if patrol_requested:
-                self._click_debug("PATROL bloqueado: mapa atual difere do mapa de patrulha.")
             self._handle_map_change(curr_m)
             return
 
@@ -8850,16 +8940,34 @@ class Overlay:
         if px is not None and (self.auto_farm or self.auto_loot or self.auto_patrol):
             position = (px, py)
             drops = self._eligible_drops(snapshot, position, entities, now) if self.auto_loot or self.auto_farm else []
-            tier1 = [entry for entry in drops if entry[0] == 1]
-            if tier1 and any(kind == "mob" and math.dist(position, mob.track.cell()) <= 8.0
-                             and self._is_active_threat(world, gid, mob, position, now)
-                             for (kind, gid), mob in entities):
-                if self._try_auto_farm(snapshot, position, entities, defense=True):
+            if self._locked_drop_gid is not None and not any(entry[2] == self._locked_drop_gid for entry in drops):
+                self._locked_drop_gid = None
+                self._drop_lock_until = 0.0
+                if self._engage_state and self._engage_state["kind"] == "drop":
+                    self._engage_state = self._engagement = None
+                    self.active_nav_path = None
+            loot_first = self.auto_loot and bool(drops)
+            if loot_first:
+                defense_range = max(2.5, getattr(world, "player_attack_range", 1.0))
+                threats = [(key, mob) for key, mob in entities
+                           if key[0] == "mob" and math.dist(position, mob.track.cell()) <= defense_range
+                           and self._is_immediate_loot_threat(world, key[1], mob, position, now)]
+                locked_gid = self._locked_farm_target_id
+                if locked_gid is not None and all(key[1] != locked_gid for key, _ in threats):
+                    self._finish_farm_lock("coleta prioritária")
+                if threats and (self._continue_farm_lock(snapshot, position, now, direct_only=True)
+                                or self._try_auto_farm(snapshot, position, threats, defense=True,
+                                                       direct_only=True, loot_defense=True)):
                     self._reset_patrol(px, py, keep_waypoint=True)
                     return
-            if self._continue_locked_target(snapshot, position, entities, drops, now):
+            elif self._continue_farm_lock(snapshot, position, now):
                 if patrol_requested:
-                    self._click_debug("PATROL bloqueado: combate ou coleta em andamento.")
+                    self._click_debug("PATROL bloqueado: combate em andamento.")
+                self._reset_patrol(px, py, keep_waypoint=True)
+                return
+            if self._continue_loot_lock(snapshot, position, entities, drops, now):
+                if patrol_requested:
+                    self._click_debug("PATROL bloqueado: coleta em andamento.")
                 self._reset_patrol(px, py, keep_waypoint=True)
                 return
             if now < self.post_kill_wait_until:
@@ -8870,6 +8978,14 @@ class Overlay:
                 drop.ownership == "MINE" for _, _, _, drop in drops
             )
             walking = world._is_player_walking()
+            if loot_first:
+                if self._try_auto_loot(snapshot, position, drops, direct_only=walking):
+                    if patrol_requested:
+                        self._click_debug("PATROL bloqueado: coleta em andamento.")
+                    self._reset_patrol(px, py, keep_waypoint=True)
+                return
+
+            tier1 = [entry for entry in drops if entry[0] == 1]
             if tier1 and self._try_auto_loot(snapshot, position, tier1, direct_only=walking):
                 if patrol_requested:
                     self._click_debug("PATROL bloqueado: coleta em andamento.")
@@ -8918,12 +9034,17 @@ class Overlay:
             removed_target = world.last_removed_farm_target
             target_missing = gid is not None and world.entity("mob", gid) is None
         if self._engagement_zone != zone:
+            changed_map = self._engagement_zone is None or self._engagement_zone[0] != current_map
             self._engagement_zone = zone
             self._finish_farm_lock("troca de mapa")
+            if changed_map:
+                self.ignored_mobs.clear()
+            self._farm_patrol_until = 0.0
             self._locked_drop_gid = None
             self._drop_lock_until = 0.0
             self._engagement = None
             self._engage_state = None
+            self._loot_attempts.clear()
             self.post_kill_wait_until = 0.0
             self.last_kill_pos = None
         for dead in deaths:
@@ -8934,60 +9055,30 @@ class Overlay:
             d_aid = dead.get("aid")
             was_locked = self._locked_farm_target_id is not None and self._locked_farm_target_id in (d_gid, d_aid)
             if was_locked:
-                self._finish_farm_lock("morte confirmada (0x0080)")
+                self._finish_farm_lock("morte confirmada (0x0080)", confirmed_death=True)
             if dead["near_player"] or dead["was_target"] or was_locked:
                 self.post_kill_wait_until = dead["time"] + 0.35
                 self.last_kill_pos = dead["cell"]
-        if gid is not None and self._locked_farm_target_id == gid:
-            if (removed_target is not None and removed_target[0] == gid
-                    and removed_target[1] >= self._farm_lock_started_at):
-                self._finish_farm_lock(removed_target[2])
-            elif target_missing:
-                self._finish_farm_lock("alvo saiu do conjunto ativo do feed")
+        if gid is not None and self._locked_farm_target_id == gid and target_missing:
+            same_removal = (removed_target and removed_target[0] == gid
+                            and removed_target[1] >= self._farm_lock_started_at)
+            vanish_type = removed_target[4] if same_removal else None
+            confirmed_death = vanish_type == 1
+            reason = (removed_target[2] if same_removal else "alvo removido do feed (0x0080)")
+            self._finish_farm_lock(reason, confirmed_death=confirmed_death, resume_patrol=not confirmed_death)
+        else:
+            self._farm_target_missing_since = None
 
     @staticmethod
     def _has_walkable_line(p0, p1, gat):
         """Verifica se há linha de caminhada direta sem colisão de paredes entre dois pontos."""
         if not gat:
             return True
-        x0, y0 = int(round(p0[0])), int(round(p0[1]))
-        x1, y1 = int(round(p1[0])), int(round(p1[1]))
-        dx = abs(x1 - x0)
-        dy = abs(y1 - y0)
-        steps = max(dx, dy)
-        if steps <= 1:
-            return gat.is_walkable(x1, y1)
-        for s in range(1, steps + 1):
-            tx = int(round(x0 + s * (x1 - x0) / steps))
-            ty = int(round(y0 + s * (y1 - y0) / steps))
-            if not gat.is_walkable(tx, ty):
-                return False
-        return True
+        return gat.has_walkable_line(p0, p1)
 
     @staticmethod
     def _has_gat_line_of_sight(x0, y0, x1, y1, gat):
-        if gat is None:
-            return False
-        x, y, end_x, end_y = (round(value) for value in (x0, y0, x1, y1))
-        dx, dy = abs(end_x - x), -abs(end_y - y)
-        sx, sy = (1 if x < end_x else -1), (1 if y < end_y else -1)
-        error = dx + dy
-        while (x, y) != (end_x, end_y):
-            twice = 2 * error
-            next_x, next_y = x, y
-            if twice >= dy:
-                error += dy
-                next_x += sx
-            if twice <= dx:
-                error += dx
-                next_y += sy
-            if next_x != x and next_y != y:
-                if not (gat.is_walkable(next_x, y) and gat.is_walkable(x, next_y)):
-                    return False
-            x, y = next_x, next_y
-            if not gat.is_walkable(x, y):
-                return False
-        return gat.is_walkable(end_x, end_y)
+        return gat is not None and gat.has_walkable_line((x0, y0), (x1, y1))
 
     def _resolve_walkable_cell(self, gat, target_x, target_y, max_radius=3, forbidden_cells=None):
         """Valida (target_x, target_y) no .gat e resolve em espiral a célula caminhável válida mais próxima."""
@@ -9044,9 +9135,11 @@ class Overlay:
         if not path:
             return False
         idx = min(self._active_nav_idx, len(path) - 1)
-        while idx < len(path) - 1 and math.dist(position, path[idx]) <= 2.5:
-            idx += 1
-            self._active_nav_idx = idx
+        end = min(len(path), idx + 16)
+        if cur_cell in path[idx:end]:
+            closest = path.index(cur_cell, idx, end)
+            idx = min(closest + 1, len(path) - 1)
+        if idx != self._active_nav_idx:
             self._active_nav_wp_dist = math.dist(position, path[idx])
             self._active_nav_wp_ts = now
         self._active_nav_idx = idx
@@ -9059,12 +9152,19 @@ class Overlay:
         ahead = path[idx:min(len(path), idx + 8)]
         if any(cell in blocked for cell in ahead if cell != cur_cell):
             return False
-        if now - self._active_nav_wp_ts > 2.2:
+        if dist_wp > 4.0 and now - self._active_nav_wp_ts > 4.0:
             return False
         return True
 
     def _safe_click_resolver(self, snapshot, project, *, allowed_portal=None, allowed_npc=None):
         left, top, width, height = snapshot.viewport
+        terrain = getattr(self.feed, "terrain", None)
+        gat = terrain.cached_gats.get(snapshot.map) if terrain else None
+        camera_ground = getattr(project, "camera_ground", None)
+        screen_occluders = (
+            gat.build_screen_occluders(snapshot.player_cell, snapshot.viewport, project, radius=14)
+            if gat is not None and snapshot.player_cell is not None else ()
+        )
         entities = self._navigation_entities(snapshot.map)
         portals, npcs = self._navigation_centers(snapshot.map, entities, allowed_npc)
         portal_keys = {f"{kind}:{gid}": tuple(map(round, ent.track.target))
@@ -9088,16 +9188,27 @@ class Overlay:
                     fu, fv = project(*ent.track.cell(), 0.0)
                     npc_boxes.append((left + fu * width, top + fv * height))
                     points.append(project(*ent.track.cell(), 5.5))
-        points.extend(
-            project(*cell, 1.2) for cell in portals
-            if cell != allowed_portal and all(math.dist(cell, ac) > 2.0 for ac in allowed_npc_cells)
-        )
+        ground_portals = []
+        for cell in portals:
+            if cell == allowed_portal:
+                continue
+            u, v = project(*cell, 1.2)
+            if any(math.dist(cell, ac) <= 2.0 for ac in allowed_npc_cells):
+                ground_portals.append((left + u * width, top + v * height))
+            else:
+                points.append((u, v))
         for cell in npcs:
             fu, fv = project(*cell, 0.0)
             npc_boxes.append((left + fu * width, top + fv * height))
             points.append(project(*cell, 5.5))
         protected = [(left + u * width, top + v * height) for u, v in points]
         npc_tiles = self._npc_zone_cells(npcs)
+        sprite_boxes = [
+            (left + u * width, top + v * height, kind)
+            for (kind, _), ent in entities if kind in ("mob", "drop", "player")
+            for u, v in (project(*ent.track.cell(), 0.0),)
+            if -0.1 <= u <= 1.1 and -0.1 <= v <= 1.1
+        ]
         npc_ground_boxes = []
         for x, y in npcs:
             corners = [project(x + dx, y + dy, 0.0)
@@ -9108,6 +9219,13 @@ class Overlay:
                                      left + max(us) * width + 8, top + max(vs) * height + 8))
 
         def resolve(cell, uv=None):
+            if uv is None:
+                tile = tuple(map(round, cell))
+                if self.visual_occluded_cells.get((snapshot.map, tile), 0.0) > time.monotonic():
+                    return None
+                if (gat is not None and camera_ground is not None and tile != allowed_portal
+                        and gat.wall_faces_camera(tile, camera_ground)):
+                    return None
             # Um clique intencional no sprite usa a proteção projetada dos outros NPCs.
             if (allowed_npc is None or uv is None) and tuple(map(round, cell)) in npc_tiles:
                 return None
@@ -9118,13 +9236,24 @@ class Overlay:
             if (self._is_point_in_game_ui(*point) or self._is_point_in_vending_shop(*point)
                     or self._is_point_in_hud(*point, margin=10)):
                 return None
+            if (uv is None and gat is not None and screen_occluders
+                    and gat.is_screen_occluded(screen_occluders, cell, *point, project)):
+                return None
             # Inclui 5 px de retentativa e 3 px de tolerância do cursor.
             if any(math.dist(point, center) < 36 for center in protected):
+                return None
+            if uv is None and any(math.dist(point, center) < 36 for center in ground_portals):
                 return None
             px, py = point
             if any(x1 <= px <= x2 and y1 <= py <= y2 for x1, y1, x2, y2 in npc_ground_boxes):
                 return None
             if any(abs(px - gx) <= 46 and (gy - 103) <= py <= (gy + 32) for gx, gy in npc_boxes):
+                return None
+            if uv is None and any(
+                abs(px - gx) <= (10 if kind == "drop" else 20)
+                and gy - (12 if kind == "drop" else 42) <= py <= gy + 7
+                for gx, gy, kind in sprite_boxes
+            ):
                 return None
             return point
 
@@ -9153,47 +9282,20 @@ class Overlay:
             map_name, allowed_portal=allowed_portal, allowed_npc=allowed_npc)
 
     def _navigation_click(self, snapshot, gat, cell, point, *, hwnd=None, target_point=None,
-                          retry_key=None, portal=None, npc=None, ground=True, hover_reset=False):
+                          retry_key=None, portal=None, npc=None, ground=True, hover_reset=False,
+                          hover_reset_point=None, completion=None, direct_touch=False, kafra=False,
+                          pickup_click=False, allow_offsets=None, hover_ms=None, hold_ms=None):
         if self._is_pin_entry_active():
             return False
-        world = self.feed.world
-        if ground and gat is not None:
-            blocked_init, _ = self._navigation_obstacles(snapshot.map, gat, portal=portal, npc=npc)
-            occupied_init = self._entity_occupied_cells(snapshot.map, allowed_portal=portal, allowed_npc=npc)
-            forbidden = blocked_init | occupied_init
-            resolved_cell = self._resolve_walkable_cell(
-                gat, cell[0], cell[1], max_radius=3, forbidden_cells=forbidden)
-            if resolved_cell is None:
+        if ground and self._visual_walk_probe is not None:
+            self._check_visual_walk()
+            if self._visual_walk_probe is not None:
                 return False
-            with world.lock:
-                pos_init = world.player.cell() if world.player else resolved_cell
-            project_init = self.feed.camera.projector(
-                snapshot.viewport, getattr(self.feed, "_cam", None) or pos_init,
-                gat.get_elevation if gat else flat_height)
-            resolve_init = self._safe_click_resolver(snapshot, project_init, allowed_portal=portal)
-            re_point = resolve_init(resolved_cell)
-            if re_point is None:
-                cx, cy = resolved_cell
-                candidates = sorted(
-                    ((cx + dx, cy + dy) for dx in range(-3, 4) for dy in range(-3, 4) if dx or dy),
-                    key=lambda cand: math.hypot(cand[0] - cx, cand[1] - cy),
-                )
-                for cand in candidates:
-                    if (cand not in forbidden and gat.is_walkable(*cand)
-                            and self._has_gat_line_of_sight(*pos_init, *cand, gat)):
-                        if cand_point := resolve_init(cand):
-                            resolved_cell, re_point = cand, cand_point
-                            break
-                else:
-                    return False
-            if resolved_cell != tuple(map(round, cell)):
-                cell = resolved_cell
-                point = re_point
-            elif re_point != point:
-                point = re_point
+        world = self.feed.world
+        cell = tuple(map(round, cell))
 
         def guarded_aim(lead):
-            if self._is_pin_entry_active():
+            if self._is_pin_entry_active() or (ground and u32.GetAsyncKeyState(0x11) & 0x8000):
                 return None
             with world.lock:
                 if (world.map != snapshot.map or world.player is None or world.is_map_loading
@@ -9205,17 +9307,22 @@ class Overlay:
                             or tuple(map(round, entity.track.target)) != tuple(map(round, cell))):
                         return None
                 position = world.player.cell()
-            blocked, _ = self._navigation_obstacles(snapshot.map, gat, portal=portal, npc=npc)
-            if not ground and npc is not None:
-                # A mira do sprite ainda passa pela proteção projetada dos outros NPCs.
-                blocked.discard(tuple(map(round, cell)))
-            if self._segment_hits_obstacle(*position, *cell, blocked):
-                return None
-            if ground and (gat is None
-                           or not self._is_empty_walkable_cell(
-                               snapshot.map, gat, cell, blocked, allowed_portal=portal, allowed_npc=npc)
-                           or not self._has_gat_line_of_sight(*position, *cell, gat)):
-                return None
+            if kafra and not ground:
+                # Interagir com o sprite só exige alcance e uma mira segura.
+                if math.dist(position, cell) > KAFRA_INTERACTION_RANGE:
+                    return None
+            else:
+                blocked, _ = self._navigation_obstacles(snapshot.map, gat, portal=portal, npc=npc)
+                if not ground and npc is not None:
+                    blocked.discard(cell)
+                if self._segment_hits_obstacle(*position, *cell, blocked):
+                    return None
+                if ground and (gat is None
+                               or not self._is_empty_walkable_cell(
+                                   snapshot.map, gat, cell, blocked, allowed_portal=portal,
+                                   allowed_npc=None if kafra else npc)
+                               or not self._has_gat_line_of_sight(*position, *cell, gat)):
+                    return None
             current_point = target_point(lead) if target_point else point
             if current_point is None:
                 return None
@@ -9223,7 +9330,7 @@ class Overlay:
             project = self.feed.camera.projector(snapshot.viewport, getattr(self.feed, "_cam", None) or position,
                                                  gat.get_elevation if gat else flat_height)
             resolve = self._safe_click_resolver(
-                snapshot, project, allowed_portal=portal, allowed_npc=None if ground else npc)
+                snapshot, project, allowed_portal=portal, allowed_npc=npc if kafra or not ground else None)
             if ground:
                 return resolve(cell)
             uv = (current_point[0] - left) / width, (current_point[1] - top) / height
@@ -9231,9 +9338,27 @@ class Overlay:
 
         if guarded_aim(getattr(self, "_sprite_click_lead", 0.085)) is None:
             return False
+        if ground:
+            with world.lock:
+                origin = world.player.cell() if world.player is not None else None
+            if origin is None:
+                return False
+            queued_at = time.monotonic()
         sent = self.patrol_move_and_click(*point, hwnd=hwnd, target_point=guarded_aim,
-                                          retry_key=retry_key,
-                                          hover_reset=hover_reset and not world._is_player_walking())
+                                          retry_key=retry_key, allow_offsets=not ground if allow_offsets is None else allow_offsets,
+                                          hover_reset=hover_reset, hover_reset_point=hover_reset_point,
+                                          completion=completion, direct_touch=direct_touch,
+                                          pickup_click=pickup_click, hover_ms=hover_ms, hold_ms=hold_ms)
+        if sent and ground:
+            expected_path = (gat.find_path(tuple(map(round, origin)), cell, prefer_clearance=False)
+                             if gat is not None else None)
+            expected_path_len = (len(expected_path) if expected_path
+                                 else max(1, int(round(math.dist(origin, cell))) + 1))
+            self._visual_walk_probe = {
+                "map": snapshot.map, "cell": cell, "point": tuple(map(int, point)),
+                "origin": origin, "queued_at": queued_at, "finished_at": None,
+                "expected_path_len": expected_path_len,
+            }
         if sent and portal is not None:
             self._intentional_portal_click = snapshot.map, time.time() + 4.0
         return sent
@@ -9254,18 +9379,158 @@ class Overlay:
             path, position, blocked, lambda cell: self._walk_ground_point(gat, position, cell, blocked, resolve))
         return (*stride, False) if stride else None
 
-    @staticmethod
-    def _pick_long_stride_cell(path_cells, min_dist=9, max_dist=14, *, position=None, ground_point):
+    def _filter_forward_path(self, path, position):
+        """Descarta nós iniciais que não aproximam do destino e rejeita células atrás do personagem em rota direta."""
+        if not path or position is None:
+            return list(path) if path else []
+        goal = path[-1]
+        player_goal_dist = math.dist(position, goal)
+        trimmed = list(path)
+        while len(trimmed) > 1 and math.dist(trimmed[0], goal) >= player_goal_dist:
+            trimmed.pop(0)
+        gx, gy = goal[0] - position[0], goal[1] - position[1]
+        if gx == 0 and gy == 0:
+            return trimmed
+        terrain = getattr(self.feed, "terrain", None)
+        world = getattr(self.feed, "world", None)
+        gat = terrain.cached_gats.get(world.map) if (terrain and world and world.map) else None
+        start = tuple(map(round, position))
+        direct_astar = len(trimmed) >= 2 and (gat is None or gat.has_walkable_line(start, goal))
+        if not direct_astar:
+            return trimmed
+        forward = [c for c in trimmed if (c[0] - position[0]) * gx + (c[1] - position[1]) * gy > 0]
+        return forward or [goal]
+
+    def _pick_long_stride_cell(self, path_cells, min_dist=9, max_dist=14, *, position=None, ground_point):
         if not path_cells:
             return None
         start = path_cells[0] if position is None else position
-        candidates = [(math.dist(start, cell), cell) for cell in path_cells]
-        for distance, cell in sorted(candidates, reverse=True):
-            if min_dist <= distance <= max_dist and (point := ground_point(cell)):
+        forward_cells = self._filter_forward_path(path_cells, start)
+        cells = sorted(forward_cells, key=lambda cell: math.dist(start, cell), reverse=True)
+        preferred = [cell for cell in cells if min_dist <= math.dist(start, cell) <= max_dist]
+        candidates = [cell for cell in cells if 0 < math.dist(start, cell) <= max_dist]
+        return self._select_walk_point(preferred, candidates, start, ground_point)
+
+    def _visual_walk_retry_active(self, now):
+        failure = self._last_visual_failure
+        return bool(failure and failure[0] == self.feed.world.map and now - failure[3] <= 1.5)
+
+    def _select_walk_point(self, preferred, candidates, position, ground_point):
+        terrain = getattr(self.feed, "terrain", None)
+        gat = terrain.cached_gats.get(self.feed.world.map) if terrain else None
+        if gat is None:
+            return next(((cell, point) for cell in preferred if (point := ground_point(cell))), None)
+
+        def clearance(cell):
+            return gat.wall_clearance(*cell)
+
+        now = time.monotonic()
+        h_player = gat.cell_height_at(*position)
+        short_only = self._plateau_short_step_until > now
+
+        def same_plateau_short_cells():
+            px, py = int(round(position[0])), int(round(position[1]))
+            nearby = [
+                c for c in self._patrol_cells_in_radius(px, py, 4)
+                if 2.0 <= math.dist(position, c) <= 4.0
+                and gat.is_walkable(*c)
+                and abs(gat.cell_height_at(*c) - h_player) <= 8.5
+            ]
+            nearby.sort(key=lambda c: (-clearance(c), math.dist(position, c)))
+            return nearby
+
+        if short_only:
+            for cell in same_plateau_short_cells():
+                if point := ground_point(cell):
+                    return cell, point
+
+        retry = self._visual_walk_retry_active(now)
+        short = []
+        if retry:
+            short = sorted((cell for cell in candidates if 2 <= math.dist(position, cell) <= 5),
+                           key=clearance, reverse=True)
+        ideal = preferred[:1] if preferred and clearance(preferred[0]) >= 2 else []
+        alternatives = sorted((cell for cell in candidates if 3 <= math.dist(position, cell) <= 9),
+                              key=clearance, reverse=True)
+        for cell in dict.fromkeys([*short, *ideal, *alternatives, *preferred]):
+            if point := ground_point(cell):
+                return cell, point
+        for cell in same_plateau_short_cells():
+            if point := ground_point(cell):
                 return cell, point
         return None
 
+    def _check_visual_walk(self):
+        probe = self._visual_walk_probe
+        if probe is None:
+            return
+        map_id, cell, point = probe["map"], probe["cell"], probe["point"]
+        origin, queued_at = probe["origin"], probe["queued_at"]
+        world = self.feed.world
+        moved = False
+        last_walk_pkt = None
+        with world.lock:
+            invalid = world.map != map_id or world.is_map_loading or world.player is None
+            if not invalid:
+                last_walk_pkt = getattr(world, "last_walk_pkt", None)
+                moved = (max(world.last_move_ts, world.last_player_move_pkt_time) >= queued_at
+                         or math.dist(world.player.cell(), origin) >= 0.4)
+        if not invalid and last_walk_pkt is not None:
+            pkt_map, dest_cell, pkt_ts = last_walk_pkt
+            if pkt_map == map_id and pkt_ts >= queued_at:
+                terrain = getattr(self.feed, "terrain", None)
+                gat = (terrain.cached_gats.get(map_id) or terrain.for_map(map_id)) if terrain else None
+                if gat is not None:
+                    px, py = int(round(origin[0])), int(round(origin[1]))
+                    dx, dy = int(dest_cell[0]), int(dest_cell[1])
+                    height_jump = abs(gat.cell_height_at(dx, dy) - gat.cell_height_at(px, py)) > 8.5
+                    actual_path = gat.find_path((px, py), (dx, dy), prefer_clearance=False)
+                    expected_len = probe.get("expected_path_len", max(1, int(round(math.dist(origin, cell))) + 1))
+                    if height_jump or not actual_path or len(actual_path) > expected_len + 12:
+                        now = time.monotonic()
+                        self._visual_walk_probe = None
+                        self.visual_occluded_cells = {
+                            key: expiry for key, expiry in self.visual_occluded_cells.items()
+                            if expiry > now
+                        }
+                        self.visual_occluded_cells[(map_id, cell)] = now + 12.0
+                        self._last_visual_failure = (map_id, point, queued_at, now)
+                        self._plateau_short_step_until = now + 2.0
+                        self._click_debug(
+                            f"[Movimento] Oclusão 3D via pacote 0x035F/0x0085: destino ({dx}, {dy}) "
+                            f"para alvo {cell}; usando passo curto no platô."
+                        )
+                        return
+        if invalid or moved or not self._is_game_focused():
+            self._visual_walk_probe = None
+            return
+        now = time.monotonic()
+        if probe["finished_at"] is None:
+            result = getattr(self, "_last_touch_result", None)
+            if result is None or result[0] != point or result[1] < queued_at:
+                if now - queued_at > 2.0:
+                    self._visual_walk_probe = None
+                return
+            if not result[2]:
+                self._visual_walk_probe = None
+                return
+            probe["finished_at"] = result[1]
+        if now - probe["finished_at"] >= 0.30:
+            self._visual_walk_probe = None
+            self.visual_occluded_cells = {key: expiry for key, expiry in self.visual_occluded_cells.items()
+                                          if expiry > now}
+            self.visual_occluded_cells[(map_id, cell)] = now + 12.0
+            self._last_visual_failure = (map_id, point, queued_at, now)
+            self._click_debug(f"[Movimento] Célula {cell} sem resposta ao clique por 300 ms.")
+
+    def _visual_walk_failed(self, point, clicked_at):
+        failure = self._last_visual_failure
+        return bool(failure and failure[0] == self.feed.world.map and failure[1] == point
+                    and 0.0 <= failure[2] - clicked_at <= 1.0)
+
     def _walk_step_result(self, world, position, previous, point, clicked_at, now):
+        if self._visual_walk_failed(point, clicked_at):
+            return "stalled"
         if world._is_player_walking():
             return "waiting"
         advanced = (tuple(map(round, position)) != tuple(map(round, previous))
@@ -9278,11 +9543,12 @@ class Overlay:
             return "waiting"
         return "stalled"
 
-    def _walk_ground_point(self, gat, position, cell, blocked, resolve):
+    def _walk_ground_point(self, gat, position, cell, blocked, resolve, *, portal=None):
         world = getattr(self.feed, "world", None)
         map_name = world.map if world else None
-        if (cell not in blocked and gat.is_walkable(*cell)
-                and (not map_name or cell not in self._entity_occupied_cells(map_name))
+        if (self.visual_occluded_cells.get((map_name, cell), 0.0) <= time.monotonic()
+                and cell not in blocked and gat.is_walkable(*cell)
+                and (not map_name or cell not in self._entity_occupied_cells(map_name, allowed_portal=portal))
                 and not self._segment_hits_obstacle(*position, *cell, blocked)
                 and self._has_gat_line_of_sight(*position, *cell, gat)
                 and abs(gat.get_elevation(*position) - gat.get_elevation(*cell)) <= 16):
@@ -9291,83 +9557,61 @@ class Overlay:
 
     def _pick_walk_stride(self, path, position, blocked, ground_point, *, min_dist=0.0):
         start = tuple(map(round, position))
-        candidates = sorted(((math.dist(position, cell), index, cell)
-                             for index, cell in enumerate(path) if cell != start), reverse=True)
-        for distance, _, cell in candidates:
-            if not min_dist < distance <= 14 or self._segment_hits_obstacle(*position, *cell, blocked):
-                continue
-            if point := ground_point(cell):
-                return cell, point
-        return None
+        forward_path = self._filter_forward_path(path, position)
+        candidates = [cell for cell in reversed(forward_path) if cell != start and math.dist(position, cell) <= 14
+                      and not self._segment_hits_obstacle(*position, *cell, blocked)]
+        preferred = [cell for cell in candidates if math.dist(position, cell) > min_dist]
+        return self._select_walk_point(preferred, candidates, position, ground_point)
 
 
-    def _prune_patrol_path(self, path, px, py, cur_cell, *, roaming=False):
-        """Avança a rota apenas para frente, descartando pontos já passados, atrás do sentido ou muito próximos."""
+    def _prune_patrol_path(self, path, px, py, cur_cell):
+        """Descarta apenas o prefixo até uma célula confirmada no corredor local."""
         if not path:
             return [], float("inf")
-        closest_idx = 0
-        min_dist_to_path = float("inf")
-        for i, (cx, cy) in enumerate(path):
-            d = math.hypot(px - cx, py - cy)
-            if d < min_dist_to_path:
-                min_dist_to_path = d
-                closest_idx = i
+        local_path = path[:16]
+        if cur_cell in local_path:
+            return path[local_path.index(cur_cell) + 1:], math.dist((px, py), cur_cell)
+        distance = min(math.dist((px, py), cell) for cell in local_path)
+        return path, distance
 
-        # Só avança para frente na lista de waypoints quando o jogador acompanha a rota.
-        if closest_idx > 0 and min_dist_to_path <= 4.0:
-            path = path[closest_idx:]
-        else:
-            path = list(path)
-
-        hx, hy = self._patrol_heading
-        has_heading = roaming and (hx != 0.0 or hy != 0.0)
-        while path:
-            c0 = path[0]
-            if c0 == cur_cell:
-                path.pop(0)
-                continue
-            dist0 = math.hypot(px - c0[0], py - c0[1])
-            if roaming and dist0 <= 2.5:
-                path.pop(0)
-                continue
-            if len(path) >= 2 and dist0 <= 4.0:
-                c1 = path[1]
-                seg_x, seg_y = c1[0] - c0[0], c1[1] - c0[1]
-                if (px - c0[0]) * seg_x + (py - c0[1]) * seg_y >= 0.0:
-                    path.pop(0)
-                    continue
-            if has_heading and len(path) >= 2 and dist0 <= 3.5:
-                if (c0[0] - px) * hx + (c0[1] - py) * hy < 0.0:
-                    path.pop(0)
-                    continue
-            break
-        return path, min_dist_to_path
-
-    def _pick_walk_retry(self, path, position, target, ground_point, *, previous_point=None, radius=2):
+    def _pick_walk_retry(self, path, position, target, ground_point, *, previous_point=None, radius=2,
+                         min_dist=1.0):
         start = tuple(map(round, position))
 
+        if self._visual_walk_retry_active(time.monotonic()):
+            terrain = getattr(self.feed, "terrain", None)
+            gat = terrain.cached_gats.get(self.feed.world.map) if terrain else None
+            nearby = sorted(
+                (cell for cell in self._patrol_cells_in_radius(*start, 5)
+                 if cell != target and 2 <= math.dist(position, cell) <= 5),
+                key=lambda cell: (-(gat.wall_clearance(*cell) if gat else 0), math.dist(cell, target)),
+            )
+            for cell in nearby:
+                if point := ground_point(cell):
+                    return cell, point
+
         def alternate(cell):
-            if math.dist(position, cell) < 1.0:
+            if not min_dist <= math.dist(position, cell) <= 14:
                 return None
             point = ground_point(cell)
             if point and (previous_point is None or math.dist(point, previous_point) >= 4):
                 return point
             return None
 
-        nearby = sorted(self._patrol_cells_in_radius(*target, 2),
-                        key=lambda cell: (math.dist(target, cell), math.dist(start, cell)))
-        for cell in nearby:
+        angle = math.atan2(position[1] - target[1], position[0] - target[0])
+        nearby = dict.fromkeys(
+            (target[0] + round(dist * math.cos(angle + i * math.pi / 4)),
+             target[1] + round(dist * math.sin(angle + i * math.pi / 4)))
+            for dist in (1, 2) for i in range(8)
+        )
+        for cell in sorted(nearby, key=lambda cell: (-math.dist(position, cell), math.dist(target, cell))):
             if (cell != target or previous_point is None) and (point := alternate(cell)):
                 return cell, point
-        if stride := self._pick_long_stride_cell(path, 2.2, 8, position=position, ground_point=alternate):
+        if stride := self._pick_long_stride_cell(path, max(2.2, min_dist), 14,
+                                                 position=position, ground_point=alternate):
             return stride
         neighbors = sorted(self._patrol_cells_in_radius(*start, radius), key=lambda cell: math.dist(cell, target))
         return next(((cell, point) for cell in neighbors if cell != target and (point := alternate(cell))), None)
-
-    @staticmethod
-    def _movement_confirmed(world, clicked_at, position, start):
-        return (world.last_player_move_pkt_time >= clicked_at
-                or tuple(map(round, position)) != tuple(map(round, start)))
 
     @staticmethod
     def _retry_lateral_cells(failed, start):
@@ -9419,39 +9663,6 @@ class Overlay:
                 self._patrol_scanned_ts[cell] = now
         return gat
 
-    def _get_patrol_wall_clearance(self, map_id, gat):
-        cached = self._patrol_wall_clearance.get(map_id)
-        if cached and cached[0] is gat:
-            return cached[1:]
-
-        width = gat.width + 2
-        height = gat.height + 2
-        distances = bytearray(width * height)
-        for y in range(1, height - 1):
-            offset = y * width
-            distances[offset + 1:offset + width - 1] = bytes(
-                4 if gat.is_walkable(x, y - 1) else 0 for x in range(gat.width)
-            )
-
-        # A borda preenchida com zero conta como parede. As duas passagens incluem diagonais.
-        for y in range(1, height - 1):
-            for i in range(y * width + 1, (y + 1) * width - 1):
-                if distances[i]:
-                    distances[i] = min(distances[i], 1 + min(
-                        distances[i - 1], distances[i - width - 1],
-                        distances[i - width], distances[i - width + 1],
-                    ))
-        for y in range(height - 2, 0, -1):
-            for i in range((y + 1) * width - 2, y * width, -1):
-                if distances[i]:
-                    distances[i] = min(distances[i], 1 + min(
-                        distances[i + 1], distances[i + width - 1],
-                        distances[i + width], distances[i + width + 1],
-                    ))
-        minimum = 1 if max(distances) < 2 else 2
-        self._patrol_wall_clearance[map_id] = (gat, distances, width, minimum)
-        return distances, width, minimum
-
     @staticmethod
     def _patrol_sector(cell):
         return cell[0] // 12, cell[1] // 12
@@ -9468,18 +9679,11 @@ class Overlay:
         return 1 if alignment >= -0.30 else 2
 
     def _choose_patrol_waypoint(self, map_id, gat, position, blocked, penalties, now):
-        distances, width, minimum = self._get_patrol_wall_clearance(map_id, gat)
         center = tuple(map(round, position))
         unexplored = []
         revisits = []
-        wall_costs = {}
-
-        def clearance_at(cell):
-            x, y = cell
-            return distances[(y + 1) * width + x + 1]
-
         def available(cell):
-            return (clearance_at(cell) >= minimum and cell not in blocked
+            return (gat.is_walkable(*cell) and cell not in blocked
                     and now - self._patrol_finished_ts.get(cell, -math.inf) > 18
                     and now >= self._patrol_unreachable_until.get(cell, 0.0))
 
@@ -9487,9 +9691,7 @@ class Overlay:
             x, y = cell
             if not (0 <= x < gat.width and 0 <= y < gat.height):
                 continue
-            clearance = clearance_at(cell)
-            if clearance == 1 and minimum == 2:
-                wall_costs[cell] = 8
+            clearance = gat.wall_clearance(*cell)
             distance = math.dist(position, cell)
             if not 10.0 <= distance <= 48 or not available(cell):
                 continue
@@ -9498,11 +9700,11 @@ class Overlay:
             turn = self._patrol_turn(center, cell)
             preferred_distance = not 18 <= distance <= 48, abs(distance - 32)
             if cell not in self._patrol_scanned_ts:
-                score = (turn, visited_at > now - 35, clearance < 3, *preferred_distance)
+                score = (clearance < 2, turn, visited_at > now - 35, clearance < 3, *preferred_distance)
                 unexplored.append((score, cell))
             else:
                 scanned_at = self._patrol_scanned_ts[cell]
-                score = (max(visited_at, scanned_at) > now - 35, turn, visited_at,
+                score = (clearance < 2, max(visited_at, scanned_at) > now - 35, turn, visited_at,
                          scanned_at, clearance < 3, *preferred_distance)
                 revisits.append((score, cell))
 
@@ -9517,7 +9719,7 @@ class Overlay:
                 attempts_by_sector[sector] += 1
                 budget -= 1
                 path = gat.find_path(center, cell, blocked_cells=blocked,
-                                     penalty_cells=penalties, cell_costs=wall_costs, max_iterations=2500)
+                                     penalty_cells=penalties, max_iterations=2500)
                 if len(path) > 1 and path[-1] == cell:
                     first_leg = path[min(len(path) - 1, 6)]
                     if self._patrol_turn(center, first_leg) < 2:
@@ -9538,7 +9740,7 @@ class Overlay:
             # Procura uma fronteira alcançável além da área local, inclusive atrás de curvas.
             self._patrol_frontier_retry_at = now + 3.0
             path = gat.find_path(
-                center, None, blocked_cells=blocked, penalty_cells=penalties, cell_costs=wall_costs, max_iterations=14000,
+                center, None, blocked_cells=blocked, penalty_cells=penalties, max_iterations=14000,
                 goal_test=lambda cell: (cell not in self._patrol_scanned_ts
                                         and math.dist(center, cell) >= 6 and available(cell)),
             )
@@ -9546,11 +9748,15 @@ class Overlay:
                 return path[-1], path
         return reachable(revisits)
 
+    def _defer_directed_replan(self, now):
+        self._directed_failures = min(4, self._directed_failures + 1)
+        self._directed_replan_at = now + 0.5 * 2 ** (self._directed_failures - 1)
+
     def _try_auto_patrol(self, snapshot, px, py):
         """Auto-Patrol: patrulha mapa por A*, calculando sub-passos a 8-11 células e clicando via movimento relativo."""
         if not snapshot or not hasattr(self.feed, "world"):
             return
-        if min(px, py) <= 0:
+        if min(px, py) < 0:
             self._click_debug("PATROL bloqueado: coordenadas do personagem indisponíveis.")
             return
 
@@ -9558,7 +9764,21 @@ class Overlay:
             self._click_debug("PATROL bloqueado: combate ou coleta em andamento.")
             return
         world = self.feed.world
+        interaction = self._patrol_interaction
+        if (self.patrol_target_route and not self.nav_goal
+                and travel_map_group(self.patrol_target_route[0]) != travel_map_group(snapshot.map)):
+            self._clear_patrol_route()
+            self._reset_patrol(px, py)
+            return
+        if interaction and interaction[0] != self.patrol_target_route:
+            self._patrol_interaction = interaction = None
         if world.npc_dialog_active or world.npc_dialog.get("open"):
+            if interaction:
+                dialog = world.npc_dialog
+                raw_gid = dialog.get("npc_gid")
+                if world.aid_to_gid.get(raw_gid, raw_gid) == interaction[0][3]:
+                    self._clear_patrol_route()
+                    self._reset_patrol(px, py)
             self._click_debug("PATROL bloqueado: diálogo de NPC aberto.")
             return
         if self._automation_click_active():
@@ -9580,7 +9800,7 @@ class Overlay:
                 self._click_debug("PATROL bloqueado: aguardando nova busca por waypoint.")
                 return
             self._patrol_no_wp_cooldown = 0.0
-        if now < getattr(self, "_map_stabilize_until", 0.0):
+        if now < max(self._map_stabilize_until, self._directed_replan_at):
             return
         cur_cell = (int(round(px)), int(round(py)))
 
@@ -9607,25 +9827,35 @@ class Overlay:
                        and isinstance(directed_route[3], int) else None)
         blocked, penalties = self._navigation_obstacles(curr_map, gat, portal=allowed_portal, npc=allowed_npc)
 
-        def click_patrol_ground(cell, point, *, sprite=False, finish_interaction=False, hover_reset=False):
+        def click_patrol_ground(cell, point, *, sprite=False, hover_reset=False):
             if self._patrol_combat_or_loot_pending(snapshot):
                 return False
             goal = self.nav_goal
             route = self.patrol_target_route
 
             def aim(_lead):
-                route_matches = (self.patrol_target_route == route
-                                 or (finish_interaction and self.patrol_target_route is None))
                 if (world.map != curr_map or not self._hud_can_run() or self.nav_goal != goal
-                        or not route_matches or not (goal or route or self.auto_patrol)
+                        or self.patrol_target_route != route or not (goal or route or self.auto_patrol)
                         or world.npc_dialog_active or world.npc_dialog.get("open")
-                        or self._client_combat_blocks_ground(world, curr_map)):
+                        or (not (goal or route) and self._client_combat_blocks_ground(world, curr_map))):
                     return None
-                return point
+                if not sprite:
+                    return point
+                with world.lock:
+                    npc = world.entity("npc", allowed_npc)
+                    if not npc:
+                        return None
+                    current = npc.track.cell()
+                    player = world.player.cell() if world.player else (px, py)
+                project_now = self.feed.camera.projector(
+                    snapshot.viewport, getattr(self.feed, "_cam", None) or player, gat.get_elevation)
+                u, v = project_now(*current, 5.5)
+                return left + int(u * width), top + int(v * height)
 
             return self._navigation_click(snapshot, gat, cell, point, hwnd=target_hwnd, target_point=aim,
                                           portal=allowed_portal, npc=allowed_npc, ground=not sprite,
-                                          retry_key=(curr_map, "ground", cell), hover_reset=hover_reset)
+                                          retry_key=(curr_map, allowed_npc if sprite else "ground", cell),
+                                          hover_reset=hover_reset)
 
         # ── Helper de projeção (definido antes de qualquer uso) ──
         viewport = snapshot.viewport
@@ -9641,8 +9871,9 @@ class Overlay:
             ng_map, ng_x, ng_y = nav
             norm_ng = ng_map.lower().removesuffix(".gat").removesuffix(".rsw")
             if curr_map == norm_ng:
-                goal = self._resolve_walkable_cell(
-                    gat, ng_x, ng_y, max_radius=15 if minimap else 3, forbidden_cells=blocked)
+                requested = ng_x, ng_y
+                goal = requested if minimap else self._resolve_walkable_cell(
+                    gat, *requested, max_radius=3, forbidden_cells=blocked)
                 dist_ng = math.dist((px, py), goal) if goal else float("inf")
                 is_manual = (getattr(self, "manual_nav_goal", None) is not None)
                 reach_thresh = 0.75 if minimap else 1.5 if is_manual else 2.0
@@ -9660,7 +9891,8 @@ class Overlay:
                     not goal
                     or not self._active_nav_path
                     or self._active_nav_goal != goal_key
-                    or not self._advance_locked_nav_waypoint((px, py), blocked, now, cur_cell)
+                    or (self._last_patrol_click_target is None
+                        and not self._advance_locked_nav_waypoint((px, py), blocked, now, cur_cell))
                 )
                 if not goal:
                     ng_path = []
@@ -9669,8 +9901,11 @@ class Overlay:
                         ng_path = self._find_minimap_path(gat, cur_cell, goal, blocked, penalties)
                     else:
                         ng_path = gat.find_path(cur_cell, goal, blocked_cells=blocked, penalty_cells=penalties)
-                    if ng_path:
+                    if ng_path and ng_path[-1] == goal:
+                        self._directed_replan_at = 0.0
                         self._set_locked_nav_path(ng_path, goal_key, (px, py), now)
+                    else:
+                        ng_path = []
                 else:
                     ng_path = self._active_nav_path
                 if ng_path:
@@ -9681,6 +9916,7 @@ class Overlay:
                 else:
                     self._reset_patrol(px, py)
                     self._clear_locked_nav_path()
+                    self._defer_directed_replan(now)
                     self._click_debug(f"PATROL bloqueado: A* sem rota até {(ng_x, ng_y)}.")
                     return
                 # Depois deixa a lógica de execução do caminho abaixo tomar conta
@@ -9702,6 +9938,9 @@ class Overlay:
         resolve = self._safe_click_resolver(
             snapshot, project, allowed_portal=allowed_portal, allowed_npc=allowed_npc)
 
+        def ground_point(cell):
+            return self._walk_ground_point(gat, (px, py), cell, blocked, resolve, portal=allowed_portal)
+
         # ── Suporte a Rotas de Destino: (map_name, x, y, target_npc_or_warp) ──
         if self.patrol_target_route:
             r_map, r_x, r_y, r_target = self.patrol_target_route
@@ -9710,35 +9949,59 @@ class Overlay:
                 dist_to_route = math.hypot(px - r_x, py - r_y)
                 interact_dist = 3.8 if r_target else 2.5
                 if dist_to_route <= interact_dist and self._last_patrol_click_target is None:
-                    item = next((obj for obj in snapshot.objects
-                                 if obj.kind in ("npc", "warp") and obj.key.partition(":")[2] == str(r_target)),
-                                None)
-                    if r_target == "warp" or item:
-                        target = r_x, r_y
-                        step = self._navigation_target_step(gat, (px, py), target, (item.u, item.v) if item else None,
-                                                            resolve, blocked, penalties)
-                        if step:
-                            cell, point, direct = step
-                            finish = bool(direct and item and allowed_portal is None)
-                            if click_patrol_ground(cell, point, sprite=direct and item is not None,
-                                                   finish_interaction=finish):
-                                if finish:
-                                    self._hud_npc_line_target = (item.key, curr_map, now + 0.950)
-                                    self.patrol_target_route = None
-                                    self._reset_patrol(px, py)
-                                elif not direct:
-                                    self._last_patrol_click_target = (now, px, py, *cell, *point, 0)
-                        elif item and self._is_point_in_game_ui(
-                            left + int(item.u * width), top + int(item.v * height)
-                        ):
-                            self._side_step_to_reveal(target, px, py, from_patrol=True)
+                    if not r_target:
+                        self._clear_patrol_route()
+                        self._reset_patrol(px, py)
                         return
-                    self._click_debug(f"PATROL: Destino da rota alcançado ({r_x}, {r_y})")
-                    self.patrol_target_route = None
-                    self._reset_patrol(px, py)
-
-        def ground_point(cell):
-            return self._walk_ground_point(gat, (px, py), cell, blocked, resolve)
+                    if world._is_player_walking():
+                        return
+                    attempts = 0
+                    if interaction and interaction[0] == self.patrol_target_route:
+                        _, clicked_at, last_point, attempts = interaction
+                        if (not self._touch_click_aborted(last_point, clicked_at)
+                                and now - self._touch_click_finished_at(last_point, clicked_at) < 1.5):
+                            return
+                        if attempts >= 3 and not self._city_travel_state:
+                            self._click_debug(f"PATROL: Interação em {(r_x, r_y)} sem confirmação.")
+                            self._clear_patrol_route()
+                            self._reset_patrol(px, py)
+                            return
+                    target = r_x, r_y
+                    npc_item = next((obj for obj in snapshot.objects if obj.key == f"npc:{r_target}"), None)
+                    uv = (npc_item.u, npc_item.v) if npc_item else None
+                    if allowed_portal is not None:
+                        if cur_cell == target:
+                            fallback = self._pick_walk_retry((), (px, py), target, ground_point)
+                            if fallback and click_patrol_ground(*fallback):
+                                cell, point = fallback
+                                self._last_patrol_click_target = (now, px, py, *cell, *point, 0)
+                            return
+                        step = self._navigation_target_step(gat, (px, py), target, None, resolve, blocked, penalties)
+                    elif uv is not None:
+                        step = self._navigation_target_step(gat, (px, py), target, uv, resolve, blocked, penalties)
+                    else:
+                        step = None
+                    if step:
+                        cell, point, direct = step
+                        if click_patrol_ground(cell, point, sprite=direct and npc_item is not None,
+                                               hover_reset=direct and attempts == 1):
+                            if direct:
+                                if npc_item:
+                                    self._hud_npc_line_target = (npc_item.key, curr_map, now + 2.0)
+                                self._patrol_interaction = (self.patrol_target_route, now, point, attempts + 1)
+                            else:
+                                self._last_patrol_click_target = (now, px, py, *cell, *point, 0)
+                        return
+                    if npc_item:
+                        self._side_step_to_reveal(target, px, py, from_patrol=True)
+                        return
+                    if allowed_npc is not None:
+                        self._defer_directed_replan(now)
+                        return
+                    if allowed_portal is None:
+                        self._clear_patrol_route()
+                        self._reset_patrol(px, py)
+                        return
 
         route_target = self.patrol_target_route and curr_map == self.patrol_target_route[0].lower().removesuffix(".gat")
         roaming = not route_target and self.nav_goal is None
@@ -9754,56 +10017,43 @@ class Overlay:
                     and math.dist((px, py), (gx, gy)) <= 3.5
                     and (not self.current_waypoint or math.dist((px, py), self.current_waypoint) > 5.0)
                 )
-                if not can_chain:
+                if can_chain:
+                    result = "moved"
+                elif now - clicked_at >= 0.8:
+                    result = "moved" if math.dist((px, py), (last_x, last_y)) >= 0.8 else "stalled"
+                else:
                     self._click_debug("PATROL bloqueado: aguardando confirmação do passo anterior.")
                     return
-                result = "moved"
             if result == "moved":
                 self._last_patrol_click_target = None
+                self._directed_failures = 0
                 dx, dy = px - last_x, py - last_y
                 distance = math.hypot(dx, dy)
                 if roaming and attempts == 0 and distance >= 2.5:
                     self._patrol_heading = dx / distance, dy / distance
             else:
-                self.temp_blocked_cells[failed] = now + 25.0
-                blocked.add(failed)
+                if attempts == 0 and (point := ground_point(failed)):
+                    if click_patrol_ground(failed, point, hover_reset=True):
+                        self._last_patrol_click_target = (now, px, py, *failed, *point, 1)
+                    return
                 if attempts < 2 and self.current_patrol_path:
-                    retry = self._pick_walk_stride(
-                        self.current_patrol_path[:15], (px, py), blocked, ground_point,
-                        min_dist=2.5 if roaming else 0.0,
+                    retry = self._pick_walk_retry(
+                        self.current_patrol_path[:16], (px, py), failed, ground_point, previous_point=(sx, sy),
                     )
-                    if retry is None:
-                        retry = self._pick_walk_retry(
-                            self.current_patrol_path, (px, py), failed, ground_point, previous_point=(sx, sy),
-                        )
-                    min_retry_dist = 2.5001 if roaming else 2.0
-                    if retry and math.dist((px, py), retry[0]) >= min_retry_dist:
+                    if retry:
                         cell, point = retry
-                        retry_hover = (attempts >= 1 and not world._is_player_walking()
-                                       and not self._touch_click_aborted((sx, sy), clicked_at))
-                        if click_patrol_ground(cell, point, hover_reset=retry_hover):
+                        if click_patrol_ground(cell, point):
                             self._current_patrol_sub_step = cell
-                            self._last_patrol_click_target = (now, px, py, *cell, *point, attempts + 1)
+                            self._last_patrol_click_target = (now, px, py, *cell, *point, 2)
                             self._click_debug(f"PATROL: Sem avanço para {failed}. Tentando {cell}.")
                         return
+                self.temp_blocked_cells[failed] = now + 12.0
                 self._last_patrol_click_target = None
                 self._current_patrol_sub_step = None
-                if self.current_waypoint:
-                    recalc = gat.find_path(cur_cell, self.current_waypoint, blocked_cells=blocked, penalty_cells=penalties)
-                    if recalc and (not roaming or recalc[-1] == self.current_waypoint):
-                        self.current_patrol_path = recalc
-                        self.active_nav_path = list(recalc)
-                        self._click_debug(f"PATROL: Desviando de {failed} mantendo destino {self.current_waypoint}.")
-                    else:
-                        if roaming:
-                            self._patrol_unreachable_until[self.current_waypoint] = now + 25.0
-                        self._reset_patrol(px, py)
-                        self.active_nav_path = None
-                        self._click_debug("PATROL: Sem avanço após tentativas. Recalculando a rota.")
-                else:
-                    self._reset_patrol(px, py)
-                    self.active_nav_path = None
-                    self._click_debug("PATROL: Sem avanço após tentativas. Recalculando a rota.")
+                self.current_patrol_path = []
+                self._clear_locked_nav_path()
+                self._directed_replan_at = now + 0.35
+                return
 
         if world._is_player_walking():
             current_sub = getattr(self, "_current_patrol_sub_step", None)
@@ -9840,9 +10090,7 @@ class Overlay:
                 if next_wp:
                     self.current_waypoint = next_wp
                     self._patrol_no_wp_cooldown = 0.0
-                    if minimap:
-                        next_path = self._find_minimap_path(gat, cur_cell, next_wp, blocked, penalties)
-                    elif next_path is None:
+                    if next_path is None:
                         next_path = gat.find_path((px, py), next_wp, blocked_cells=blocked, penalty_cells=penalties)
                     self.current_patrol_path = next_path or []
                     self.active_nav_path = list(self.current_patrol_path)
@@ -9871,6 +10119,7 @@ class Overlay:
                             self._patrol_no_wp_cooldown = now + 0.35
                         else:
                             self._reset_patrol(px, py)
+                            self._defer_directed_replan(now)
                         self._clear_locked_nav_path()
                         self._click_debug(f"PATROL bloqueado: A* sem rota até {self.current_waypoint}.")
                         return
@@ -9880,7 +10129,7 @@ class Overlay:
                 # ── Detecção e Poda Precisa de Avanço na Rota ──
                 if self.current_patrol_path:
                     pruned, min_dist_to_path = self._prune_patrol_path(
-                        self.current_patrol_path, px, py, cur_cell, roaming=roaming,
+                        self.current_patrol_path, px, py, cur_cell,
                     )
                     self.current_patrol_path = pruned
 
@@ -9890,7 +10139,7 @@ class Overlay:
                                                  blocked_cells=blocked, penalty_cells=penalties)
                         if recalc_p and (not roaming or recalc_p[-1] == self.current_waypoint):
                             pruned_recalc, _ = self._prune_patrol_path(
-                                recalc_p, px, py, cur_cell, roaming=roaming,
+                                recalc_p, px, py, cur_cell,
                             )
                             self.current_patrol_path = pruned_recalc
                             self.active_nav_path = list(pruned_recalc)
@@ -9936,6 +10185,11 @@ class Overlay:
                         continue
 
             if stride is None:
+                stride = self._pick_walk_stride(self.current_patrol_path[:16], (px, py), blocked, ground_point)
+            if stride is None and not roaming and self.current_waypoint:
+                step = self.current_patrol_path[min(4, len(self.current_patrol_path) - 1)]
+                stride = self._pick_walk_retry(self.current_patrol_path[:16], (px, py), step, ground_point)
+            if stride is None:
                 if roaming:
                     if self.current_waypoint:
                         self._patrol_unreachable_until[self.current_waypoint] = now + 12.0
@@ -9947,8 +10201,9 @@ class Overlay:
                     self._click_debug("PATROL bloqueado: nenhum passo caminhável pode ser clicado no viewport.")
                     return
                 self._click_debug("PATROL bloqueado: nenhum passo caminhável pode ser clicado no viewport.")
+                self._clear_locked_nav_path()
                 self._reset_patrol(px, py)
-                self.active_nav_path = None
+                self._defer_directed_replan(now)
                 return
             break
 
@@ -10045,7 +10300,7 @@ class Overlay:
         for (kind, entity_id), entity in entities:
             if entity.is_portal:
                 portals.add(tuple(map(round, entity.track.target)))
-            elif kind == "npc" or entity.objecttype in (1, 6) or entity.is_kafra:
+            elif kind == "npc" or entity.objecttype in (1, 6) or entity.is_kafra or entity.has_vending_shop:
                 cell = tuple(map(round, entity.track.target))
                 if entity_id == allowed_target_id:
                     allowed_cells.add(cell)
@@ -10166,12 +10421,17 @@ class Overlay:
                     else:
                         penalty_cells[cell] = max(cost, penalty_cells.get(cell, 0.0))
 
-        if block_portals:
-            for box in self._portal_boxes(map_name, gat, portals, allowed_portal_cell).values():
-                add_box(box, 2, 6.0)
         world = getattr(self.feed, "world", None)
         player_cell = (tuple(map(round, world.player.cell()))
                        if world is not None and world.map == map_name and world.player else None)
+        if block_portals:
+            for center, box in self._portal_boxes(map_name, gat, portals, allowed_portal_cell).items():
+                x1, y1, x2, y2 = box
+                if player_cell and x1 <= player_cell[0] <= x2 and y1 <= player_cell[1] <= y2:
+                    # A chegada pelo portal deve permitir sair da zona de entrada.
+                    add_box((*center, *center), max(x2 - x1, y2 - y1), 8.0)
+                else:
+                    add_box(box, 2, 6.0)
         for x, y in npcs:
             # Se o personagem já estiver na zona, o A* pode sair dela.
             # O resolvedor de cliques continua protegendo os nove destinos.
@@ -10179,20 +10439,6 @@ class Overlay:
             add_box((x - radius, y - radius, x + radius, y + radius), 1, 3.0)
         for cell in blocked_cells:
             penalty_cells.pop(cell, None)
-        self._unblock_allowed_npc_vicinity(
-            map_name, entities, gat, allowed_target_id, blocked_cells, portals, npcs,
-            penalty_cells=penalty_cells,
-        )
-
-        exempt_cells = set()
-        if self.current_waypoint:
-            exempt_cells.add((int(round(self.current_waypoint[0])), int(round(self.current_waypoint[1]))))
-        if self.nav_goal and len(self.nav_goal) >= 3:
-            exempt_cells.add((int(round(self.nav_goal[1])), int(round(self.nav_goal[2]))))
-        if self.patrol_target_route and len(self.patrol_target_route) >= 3:
-            exempt_cells.add((int(round(self.patrol_target_route[1])), int(round(self.patrol_target_route[2]))))
-
-        blocked_cells.difference_update(exempt_cells - self._npc_zone_cells(npcs))
         if player_cell is not None:
             blocked_cells.discard(player_cell)
 
@@ -10205,93 +10451,51 @@ class Overlay:
         with world.lock:
             return tuple(world.entity_items()) if world.map == map_name else ()
 
-    def _unblock_allowed_npc_vicinity(self, map_name, entities, gat, allowed_target_id, blocked_cells, portals=None,
-                                      npcs=None, penalty_cells=None):
-        """Libera a aproximação ao NPC alvo respeitando as zonas de outros NPCs e portais reais."""
-        if allowed_target_id is None:
-            return
-        allowed_cells = {
-            tuple(map(round, entity.track.target))
-            for (_, entity_id), entity in entities
-            if entity_id == allowed_target_id
-        }
-        if not allowed_cells:
-            return
-        if portals is None or npcs is None:
-            portals, npcs = self._navigation_centers(map_name, entities, allowed_target_id)
-        real_portals = set(portals)
-        npc_zone = self._npc_zone_cells(npcs)
-        for (x, y), _ in self._parsed_portal_guard_triggers(map_name):
-            real_portals.add((x, y))
-        for kx, ky in allowed_cells:
-            for dx in range(-3, 4):
-                for dy in range(-3, 4):
-                    if max(abs(dx), abs(dy)) < 1:
-                        continue
-                    cell = (kx + dx, ky + dy)
-                    if cell in npc_zone or cell in real_portals:
-                        continue
-                    if gat is None or gat.is_walkable(*cell):
-                        blocked_cells.discard(cell)
-                        if penalty_cells is not None:
-                            penalty_cells.pop(cell, None)
-
-    def _navigation_obstacles(self, map_name, gat, *, portal=None, npc=None, block_portals=None):
-        if block_portals is None:
-            in_kafra_or_travel = bool(
-                self._kafra_cycle
-                or self.travel_plan
-                or self._city_travel_state
-            )
-            in_patrol_or_farm = bool(self.auto_patrol or self.auto_farm)
-            block_portals = (
-                in_patrol_or_farm
-                and (not self._minimap_goal)
-                and (npc is None)
-                and (portal is None)
-                and (not in_kafra_or_travel)
-            )
+    def _navigation_obstacles(self, map_name, gat, *, portal=None, npc=None, block_portals=True):
         now = time.monotonic()
-        cache_key = (map_name, id(gat), portal, npc, block_portals)
-        cache = getattr(self, "_nav_obstacles_cache", None)
-        if cache and cache[0] == cache_key and now < cache[1]:
-            return set(cache[2]), dict(cache[3])
+            blocked = set(cache[2])
+            penalties = dict(cache[3])
+            world = getattr(self.feed, "world", None)
+            player_cell = None
+            if world is not None:
+                with world.lock:
+                    if world.player is not None:
+                        player_cell = tuple(map(round, world.player.cell()))
+            if player_cell is not None:
+                blocked.discard(player_cell)
+            return blocked, penalties
+
         entities = self._navigation_entities(map_name)
+        allowed_target_id = npc
+        allowed_portal_cell = portal if isinstance(portal, tuple) else None
         blocked, penalties = self._build_navigation_obstacles(
-            map_name, entities, gat, allowed_target_id=npc, allowed_portal_cell=portal,
-            block_portals=block_portals)
-        planned_blocks = blocked.copy()
-        blocked.update(cell for cell, until in tuple(self.temp_blocked_cells.items())
-                       if until > now and cell != portal)
-        for (kind, gid), ent in entities:
-            if kind == "npc" and not ent.is_portal and gid != npc and ent.avoid_until > now:
-                x, y = map(round, ent.track.target)
-                blocked.update(self._patrol_cells_in_radius(x, y, 4))
-        self._unblock_allowed_npc_vicinity(map_name, entities, gat, npc, blocked, penalty_cells=penalties)
-
-        exempt_cells = set()
-        world = getattr(self.feed, "world", None)
-        if world is not None and getattr(world, "player", None) is not None:
-            p_cell = world.player.cell()
-            if p_cell and None not in p_cell:
-                exempt_cells.add((int(round(p_cell[0])), int(round(p_cell[1]))))
-        if self.current_waypoint:
-            exempt_cells.add((int(round(self.current_waypoint[0])), int(round(self.current_waypoint[1]))))
-        if self.nav_goal and len(self.nav_goal) >= 3:
-            exempt_cells.add((int(round(self.nav_goal[1])), int(round(self.nav_goal[2]))))
-        if self.patrol_target_route and len(self.patrol_target_route) >= 3:
-            exempt_cells.add((int(round(self.patrol_target_route[1])), int(round(self.patrol_target_route[2]))))
-
-        blocked.difference_update(exempt_cells - planned_blocks)
-
+            map_name, entities, gat,
+            allowed_target_id=allowed_target_id,
+            allowed_portal_cell=allowed_portal_cell,
+            block_portals=block_portals,
+        )
+        # Adiciona células temporariamente bloqueadas (colisões recentes)
+        for cell, exp in list(self.temp_blocked_cells.items()):
+            if now < exp:
+                blocked.add(cell)
+                penalties.pop(cell, None)
         self._nav_obstacles_cache = (cache_key, now + 0.04, frozenset(blocked), dict(penalties))
+        # Remove célula do jogador para não bloquear o próprio movimento
+        world = getattr(self.feed, "world", None)
+        player_cell = None
+        if world is not None:
+            with world.lock:
+                if world.player is not None:
+                    player_cell = tuple(map(round, world.player.cell()))
+        if player_cell is not None:
+            blocked.discard(player_cell)
         return blocked, penalties
 
     def _is_intentional_warp(self, event, portal_ids):
         if self.travel_plan or self._city_travel_state or self._travel_allowed_portal or self._kafra_cycle:
             return True
         retreat = self._retreat_click
-        if retreat and retreat[-1]:
+        if retreat and retreat[4]:
             return True
         map_name = event["map"]
         recent = self._intentional_portal_click
@@ -10345,6 +10549,10 @@ class Overlay:
         self.nav_path = None
         self.nav_goal = None
         self._minimap_goal = None
+        self._minimap_path_request = None
+        self._directed_replan_at = 0.0
+        self._directed_failures = 0
+        self._patrol_interaction = None
         self.patrol_target_route = None
         if hasattr(self, "canvas_pool"):
             try:
@@ -10376,32 +10584,31 @@ class Overlay:
             self._send_game_key(0x1B)
         self.root.after(delay_ms, _fire)
 
-    def _update_map_stabilization(self, world, curr_m, now, *, loading=False):
+    def _update_map_stabilization(self, world, curr_m, now):
         """Aplica pausa breve de estabilização após transição de mapa ou map-server."""
-        if loading:
-            self._map_stabilize_until = max(self._map_stabilize_until, now + 0.75)
-            return
         transition_ts = getattr(world, "last_map_server_transition_ts", 0.0)
         if transition_ts > self._last_map_server_transition_ts:
             self._last_map_server_transition_ts = transition_ts
-            self._map_stabilize_until = max(self._map_stabilize_until, now + 0.75)
+            self._map_stabilize_until = max(self._map_stabilize_until, transition_ts + 0.75)
         arrival = getattr(world, "last_map_arrival", None)
         arrival_ts = arrival[2] if arrival and len(arrival) >= 3 else 0.0
         if arrival_ts > self._last_map_arrival_ts:
             self._last_map_arrival_ts = arrival_ts
-            self._map_stabilize_until = max(self._map_stabilize_until, now + 0.75)
+            self._map_stabilize_until = max(self._map_stabilize_until, arrival_ts + 0.75)
         if curr_m:
             if self._last_stabilized_map is not None and curr_m != self._last_stabilized_map:
-                self._map_stabilize_until = max(self._map_stabilize_until, now + 0.75)
+                if not world.last_map_ready_ts or now - world.last_map_ready_ts > 5.0:
+                    self._map_stabilize_until = max(self._map_stabilize_until, now + 0.75)
+                self.temp_blocked_cells.clear()
+                self._nav_obstacles_cache = None
+                self._last_patrol_click_target = None
+                self._current_patrol_sub_step = None
             self._last_stabilized_map = curr_m
 
     def _handle_map_change(self, new_map):
-        """Ao detectar troca de mapa (0x0091 / current_map != farm_map), atualiza rotas ou desativa farm."""
-        norm_new = str(new_map or "").lower().removesuffix(".gat").removesuffix(".rsw")
-        self._click_debug(f"MAPA ALTERADO ({self.farm_map} -> {new_map}): Desativando Auto-Farm e Auto-Patrol!")
-        self.auto_farm = False
-        self.auto_patrol = False
-        self.farm_map = None
+        """Descarta rotas e alvos do mapa anterior, preservando os modos ativos."""
+        self._click_debug(f"MAPA ALTERADO ({self.farm_map} -> {new_map}): reiniciando rotas e alvos.")
+        self.farm_map = new_map if self.auto_farm or self.auto_patrol else None
         self.retreat_origin_map = None
         self.retreat_return_portal_pos = None
         self._finish_farm_lock("troca de mapa")
@@ -10641,6 +10848,11 @@ class Overlay:
         return matched if mode == "Whitelist" else not matched
 
     def _eligible_drops(self, snapshot, position, entities, now):
+        if self._loot_attempts:
+            present = {(gid, ent.created_at) for (kind, gid), ent in entities if kind == "drop"}
+            self._loot_attempts = {key: attempts for key, attempts in self._loot_attempts.items() if key in present}
+        if self.feed.world.inventory_pickup_blocked:
+            return []
         candidates = []
         wall_now = time.time()
         terrain = getattr(self.feed, "terrain", None)
@@ -10651,8 +10863,14 @@ class Overlay:
                 continue
             name = self.names.get("drop", {}).get(drop.catalog_id, "").strip().lower()
             tier = self.classify_item_tier(drop.catalog_id, name)
-            if tier != 1 and (drop.retry_after > wall_now or drop.unreachable_until > now):
+            if drop.retry_after > wall_now or drop.unreachable_until > now:
                 continue
+            loot_key = (gid, drop.created_at)
+            _, exhausted_at = self._loot_attempts.get(loot_key, (0, None))
+            if exhausted_at is not None:
+                if math.dist(position, exhausted_at) < 1.5:
+                    continue
+                self._loot_attempts.pop(loot_key, None)
             if tier == 3 and self._skip_hud_tier3(snapshot.weight_ratio * 100):
                 continue
             if self._passes_target_filter("drop", drop.catalog_id, name, bypass_whitelist=tier == 1):
@@ -10672,24 +10890,26 @@ class Overlay:
                     or (attack_ts > self._farm_seen_attack_ts and world.entity("mob", gid) is not None))
 
     def _patrol_combat_or_loot_pending(self, snapshot):
-        if self.travel_plan or self._city_travel_state or self._kafra_cycle:
+        if self.travel_plan or self._city_travel_state or self._kafra_cycle or self.nav_goal or self.patrol_target_route:
             return False
-        if self._client_combat_blocks_ground(self.feed.world, snapshot.map):
-            return True
-        if not self.auto_loot or self._minimap_goal or self.nav_goal or self.patrol_target_route:
-            return False
-        world = self.feed.world
-        map_id, player, entities = world.snapshot()
-        if map_id != snapshot.map or player is None:
-            return False
-        return bool(self._eligible_drops(snapshot, player.cell(), entities, time.monotonic()))
+        return self._client_combat_blocks_ground(self.feed.world, snapshot.map)
 
-    def _finish_farm_lock(self, reason):
+    def _finish_farm_lock(self, reason, *, confirmed_death=False, resume_patrol=False):
         gid = self._locked_farm_target_id
         self._locked_farm_target_id = self._locked_mob_gid = None
         self._in_active_combat = False
+        self._farm_target_missing_since = None
+        self._farm_progress = None
+        self._farm_route = self._farm_pursuit = None
         if gid is None:
             return
+        if not confirmed_death:
+            now = time.monotonic()
+            self.ignored_mobs[gid] = now + FARM_IGNORE_DURATION
+            if resume_patrol:
+                self._farm_patrol_until = now + 1.0
+        self._pending_skill_target = None
+        self._skill_approach_step = None
         if self._engage_state and (self._engage_state["kind"], self._engage_state["gid"]) == ("mob", gid):
             self._engage_state = self._engagement = None
         if self.locked_combat_mob_gid == gid:
@@ -10700,6 +10920,17 @@ class Overlay:
         if self._skill_cast_target_gid == gid:
             self._skill_cast_until = 0.0
             self._skill_cast_target_gid = None
+        # ── Parte 3: limpa estado pré-combate ao liberar farm lock ───────────
+        if gid is not None:
+            for k in [k for k in self._precombat_states if k[0] == gid]:
+                self._precombat_states.pop(k, None)
+                self._precombat_click_attempts.pop(k, None)
+        self._precombat_cast_until = 0.0
+        self._precombat_wait_until = 0.0
+        self._precombat_active_slot = {}
+        self._precombat_cursor_armed = False
+        self._precombat_key_future = None
+        self._precombat_need_hover_reset = False
         self.active_nav_path = None
         world = self.feed.world
         with world.lock:
@@ -10728,9 +10959,23 @@ class Overlay:
                     and not self._segment_hits_obstacle(*ground, *target, blocked)
                     and self._has_gat_line_of_sight(*ground, *target, gat))
 
-        return not gat.find_path(start, None, goal_test=within_attack_range,
+        return not gat.find_path(start, target, goal_test=within_attack_range, goal_radius=attack_range,
                                  blocked_cells=blocked, penalty_cells=penalties,
-                                 max_iterations=8 * gat.width * gat.height + 1)
+                                 max_iterations=gat.width * gat.height)
+
+    def _farm_path(self, gat, start, target, blocked, *, max_steps=FARM_MAX_PATH_STEPS):
+        if gat is None:
+            return []
+        walkable_target = gat.is_walkable(*target)
+
+        def reaches_target(cell):
+            return (max(abs(cell[0] - target[0]), abs(cell[1] - target[1])) <= 1
+                    and (not walkable_target or gat.has_walkable_line(cell, target))
+                    and not self._segment_hits_obstacle(*cell, *target, blocked))
+
+        path = gat.find_path(start, target, blocked_cells=blocked, goal_test=reaches_target, goal_radius=1,
+                             max_iterations=2500, max_cost=max_steps * 10, diagonal_cost=10, prefer_clearance=False)
+        return path if path and path[0] == start else []
 
     def _sync_client_farm_target(self, world, map_id):
         with world.lock:
@@ -10740,21 +10985,29 @@ class Overlay:
             if attack_ts <= self._farm_seen_attack_ts:
                 return
             self._farm_seen_attack_ts = attack_ts
-            if world.entity("mob", gid) is None:
+            mob = world.entity("mob", gid)
+            now = time.monotonic()
+            if mob is None or mob.unreachable_until > now or self.ignored_mobs.get(gid, 0.0) > now:
                 return
-            world.farm_target_gid = gid
 
         if self._locked_farm_target_id != gid:
+            if self._locked_farm_target_id is not None:
+                self._finish_farm_lock("alvo substituído no cliente")
             self._locked_farm_target_id = self._locked_mob_gid = gid
             self._farm_lock_started_at = attack_ts
             self._farm_range_hit_ts = 0.0
             self._farm_range = 1.0
             self._farm_reachability_check = None
+            self._farm_target_missing_since = None
+        with world.lock:
+            world.farm_target_gid = gid
         self._farm_attack_ts = attack_ts
         self._farm_attack_action = action
         self._farm_retry_at = 0.0
         self._in_active_combat = True
         self.locked_combat_mob_gid = gid
+        if self.auto_loot and self._engage_state and self._engage_state["kind"] == "drop":
+            return
         self._locked_drop_gid = None
         self._drop_lock_until = 0.0
         self._engage_state = self._engagement = None
@@ -10820,69 +11073,122 @@ class Overlay:
                 return False
         return True
 
+    def _sync_learned_skill_from_tcp(self, world, now) -> dict:
+        """Aprende skill_id automaticamente via TCP e sincroniza cast_time/cooldowns do servidor."""
+        snap = world.skill_snapshot()
+        dispatched = self._last_dispatched_skill_slot
+        if dispatched is not None:
+            dispatch_ts, dispatch_idx = dispatched
+            if 0 <= dispatch_idx < len(self.skills_config) and now - dispatch_ts <= 1.5:
+                slot = self.skills_config[dispatch_idx]
+                if slot.get("skill_id", 0) == 0:
+                    cs_pkt = snap.get("last_cs_skill_packet")
+                    cast_start = snap.get("last_skill_cast_start")
+                    learned_id = 0
+                    if cs_pkt and cs_pkt[0] >= dispatch_ts - 0.1 and cs_pkt[2] > 0:
+                        learned_id = int(cs_pkt[2])
+                    elif cast_start and cast_start[0] >= dispatch_ts - 0.1 and cast_start[1] > 0:
+                        learned_id = int(cast_start[1])
+                    if learned_id > 0:
+                        slot["skill_id"] = learned_id
+                        save_skills_config(self.skills_config)
+                        print(f"[Skills] Skill ID #{learned_id} aprendido via TCP para '{slot['name'] or slot['hotkey']}'.", flush=True)
+        cast_start = snap.get("last_skill_cast_start")
+        if cast_start and now - cast_start[0] <= 0.5 and len(cast_start) > 2 and cast_start[2] > 0:
+            self._skill_cast_until = max(self._skill_cast_until, cast_start[0] + cast_start[2] / 1000.0 + 0.1)
+        fail_info = snap.get("last_skill_fail")
+        if fail_info and time.time() - fail_info.get("ts", 0.0) <= 0.5:
+            fail_id = fail_info.get("skill_id", 0)
+            for idx, slot in enumerate(self.skills_config):
+                if (fail_id and slot.get("skill_id") == fail_id) or (
+                    dispatched is not None and dispatched[1] == idx and now - dispatched[0] <= 1.0
+                ):
+                    self._skill_cooldowns[idx] = max(self._skill_cooldowns.get(idx, 0.0), now + 0.8)
+        return snap
+
     def _tick_auto_buff_skills(self, world, now) -> bool:
-        if not self.auto_farm or not self._hud_can_run() or not self.skills_config:
+        snap = self._sync_learned_skill_from_tcp(world, now)
+        if self._pending_buff_key is not None:
+            idx, slot, completion = self._pending_buff_key
+            if not completion.done():
+                return True
+            self._pending_buff_key = None
+            if (sent_at := completion.result()) is not None:
+                self._record_skill_use(idx, slot, sent_at)
+                return True
+            self._skill_cooldowns[idx] = now + 0.5
+        if (not self.auto_farm or not self._hud_can_run() or not self.skills_config
+                or self._pending_skill_target is not None or self._precombat_cursor_armed):
             return False
         if not self._game_is_foreground() or self._manual_mouse_button_pressed() or self._automation_click_active():
             return False
-        active_statuses = world.skill_snapshot().get("active_status_ids", set())
+        active_statuses = snap.get("active_status_ids", set())
+        server_cds = snap.get("skill_cooldowns_until", {})
         for idx, slot in enumerate(self.skills_config):
-            if not slot["enabled"] or slot["mode"] != "Auto-Buff / Postura":
+            if not slot["enabled"] or slot["mode"] != "Auto-Buff / Suporte":
                 continue
-            if now < self._skill_cooldowns.get(idx, 0.0):
+            sk_id = slot.get("skill_id", 0)
+            if now < max(self._skill_cooldowns.get(idx, 0.0), server_cds.get(sk_id, 0.0)):
                 continue
             if slot["status_id"] > 0 and slot["status_id"] in active_statuses:
                 continue
             if not self._skill_has_sp(slot, world):
                 continue
             vk = SKILL_HOTKEY_TO_VK.get(slot["hotkey"])
-            if vk and self._send_game_key(vk):
-                self._skill_cooldowns[idx] = now + slot["cooldown_sec"]
-                if slot["cast_time_sec"] > 0:
-                    self._skill_cast_until = now + slot["cast_time_sec"]
-                    self._skill_cast_started_at = time.time()
-                    self._skill_cast_target_gid = None
-                    self._skill_cast_skill_id = slot["skill_id"]
+            completion = Future()
+            map_id = world.map
+            if vk and self._send_game_key(
+                vk, completion=completion,
+                allowed=lambda: self.auto_farm and self._hud_can_run() and world.map == map_id,
+            ):
+                self._last_dispatched_skill_slot = (now, idx)
+                self._pending_buff_key = (idx, slot, completion)
                 return True
         return False
+
+    def _record_skill_use(self, idx, slot, sent_at, gid=None):
+        self._skill_cooldowns[idx] = sent_at + slot["cooldown_sec"]
+        if gid is not None and slot["min_mobs_3x3"] > 1:
+            self._active_splash_gid = gid
+            self._active_splash_until = sent_at + max(1.0, slot["cooldown_sec"], slot["cast_time_sec"] + 0.5)
+        if slot["cast_time_sec"] > 0:
+            self._skill_cast_until = sent_at + slot["cast_time_sec"]
+            self._skill_cast_started_at = time.time()
+            self._skill_cast_target_gid = gid
+            self._skill_cast_max_range = slot["max_range"]
+            self._skill_cast_skill_id = slot["skill_id"]
 
     def _try_combat_skill(self, snapshot, position, gid, mob, now) -> str:
         if not self.skills_config:
             return "none"
         world = self.feed.world
+        skill_snap = self._sync_learned_skill_from_tcp(world, now)
         if self._check_skill_cast_lock(world, position, now):
             return "used"
         if not self._game_is_foreground() or self._manual_mouse_button_pressed() or self._automation_click_active():
             return "none"
 
-        skill_snap = world.skill_snapshot()
-        steal_confirmed = skill_snap["steal_confirmed_targets"]
-        mob_name = self.names.get("mob", {}).get(mob.catalog_id, "").strip().lower()
+        pending = self._pending_skill_target
+        if pending is not None:
+            if (pending["map"], pending["gid"]) != (snapshot.map, gid):
+                self._pending_skill_target = None
+            else:
+                return self._finish_combat_skill_input(snapshot, position, mob, pending, now)
+
         cell = mob.track.cell()
         distance = math.dist(position, cell)
+        server_cds = skill_snap.get("skill_cooldowns_until", {})
 
         for idx, slot in enumerate(self.skills_config):
-            if not slot["enabled"] or slot["mode"] == "Auto-Buff / Postura":
+            if not slot["enabled"] or slot["mode"] != "Combate (Alvo / Área)":
                 continue
-            if not self._passes_skill_mob_filter(slot, mob.catalog_id, mob_name):
-                continue
-            is_repeat = slot["mode"] == "Repetir até Confirmar no Alvo"
-            if is_repeat:
-                if gid in steal_confirmed:
-                    continue
-                if self._skill_target_attempts.get((gid, idx), 0) >= slot["max_attempts"]:
-                    continue
-            if slot["min_mobs_3x3"] > 1:
-                if self._count_mobs_in_3x3(world, cell, gid, now) < slot["min_mobs_3x3"]:
-                    continue
             if not self._skill_has_sp(slot, world):
                 continue
-            if now < self._skill_cooldowns.get(idx, 0.0):
-                if is_repeat:
-                    return "used"
+            sk_id = slot.get("skill_id", 0)
+            if now < max(self._skill_cooldowns.get(idx, 0.0), server_cds.get(sk_id, 0.0)):
                 continue
             if distance > slot["max_range"]:
-                self._skill_approach_range = slot["max_range"]
+                self._skill_approach_range = slot.get("skill_range", slot["max_range"])
                 return "approach"
 
             hwnd = self.get_game_hwnd()
@@ -10902,36 +11208,312 @@ class Overlay:
             if not screen or self._is_point_in_hud(*screen, margin=10):
                 continue
             vk = SKILL_HOTKEY_TO_VK.get(slot["hotkey"])
-            if not vk or not self._send_game_key(vk):
-                continue
+            completion = Future()
 
-            def skill_target_point(lead):
-                latest = self._live_sprite_aim(("mob", gid), snapshot.map, viewport, height, mob, time.perf_counter() + lead)
-                if latest is None:
-                    return None
-                pt = resolve(*latest)
-                return pt if pt and not self._is_point_in_hud(*pt, margin=10) else None
+            def allowed():
+                return (self._hud_can_run() and self._locked_farm_target_id == gid
+                        and world.map == snapshot.map and world.entity("mob", gid) is mob
+                        and not world.is_map_loading and not world.npc_dialog_active)
 
-            target_tile = (int(round(aimed_cell[0])), int(round(aimed_cell[1])))
-            self._navigation_click(
-                snapshot, gat, target_tile, screen, hwnd=hwnd,
-                target_point=skill_target_point,
-                retry_key=(snapshot.map, "skill", gid, idx),
-            )
-            self._skill_cooldowns[idx] = now + slot["cooldown_sec"]
-            if is_repeat:
-                self._skill_target_attempts[(gid, idx)] = self._skill_target_attempts.get((gid, idx), 0) + 1
-            if slot["min_mobs_3x3"] > 1:
-                self._active_splash_gid = gid
-                self._active_splash_until = now + max(1.0, slot["cooldown_sec"], slot["cast_time_sec"] + 0.5)
-            if slot["cast_time_sec"] > 0:
-                self._skill_cast_until = now + slot["cast_time_sec"]
-                self._skill_cast_started_at = time.time()
-                self._skill_cast_target_gid = gid
-                self._skill_cast_max_range = slot["max_range"]
-                self._skill_cast_skill_id = slot["skill_id"]
-            return "used"
+            if vk and self._send_game_key(vk, completion=completion, allowed=allowed):
+                self._last_dispatched_skill_slot = (now, idx)
+                self._pending_skill_target = {
+                    "map": snapshot.map, "gid": gid, "idx": idx, "slot": slot,
+                    "key": completion, "allowed": allowed, "click": None,
+                }
+                return "used"
         return "none"
+
+    def _finish_combat_skill_input(self, snapshot, position, mob, pending, now):
+        key = pending["key"]
+        if not key.done():
+            return "used"
+        sent_at = key.result()
+        idx, slot, gid = pending["idx"], pending["slot"], pending["gid"]
+        click = pending["click"]
+        if click is not None and not click.done():
+            return "used"
+        if click is not None and click.result()[1]:
+            self._pending_skill_target = None
+            self._record_skill_use(idx, slot, click.result()[0], gid)
+            return "used"
+        if sent_at is None or now - sent_at > 0.85 or not pending["allowed"]():
+            self._pending_skill_target = None
+            self._skill_cooldowns[idx] = now + 0.5
+            return "none"
+
+        terrain = getattr(self.feed, "terrain", None)
+        gat = terrain.cached_gats.get(snapshot.map) if terrain else None
+        height = gat.get_elevation if gat else flat_height
+        viewport = snapshot.viewport
+        project = self.feed.camera.projector(viewport, getattr(self.feed, "_cam", None) or position, height)
+        resolve = self._safe_click_resolver(snapshot, project)
+
+        def aim(lead):
+            if not pending["allowed"]():
+                return None
+            latest = self._live_sprite_aim(("mob", gid), snapshot.map, viewport, height, mob,
+                                           time.perf_counter() + lead)
+            if latest is None:
+                return None
+            world = self.feed.world
+            with world.lock:
+                current_position = world.player.cell() if world.player else position
+            target_cell, uv = latest
+            if math.dist(current_position, target_cell) > slot["max_range"]:
+                return None
+            if gat is not None and not self._has_gat_line_of_sight(*current_position, *target_cell, gat):
+                return None
+            return resolve(target_cell, uv)
+
+        if screen := aim(0.075):
+            click = Future()
+            if self._navigation_click(
+                snapshot, gat, mob.track.cell(), screen, target_point=aim, ground=False,
+                retry_key=(snapshot.map, "skill", gid, idx), completion=click,
+            ):
+                pending["click"] = click
+        return "used"
+
+    # ── Parte 3: Máquina de estados Pré-Combate ──────────────────────────────
+    _PRECOMBAT_SPRITE_OFFSETS = [(0, -22), (0, -30), (-12, -22), (12, -22)]
+    _PRECOMBAT_MAX_CLICK_FAILURES = 3
+    _PRECOMBAT_WAIT_S = 0.300       # aguarda sinal TCP até 300 ms
+    _PRECOMBAT_KEY_DELAY_S = 0.080  # pausa entre hotkey e clique (80 ms)
+
+    def _precombat_pending_slots(self, gid: int) -> list:
+        """Retorna slots de modo 'Pré-Combate (Abertura / Furto)' ainda não DONE/FAILED para este mob."""
+        result = []
+        for idx, slot in enumerate(self.skills_config):
+            if not slot["enabled"] or slot["mode"] != "Pré-Combate (Abertura / Furto)":
+                continue
+            state = self._precombat_states.get((gid, idx), "PENDING")
+            if state not in ("DONE", "FAILED"):
+                result.append((idx, slot))
+        return result
+
+    def _tick_precombat_skill(self, snapshot, position, gid, mob, now) -> str:
+        """
+        Executa a sequência pré-combate para um mob_gid.
+        Retorna:
+          "blocking"  — ainda em curso; não enviar ataque normal nem andar com cursor armado
+          "casting"   — skill em conjuração; não mover nem atacar
+          "done"      — todos os slots concluídos; libera ataque
+          "approach"  — precisa se aproximar (antes de armar a skill)
+          "none"      — nenhum slot pré-combate configurado
+        """
+        world = self.feed.world
+        snap = self._sync_learned_skill_from_tcp(world, now)
+        pending_slots = self._precombat_pending_slots(gid)
+        if not pending_slots:
+            self._precombat_cursor_armed = False
+            return "none"
+
+        # Bloqueia enquanto cast ativo (evita cancelar conjuração)
+        if now < self._precombat_cast_until:
+            return "casting"
+
+        idx, slot = pending_slots[0]
+        key = (gid, idx)
+        state = self._precombat_states.get(key, "PENDING")
+        attempts = self._precombat_click_attempts.get(key, 0)
+        max_attempts = 3 if slot.get("repeat_until_success", True) else 1
+        skill_range = slot.get("skill_range", 2.3)
+
+        # Fase ARMING: aguarda hotkey ser enviada + 80 ms, então clica no sprite do monstro
+        if state == "ARMING":
+            key_future = self._precombat_key_future
+            if key_future is not None and not key_future.done():
+                return "blocking"
+            sent_at = key_future.result() if key_future is not None else None
+            if sent_at is None:
+                self._precombat_cursor_armed = False
+                new_att = attempts + 1
+                self._precombat_click_attempts[key] = new_att
+                self._precombat_states[key] = "FAILED" if new_att >= max_attempts else "PENDING"
+                return "done" if self._precombat_states[key] == "FAILED" else "blocking"
+            if time.monotonic() - sent_at < self._PRECOMBAT_KEY_DELAY_S:
+                return "blocking"
+
+            hwnd = self.get_game_hwnd()
+            if not hwnd:
+                self._precombat_cursor_armed = False
+                return "none"
+            terrain = getattr(self.feed, "terrain", None)
+            gat = terrain.for_map(snapshot.map) if terrain and snapshot.map else None
+            height = gat.get_elevation if gat else flat_height
+            viewport = snapshot.viewport
+            project = self.feed.camera.projector(viewport, getattr(self.feed, "_cam", None) or position, height)
+            resolve = self._safe_click_resolver(snapshot, project)
+
+            offset_index = min(attempts, len(self._PRECOMBAT_SPRITE_OFFSETS) - 1)
+            dx, dy = self._PRECOMBAT_SPRITE_OFFSETS[offset_index]
+            aimed = self._live_sprite_aim(("mob", gid), snapshot.map, viewport, height, mob, now + 0.04)
+            raw_screen = None
+            if aimed is not None:
+                aimed_cell, uv = aimed
+                raw_screen = resolve(aimed_cell, uv)
+            if raw_screen and self._is_point_in_hud(*raw_screen, margin=10):
+                raw_screen = None
+
+            if raw_screen is None:
+                self._precombat_cursor_armed = False
+                new_att = attempts + 1
+                self._precombat_click_attempts[key] = new_att
+                self._precombat_states[key] = "FAILED" if new_att >= max_attempts else "PENDING"
+                return "done" if self._precombat_states[key] == "FAILED" else "blocking"
+
+            screen = (raw_screen[0] + dx, raw_screen[1] + dy)
+            # Garante que não está clicando na célula do próprio jogador
+            player_screen = resolve(tuple(map(round, position)), (0.5, 0.5))
+            if player_screen and math.dist(screen, player_screen) < 12:
+                screen = (raw_screen[0], raw_screen[1] - 26)
+
+            hover_reset_pt = None
+            if self._precombat_need_hover_reset:
+                vx, vy, vw, vh = viewport
+                hx = max(vx + 10, min(vx + vw - 10, screen[0] + 30))
+                hy = max(vy + 10, min(vy + vh - 10, screen[1] - 30))
+                hover_reset_pt = (hx, hy)
+
+            cell = mob.track.cell()
+            self._navigation_click(
+                snapshot, gat, cell, screen, ground=False,
+                hover_reset=self._precombat_need_hover_reset,
+                hover_reset_point=hover_reset_pt,
+                retry_key=(snapshot.map, "precombat", gid, idx, attempts),
+                allow_offsets=False,
+            )
+            self._precombat_need_hover_reset = False
+            cs_ref = snap.get("last_cs_skill_packet")
+            self._precombat_last_cs_ts = cs_ref[0] if cs_ref else now
+            self._precombat_states[key] = "WAITING"
+            self._precombat_wait_until = now + self._PRECOMBAT_WAIT_S
+            self._precombat_active_slot = slot
+            self._farm_attack_ts = now
+            print(f"[PreCombate] Slot#{idx} skill#{slot.get('skill_id', 0)} → mob#{gid} tentativa #{attempts + 1}", flush=True)
+            return "blocking"
+
+        # Fase WAITING: aguarda sinal TCP por até 300 ms após hotkey+clique
+        if state == "WAITING":
+            cs_pkt = snap.get("last_cs_skill_packet")
+            cast_start = snap.get("last_skill_cast_start")
+            executed = snap.get("last_skill_executed")
+            failed = snap.get("last_skill_failed")
+            item_added = snap.get("last_item_added")
+            skill_id = slot.get("skill_id", 0)
+            ref_ts = self._precombat_last_cs_ts
+
+            # Conjuração iniciada pelo servidor (0x07FB / 0x013E)
+            if (cast_start and cast_start[0] >= ref_ts
+                    and (skill_id == 0 or cast_start[1] == skill_id)):
+                self._precombat_cursor_armed = False
+                cast_ms = cast_start[2] if len(cast_start) > 2 else 0
+                self._precombat_cast_until = now + max(0.0, cast_ms / 1000.0 + 0.15)
+                self._precombat_states[key] = "CASTING"
+                return "casting"
+
+            # 0x09CB (result=1) ou 0x0B41 (item adicionado ao inventário): sucesso confirmado
+            executed_ok = (
+                executed and executed[0] >= ref_ts
+                and (skill_id == 0 or executed[1] == skill_id)
+                and (len(executed) < 4 or executed[3] != 0)
+            )
+            item_ok = item_added and item_added[0] >= ref_ts
+            if executed_ok or item_ok:
+                self._precombat_cursor_armed = False
+                self._precombat_states[key] = "DONE"
+                return "done" if not self._precombat_pending_slots(gid) else "blocking"
+
+            # 0x0110 (ZC_SKILL_FAILED): acertou o monstro mas falhou na chance
+            if (failed and failed[0] >= ref_ts
+                    and (skill_id == 0 or failed[1] == skill_id)):
+                self._precombat_cursor_armed = False
+                if not slot.get("repeat_until_success", True):
+                    self._precombat_states[key] = "DONE"
+                else:
+                    new_att = attempts + 1
+                    self._precombat_click_attempts[key] = new_att
+                    self._precombat_states[key] = "DONE" if new_att >= max_attempts else "PENDING"
+                return "done" if not self._precombat_pending_slots(gid) else "blocking"
+
+            # Cliente enviou apenas 0x035F/0x0085 (andou no chão porque errou o sprite)
+            walked_instead = world.last_move_ts >= ref_ts and not (cs_pkt and cs_pkt[0] >= ref_ts)
+            if walked_instead or now >= self._precombat_wait_until:
+                self._precombat_cursor_armed = False
+                if cs_pkt and cs_pkt[0] >= ref_ts and cs_pkt[1] in (0x0438, 0x0436):
+                    self._precombat_states[key] = "DONE"
+                    return "done" if not self._precombat_pending_slots(gid) else "blocking"
+                self._precombat_need_hover_reset = True
+                new_att = attempts + 1
+                self._precombat_click_attempts[key] = new_att
+                if new_att >= self._PRECOMBAT_MAX_CLICK_FAILURES:
+                    self._precombat_states[key] = "FAILED"
+                    print(f"[PreCombate] Slot#{idx} mob#{gid}: {new_att} falhas consecutivas; liberando combate.", flush=True)
+                    return "done" if not self._precombat_pending_slots(gid) else "blocking"
+                self._precombat_states[key] = "PENDING"
+                return "blocking"
+
+            return "blocking"
+
+        # Fase CASTING: cast terminou
+        if state == "CASTING":
+            self._precombat_cursor_armed = False
+            self._precombat_states[key] = "DONE"
+            return "done" if not self._precombat_pending_slots(gid) else "blocking"
+
+        if attempts >= max_attempts:
+            self._precombat_cursor_armed = False
+            self._precombat_states[key] = "DONE"
+            return "done" if not self._precombat_pending_slots(gid) else "blocking"
+
+        # Não arma a skill enquanto caminha de longe
+        cell = mob.track.cell()
+        distance = math.dist(position, cell)
+        if distance > skill_range:
+            self._skill_approach_range = skill_range
+            return "approach"
+        if world._is_player_walking():
+            return "blocking"
+
+        server_cds = snap.get("skill_cooldowns_until", {})
+        sk_id = slot.get("skill_id", 0)
+        if now < max(self._skill_cooldowns.get(idx, 0.0), server_cds.get(sk_id, 0.0)):
+            return "blocking"
+
+        if not self._skill_has_sp(slot, world):
+            self._precombat_states[key] = "FAILED"
+            return "done" if not self._precombat_pending_slots(gid) else "blocking"
+
+        if now < self._skill_cast_until:
+            return "blocking"
+
+        vk = SKILL_HOTKEY_TO_VK.get(slot["hotkey"])
+        if not vk:
+            self._precombat_states[key] = "FAILED"
+            return "done" if not self._precombat_pending_slots(gid) else "blocking"
+
+        key_future = Future()
+
+        def _allowed():
+            return (self._hud_can_run() and self._locked_farm_target_id == gid
+                    and world.map == snapshot.map and world.entity("mob", gid) is mob
+                    and not world.is_map_loading and not world.npc_dialog_active)
+
+        if not self._send_game_key(vk, completion=key_future, allowed=_allowed):
+            new_att = attempts + 1
+            self._precombat_click_attempts[key] = new_att
+            if new_att >= max_attempts:
+                self._precombat_states[key] = "FAILED"
+            return "blocking"
+
+        self._last_dispatched_skill_slot = (now, idx)
+        self._precombat_key_future = key_future
+        self._precombat_cursor_armed = True
+        self._precombat_states[key] = "ARMING"
+        self._precombat_active_slot = slot
+        self._farm_attack_ts = now
+        return "blocking"
 
     def _approach_skill_range(self, snapshot, position, cell, max_range):
         """Aproxima do alvo por célula do chão sem clicar no sprite (evita ataque normal antes da skill)."""
@@ -10945,6 +11527,16 @@ class Overlay:
             return False
         start = tuple(map(round, position))
         target_cell = tuple(map(round, cell))
+        now = time.monotonic()
+        key = snapshot.map, self._locked_farm_target_id
+        if self._skill_approach_step and self._skill_approach_step[0] == key:
+            _, clicked_at, previous, ground, point, retried = self._skill_approach_step
+            result = self._walk_step_result(world, position, previous, point, clicked_at, now)
+            if result == "waiting":
+                return True
+        else:
+            result = None
+        self._skill_approach_step = None
         nav_blocked, penalties = self._navigation_obstacles(snapshot.map, gat)
         blocked = nav_blocked | {target_cell}
         project = self.feed.camera.projector(
@@ -10967,8 +11559,16 @@ class Overlay:
                 and self._has_gat_line_of_sight(*ground, *cell, gat)
             )
 
-        path = self._approach_path(gat, start, target_cell, blocked, penalties, ring=ring)
-        if not path:
+        if result == "stalled":
+            if not retried and (screen := ground_point(ground)):
+                if self._navigation_click(snapshot, gat, ground, screen, hwnd=hwnd, hover_reset=True):
+                    self._skill_approach_step = (key, now, position, ground, screen, True)
+                return True
+            blocked.add(ground)
+        path = self._approach_path(gat, start, target_cell, blocked, penalties, ring=ring, ring_radius=ring_max + 1)
+        detour = (not gat.has_walkable_line(start, target_cell)
+                  or self._segment_hits_obstacle(*start, *target_cell, nav_blocked))
+        if not path or (detour and len(path) - 1 > FARM_MAX_PATH_STEPS):
             return False
         self.active_nav_path = path
         self.active_nav_color = "#A78BFA"
@@ -10976,10 +11576,84 @@ class Overlay:
         if stride is None:
             return False
         ground_cell, screen = stride
-        return self._navigation_click(
-            snapshot, gat, ground_cell, screen, hwnd=hwnd,
-            retry_key=(snapshot.map, "ground", ground_cell), ground=True,
-        )
+        if self._navigation_click(snapshot, gat, ground_cell, screen, hwnd=hwnd,
+                                  retry_key=(snapshot.map, "ground", ground_cell)):
+            self._skill_approach_step = (key, now, position, ground_cell, screen, False)
+            if detour:
+                self._farm_route = {"cell": target_cell, "path": path, "index": 0, "started": True}
+            return True
+        return False
+
+    def _continue_farm_pursuit(self, snapshot, position, now, gid):
+        pursuit = self._farm_pursuit
+        target = pursuit["cell"]
+        world = self.feed.world
+        terrain = getattr(self.feed, "terrain", None)
+        gat = terrain.for_map(snapshot.map) if terrain and snapshot.map else None
+        if now >= pursuit["until"] or gat is None:
+            self._finish_farm_lock("tempo limite ou terreno indisponível na perseguição", resume_patrol=True)
+            return False
+        if math.dist(position, target) <= 1.5 and gat.has_walkable_line(position, target):
+            self._finish_farm_lock("última posição alcançada sem reencontrar o alvo", resume_patrol=True)
+            return False
+        if pending := pursuit["pending"]:
+            clicked_at, previous, point = pending
+            result = self._walk_step_result(world, position, previous, point, clicked_at, now)
+            if result == "waiting":
+                return True
+            pursuit["pending"] = None
+            if result == "stalled":
+                self._finish_farm_lock("passo bloqueado na perseguição", resume_patrol=True)
+                return False
+        if world._is_player_walking():
+            return True
+
+        blocked, _ = self._navigation_obstacles(snapshot.map, gat)
+        project = self.feed.camera.projector(snapshot.viewport, getattr(self.feed, "_cam", None) or position,
+                                             gat.get_elevation)
+        resolve = self._safe_click_resolver(snapshot, project)
+
+        def ground_point(cell):
+            return self._walk_ground_point(gat, position, cell, blocked, resolve)
+
+        for _ in range(2):
+            path = pursuit["path"]
+            if path:
+                index = min(range(pursuit["index"], len(path)), key=lambda i: math.dist(position, path[i]))
+                pursuit["index"] = index
+                if math.dist(position, path[index]) <= 2.0:
+                    remaining = path[index + 1:]
+                    self.active_nav_path = path[index:]
+                    self.active_nav_color = "#F87171"
+                    stride = self._pick_walk_stride(remaining[:11], position, blocked, ground_point)
+                    if stride:
+                        cell, point = stride
+
+                        def aim(_lead):
+                            with world.lock:
+                                if (self._farm_pursuit is pursuit and self._locked_farm_target_id == gid
+                                        and world.entity("mob", gid) is None
+                                        and time.monotonic() < pursuit["until"]):
+                                    return point
+                            return None
+
+                        if self._navigation_click(snapshot, gat, cell, point, target_point=aim,
+                                                  retry_key=(snapshot.map, "farm-last-position", gid, cell)):
+                            pursuit["pending"] = (now, position, point)
+                        return True
+            if pursuit["replanned"]:
+                break
+            pursuit["replanned"] = True
+            start = tuple(map(round, position))
+            path = self._farm_path(gat, start, target, blocked)
+            if not path or len(path) - 1 > FARM_MAX_PATH_STEPS:
+                break
+            if len(path) == 1:
+                self._finish_farm_lock("última posição alcançada sem reencontrar o alvo", resume_patrol=True)
+                return False
+            pursuit.update(path=path, index=0)
+        self._finish_farm_lock("rota bloqueada até a última posição do alvo", resume_patrol=True)
+        return False
 
     def _continue_farm_lock(self, snapshot, position, now, *, direct_only=False):
         gid = self._locked_farm_target_id
@@ -10993,11 +11667,35 @@ class Overlay:
             other_hit_ts = world.mobs_damaged_by_others.get(gid, 0.0)
             player = world.player
         if mob is None:
-            self._finish_farm_lock("alvo saiu do snapshot")
-            return False
+            return (self._continue_farm_pursuit(snapshot, position, now, gid)
+                    if self._farm_pursuit is not None and not direct_only else True)
+        if self._farm_pursuit is not None:
+            self._farm_pursuit = None
+            self._farm_progress = None
+            print(f"[FarmLock] Alvo #{gid} reencontrado. Retomando combate.", flush=True)
 
         cell = mob.track.cell()
         distance = math.dist(position, cell)
+        progress = self._farm_progress
+        route = self._farm_route
+        advanced = False
+        if route and route["started"]:
+            path = route["path"]
+            index = min(range(route["index"], len(path)), key=lambda i: math.dist(position, path[i]))
+            if index > route["index"] and math.dist(position, path[index]) <= 1.5:
+                route["index"] = index
+                advanced = True
+        if progress is None or progress[0] != gid or advanced or distance <= progress[1] - 0.75:
+            progress = self._farm_progress = (gid, distance, now)
+        if now - max(progress[2], hit_ts) >= 8.0:
+            with world.lock:
+                if world.mobs_damaged_by_me.get(gid, 0.0) > hit_ts:
+                    return True
+                current = world.entity("mob", gid)
+                if current is not None and current.created_at == mob.created_at:
+                    current.unreachable_until = max(current.unreachable_until, now + 1.5)
+            self._finish_farm_lock("8 s sem aproximação ou dano confirmado", resume_patrol=True)
+            return False
         walking = world._is_player_walking()
         following = walking and player and math.dist(player.target, cell) < distance
         if hit_ts >= self._farm_lock_started_at and hit_ts > self._farm_range_hit_ts:
@@ -11019,9 +11717,10 @@ class Overlay:
                         or tuple(map(round, current.track.cell())) != tuple(map(round, cell))):
                     self._farm_reachability_check = None
                     return True
-                current.unreachable_until = now + 6.0
-            self._finish_farm_lock("inalcançável e há mais de 10 s sem ataque ou dano")
-            return False
+            state = self._engage_state
+            if state and (state["kind"], state["gid"]) == ("mob", gid):
+                state["retry_at"] = now + 0.65
+            return True
 
         if (self._in_active_combat and self._farm_attack_action == 0x07
                 and move_ts <= self._farm_attack_ts and distance <= attack_range + 1.5
@@ -11029,7 +11728,7 @@ class Overlay:
                      or now < self._farm_retry_at)):
             self.active_nav_path = None
             return True
-        if following:
+        if following and not direct_only:
             return True
 
         skill_state = self._try_combat_skill(snapshot, position, gid, mob, now)
@@ -11040,12 +11739,24 @@ class Overlay:
             if self._approach_skill_range(snapshot, position, cell, getattr(self, "_skill_approach_range", 2.0)):
                 return True
 
-        self._smart_engage_target((gid, mob), "mob", snapshot, position, direct_only=direct_only)
-        return True
-
-    def _continue_locked_target(self, snapshot, position, entities, drops, now):
-        if self._continue_farm_lock(snapshot, position, now):
+        # ── Parte 3: Pré-Combate — executa antes do ataque normal ────────────
+        precombat = self._tick_precombat_skill(snapshot, position, gid, mob, now)
+        if precombat == "casting":
+            # Em conjuração: não mover, não atacar
+            self.active_nav_path = None
             return True
+        if precombat == "blocking":
+            # Nunca clicar no chão enquanto o cursor estiver armado com habilidade
+            return True
+        if precombat == "approach" and not direct_only and not self._precombat_cursor_armed:
+            if self._approach_skill_range(snapshot, position, cell,
+                                          getattr(self, "_skill_approach_range", 2.3)):
+                return True
+
+        self._smart_engage_target((gid, mob), "mob", snapshot, position, direct_only=direct_only)
+        return self._locked_farm_target_id == gid
+
+    def _continue_loot_lock(self, snapshot, position, entities, drops, now):
         world = self.feed.world
         live = dict(entities)
 
@@ -11062,36 +11773,40 @@ class Overlay:
         state = self._engage_state
         has_attempt = bool(state and state["kind"] == "drop" and state["gid"] == drop_gid)
         if (self.auto_farm or self.auto_loot) and (entry[0] == 1 or now < self._drop_lock_until or has_attempt):
-            self._smart_engage_target((drop_gid, drop), "drop", snapshot, position, priority_loot=entry[0] == 1)
-            return True
+            if self._smart_engage_target((drop_gid, drop), "drop", snapshot, position, priority_loot=entry[0] == 1):
+                return True
+            self._locked_drop_gid = None
         return False
 
     def _try_auto_loot(self, snapshot, position, drops, *, direct_only=False):
         world = self.feed.world
         if not drops or self._client_combat_blocks_ground(world, snapshot.map):
             return False
-        if world._is_player_walking() and all(distance > 2.0 for _, distance, _, _ in drops):
-            return True
-        tier, _, gid, drop = drops[0]
-        if gid != self._locked_drop_gid:
-            self._locked_drop_gid = gid
-            self._drop_lock_until = time.monotonic() + 1.5
-        self._smart_engage_target((gid, drop), "drop", snapshot, position,
-                                  direct_only=direct_only, priority_loot=tier == 1)
-        return True
+        walking = world._is_player_walking()
+        for tier, distance, gid, drop in drops[:3]:
+            if walking and distance > (3.0 if tier == 1 else 2.0):
+                continue
+            if gid != self._locked_drop_gid:
+                self._locked_drop_gid = gid
+                self._drop_lock_until = time.monotonic() + 1.5
+            if self._smart_engage_target((gid, drop), "drop", snapshot, position,
+                                         direct_only=direct_only, priority_loot=tier == 1):
+                return True
+            self._locked_drop_gid = None
+        return False
 
     @staticmethod
     def _path_cost(path):
         return sum(14 if a[0] != b[0] and a[1] != b[1] else 10 for a, b in zip(path, path[1:]))
 
-    def _approach_path(self, gat, start, target_cell, blocked, penalties, *, ring=None):
+    def _approach_path(self, gat, start, target_cell, blocked, penalties, *, ring=None, ring_radius=None):
         if gat is None:
             return []
         if ring is None:
             path = gat.find_path(start, target_cell, blocked_cells=blocked, penalty_cells=penalties)
             return path if path and path[-1] == target_cell else []
-        return gat.find_path(start, None, blocked_cells=blocked, penalty_cells=penalties,
-                             max_iterations=3500, goal_test=ring)
+        return gat.find_path(start, target_cell, blocked_cells=blocked, penalty_cells=penalties,
+                             max_iterations=3500, goal_test=ring, goal_radius=ring_radius)
 
     def _live_sprite_aim(self, key, map_id, viewport, height, expected, at):
         world = self.feed.world
@@ -11123,6 +11838,8 @@ class Overlay:
         world = self.feed.world
         now = time.monotonic()
         key = (kind, gid)
+        loot_key = (gid, entity.created_at) if kind == "drop" else None
+        loot_attempts, _ = self._loot_attempts.get(loot_key, (0, None))
         with world.lock:
             live = world.entity(*key)
             committed = kind == "mob" and gid == self._locked_farm_target_id
@@ -11144,10 +11861,12 @@ class Overlay:
             return True
 
         state = self._engage_state
-        if state is None or (state["kind"], state["gid"], state["map"]) != (*key, snapshot.map):
-            state = self._engage_state = {"kind": kind, "gid": gid, "map": snapshot.map,
-                                          "pending": None,
-                                          "failed": set(), "direct_failures": 0}
+        if state is None or state["target"] != (*key, snapshot.map, live.created_at):
+            state = self._engage_state = {
+                "kind": kind, "gid": gid, "map": snapshot.map,
+                "target": (*key, snapshot.map, live.created_at), "pending": None,
+                "failed": set(), "direct_failures": 0,
+            }
         self._engagement = {"key": key, "phase": state.get("phase", "direct")}
 
         def release():
@@ -11157,11 +11876,12 @@ class Overlay:
             return False
 
         def pause_target():
-            if committed or priority_loot:
+            if committed:
                 state["pending"] = None
                 state["direct_failures"] = 0
                 state["failed"].clear()
-                state["retry_at"] = now + 0.35
+                state.pop("path_key", None)
+                state["retry_at"] = now + 0.65
                 return True
             with world.lock:
                 current = world.entity(*key)
@@ -11169,9 +11889,11 @@ class Overlay:
                     if kind == "drop" and (current.suspected_other_owner or current.retry_after):
                         current.retry_after = max(current.retry_after, time.time() + 3.5)
                     else:
-                        current.unreachable_until = now + (4.0 if kind == "drop" else 6.0)
+                        current.unreachable_until = now + (4.0 if kind == "drop" else 1.5)
                     if kind == "mob" and world.locked_combat_mob_gid == gid:
                         world.locked_combat_mob_gid = None
+            if committed:
+                self._finish_farm_lock("sem avanço após as retentativas")
             return release()
 
         if now < state.get("retry_at", 0.0):
@@ -11181,22 +11903,36 @@ class Overlay:
         if state["pending"]:
             clicked_at, start_xy, last_cell, last_point, phase = state["pending"]
             aborted = self._touch_click_aborted(last_point, clicked_at)
+            if phase != "direct":
+                aborted = aborted or self._visual_walk_failed(last_point, clicked_at)
             elapsed = now - self._touch_click_finished_at(last_point, clicked_at)
             if kind == "drop":
-                if pickup_ack and pickup_ack[0] == gid and pickup_ack[1] >= clicked_at and pickup_ack[2] == 0:
-                    return release()
+                ack = (pickup_ack if phase == "direct" and pickup_ack and pickup_ack[0] == gid
+                       and pickup_ack[1] >= clicked_at else None)
+                if phase == "direct":
+                    if ack and ack[2] == 0:
+                        self._loot_attempts.pop(loot_key, None)
+                        return release()
+                    # O toque pode chegar mesmo quando o PostMessageW é recusado.
+                    if ack is None and (elapsed < 0.75 or (walking and elapsed < 1.5)):
+                        return True
+                    if loot_attempts > len(LOOT_CLICK_OFFSETS) and not aborted:
+                        state["loot_reset_done"] = True
+                    if math.dist(position, start_xy) < 0.55:
+                        state["loot_step_due"] = True
                 distance = math.dist(position, live.track.cell())
                 if not aborted:
                     if phase == "direct":
-                        if elapsed < 0.75:
-                            return True
-                        if walking:
-                            return True
                         state["direct_failures"] += 1
                     elif phase == "approach":
-                        if distance > 2.0 and (walking or elapsed < 0.95):
+                        if distance > 2.0 and (elapsed < 0.95 or (walking and elapsed < 2.25)):
                             return True
-                        if distance > 2.0:
+                        if distance > 2.0 and math.dist(position, start_xy) < 0.75:
+                            state["failed"].add(last_cell)
+                    elif phase == "loot-step":
+                        if elapsed < 0.65 or (walking and elapsed < 1.5):
+                            return True
+                        if math.dist(position, last_cell) > 0.55:
                             state["failed"].add(last_cell)
                     elif walking:
                         return True
@@ -11208,17 +11944,23 @@ class Overlay:
                             return pause_target()
                     else:
                         state["direct_failures"] = 0
-                if phase == "direct" and aborted:
+                if phase == "direct":
+                    if aborted:
+                        state["direct_failures"] += 1
                     with world.lock:
                         if world.pending_pickup and world.pending_pickup[:2] == (gid, clicked_at):
                             world.pending_pickup = None
+                elif aborted:
+                    failed = last_cell
+                    state["failed"].add(failed)
                 state["pending"] = None
             else:
                 if (phase == "direct" and not aborted and elapsed < 1.8
                         and max(attack_at, self._farm_attack_ts) < clicked_at):
                     return True
                 started_walking = phase == "direct" and moved_at >= clicked_at
-                moved = phase != "direct" and self._movement_confirmed(world, clicked_at, position, start_xy)
+                moved = (phase != "direct" and not walking
+                         and tuple(map(round, position)) != tuple(map(round, start_xy)))
                 if max(attack_at, self._farm_attack_ts) >= clicked_at or started_walking or moved:
                     state["pending"] = None
                     state["failed"].clear()
@@ -11228,10 +11970,7 @@ class Overlay:
                             state["following"] = True
                     elif phase == "reposition":
                         state["reposition_goal"] = last_cell
-                elif aborted:
-                    state["pending"] = None
-                    return True
-                elif phase != "direct" and elapsed < 0.85:
+                elif phase != "direct" and not aborted and (walking or elapsed < 0.85):
                     return True
                 else:
                     state["pending"] = None
@@ -11242,6 +11981,16 @@ class Overlay:
                         state["failed"].add(failed)
                         if len(state["failed"]) >= 3:
                             return pause_target()
+
+        if loot_attempts >= LOOT_MAX_ATTEMPTS:
+            with world.lock:
+                current = world.entity(*key)
+                if current is not None and current.created_at == live.created_at:
+                    current.unreachable_until = max(current.unreachable_until, now + 15.0)
+            self._loot_attempts[loot_key] = (loot_attempts, position)
+            self._click_debug(f"[Loot] Drop #{gid} adiado após {loot_attempts} tentativas. "
+                              "A nova tentativa depende de mudar de posição.")
+            return release()
 
         if kind == "mob" and now - attack_at < 1.2:
             self.active_nav_path = None
@@ -11291,7 +12040,19 @@ class Overlay:
         if aimed_tile in nav_blocked:
             return pause_target()
         obstacle_between = self._segment_hits_obstacle(*position, *aimed_cell, nav_blocked)
-        point = resolve(aimed_cell, uv) if uv is not None else None
+        if loot_key is not None:
+            dx, dy = LOOT_CLICK_OFFSETS[loot_attempts % len(LOOT_CLICK_OFFSETS)]
+        elif kind == "mob" and state["direct_failures"]:
+            dx, dy = CLICK_RETRY_OFFSETS[(state["direct_failures"] - 1) % len(CLICK_RETRY_OFFSETS)]
+        else:
+            dx, dy = 0, 0
+
+        def sprite_point(cell_now, uv_now):
+            _, _, width, height_px = viewport
+            shifted = resolve(cell_now, (uv_now[0] + dx / width, uv_now[1] + dy / height_px))
+            return shifted if loot_key is not None else shifted or resolve(cell_now, uv_now)
+
+        point = sprite_point(aimed_cell, uv) if uv is not None else None
         protected_target = visible and point is None
 
         def attack_started():
@@ -11315,10 +12076,14 @@ class Overlay:
             cell_now, uv_now = latest
             with world.lock:
                 player_now = world.player.cell() if world.player else position
+                if kind == "mob" and direct_only and math.dist(player_now, cell_now) > max(
+                    2.5, getattr(world, "player_attack_range", 1.0),
+                ):
+                    return None
             blocked_now, _ = self._navigation_obstacles(snapshot.map, gat)
             if self._segment_hits_obstacle(*player_now, *cell_now, blocked_now):
                 return None
-            screen_now = resolve(cell_now, uv_now)
+            screen_now = sprite_point(cell_now, uv_now)
             if screen_now and not self._is_point_in_hud(*screen_now, margin=10):
                 return screen_now
             return None
@@ -11338,25 +12103,38 @@ class Overlay:
                         return True
                     world.pending_pickup = (gid, clicked_at, retry_delay)
             def ground_target_point(_lead):
-                return None if combat_blocks_click() else screen
+                if combat_blocks_click():
+                    return None
+                if phase == "loot-step":
+                    with world.lock:
+                        current = world.entity(*key)
+                        if current is None or current.created_at != live.created_at:
+                            return None
+                return screen
 
             target_point = current_target_point if phase == "direct" else ground_target_point
             retry_key = ((snapshot.map, kind, gid, live.created_at) if phase == "direct"
                          else (snapshot.map, "ground", ground))
-            retry_hover = phase == "direct" and state["direct_failures"] >= 2
+            retry_hover = (loot_attempts >= len(LOOT_CLICK_OFFSETS) and not state.get("loot_reset_done") if pickup
+                           else phase == "direct" and state["direct_failures"] == 1)
             if not self._navigation_click(snapshot, gat, ground, screen, hwnd=hwnd,
                                           target_point=target_point, retry_key=retry_key,
-                                          ground=phase != "direct", hover_reset=retry_hover):
+                                          ground=phase != "direct", hover_reset=retry_hover,
+                                          pickup_click=pickup,
+                                          allow_offsets=False,
+                                          hover_ms=55 if pickup else None,
+                                          hold_ms=85 if pickup else None):
                 if pickup:
                     with world.lock:
                         if world.pending_pickup and world.pending_pickup[:2] == (gid, clicked_at):
                             world.pending_pickup = None
+                    if now - state.setdefault("loot_refused_at", now) >= 1.0:
+                        self._loot_attempts[loot_key] = (loot_attempts + 1, None)
+                        state.pop("loot_refused_at")
                 return True
-            if pickup and (priority_loot or live.suspected_other_owner or live.retry_after):
-                with world.lock:
-                    current = world.entity(*key)
-                    if current is not None and current.created_at == live.created_at:
-                        current.retry_after = max(current.retry_after, time.time() + retry_delay)
+            if pickup:
+                self._loot_attempts[loot_key] = (loot_attempts + 1, None)
+                state.pop("loot_refused_at", None)
             if kind == "mob" and phase == "direct":
                 self._farm_retry_at = clicked_at + 1.8
             state["pending"] = (clicked_at, position, ground, screen, phase)
@@ -11375,7 +12153,21 @@ class Overlay:
         if kind == "drop":
             distance = math.dist(position, cell)
             pickup_range = 3.0 if priority_loot else 2.0
-            if state["direct_failures"] < 3 and distance <= pickup_range and point and direct_line:
+            if state.get("loot_step_due") and not walking and not direct_only and gat is not None:
+                state.pop("loot_step_due")
+                blocked = nav_blocked | state["failed"] | {target_cell}
+                nearby = sorted(self._patrol_cells_in_radius(*start, 2),
+                                key=lambda ground: (math.dist(ground, cell), math.dist(ground, position)))
+                for ground in nearby:
+                    if ground != start and math.dist(ground, cell) <= min(pickup_range, max(1.5, distance)):
+                        if screen := self._walk_ground_point(gat, position, ground, blocked, resolve):
+                            click(ground, screen, "loot-step")
+                            if state["pending"]:
+                                return True
+            if distance <= pickup_range and planned is not None and point is None and direct_line:
+                self._loot_attempts[loot_key] = (loot_attempts + 1, None)
+                return True
+            if distance <= pickup_range and point and direct_line:
                 last_attack = world.last_player_attack_ts
                 if (live.ownership != "MINE" and now - last_attack < 0.28
                         and state.get("loot_attack_at") != last_attack):
@@ -11385,19 +12177,24 @@ class Overlay:
                     return True
                 self.active_nav_path = None
                 return click(aimed_tile, point, "direct")
-            if walking or (direct_only and not obstacle_between):
-                return True
+            if walking:
+                return state["pending"] is not None
+            if direct_only and not obstacle_between:
+                return release()
             if gat is None or len(state["failed"]) >= 3:
                 return pause_target()
 
-        reposition = state["direct_failures"] >= (3 if kind == "drop" else 2)
+        reposition = state["direct_failures"] >= 3
         can_aim = kind == "mob" and point and direct_line and distance <= direct_range
-        if can_aim and not reposition:
+        if can_aim and (not reposition or direct_only):
             self.active_nav_path = None
-            return click(aimed_tile, point, "direct")
+            handled = click(aimed_tile, point, "direct")
+            if committed and state["pending"]:
+                self._farm_route = None
+            return handled
         if reposition and direct_only and gat is not None and not obstacle_between:
             return True
-        if (direct_only and not obstacle_between) or gat is None or (walking and failed is None and not reposition):
+        if (direct_only and (kind == "mob" or not obstacle_between)) or gat is None or (walking and failed is None and not reposition):
             return pause_target() if failed or reposition else release()
 
         blocked = nav_blocked | state["failed"] | {target_cell}
@@ -11429,15 +12226,39 @@ class Overlay:
                     and self._has_gat_line_of_sight(*ground, *cell, gat)
                     and (not protected_target or resolve(ground) is not None))
 
-        path = self._approach_path(gat, start, target_cell, blocked, penalties, ring=ring)
+        path_key = target_cell, ring_min, ring_max, frozenset(state["failed"]), reposition
+        path = state.get("path", []) if state.get("path_key") == path_key else []
+        if start in path:
+            path = path[path.index(start):]
+            if len(path) <= 1 or any(ground in blocked for ground in path[1:16]):
+                path = []
+        else:
+            path = []
+        if not path and committed and not direct_line:
+            route = self._farm_route
+            if route and route["cell"] == target_cell:
+                remaining = route["path"][route["index"]:]
+                if start in remaining:
+                    remaining = remaining[remaining.index(start):]
+                    if len(remaining) > 1 and ring(remaining[-1]) and not any(
+                        cell in blocked for cell in remaining[1:]
+                    ):
+                        path = remaining
+        if not path:
+            path = self._approach_path(gat, start, target_cell, blocked, penalties,
+                                       ring=ring, ring_radius=ring_max + 1)
+        state["path_key"], state["path"] = path_key, path
+        if committed and not direct_line and (not path or len(path) - 1 > FARM_MAX_PATH_STEPS):
+            self._finish_farm_lock("rota de aproximação bloqueada ou longa demais", resume_patrol=True)
+            return False
         if not path:
             if kind == "mob" and gat is not None:
+                if committed:
+                    return pause_target()
                 with world.lock:
                     current = world.entity(*key)
                     if current and world.map == snapshot.map:
-                        current.unreachable_until = max(current.unreachable_until, now + 6.0)
-                if committed:
-                    self._finish_farm_lock("sem rota válida no .gat")
+                        current.unreachable_until = max(current.unreachable_until, now + 1.5)
                 return release()
             return pause_target()
         self.active_nav_path = path or None
@@ -11454,7 +12275,10 @@ class Overlay:
         if stride is None:
             stride = self._pick_walk_stride(path[:15], position, blocked, ground_point)
         if stride:
-            return click(*stride, "reposition" if reposition and kind == "drop" else "approach")
+            handled = click(*stride, "reposition" if reposition and kind == "drop" else "approach")
+            if committed and not direct_line and state["pending"]:
+                self._farm_route = {"cell": target_cell, "path": path, "index": 0, "started": True}
+            return handled
         return pause_target()
 
     def get_game_hwnd(self, hwnd=None):
@@ -11567,14 +12391,32 @@ class Overlay:
         err_up = ctypes.get_last_error()
         return ok_init, err_init, r_down, err_down, r_up, err_up
 
-    def _click_retry_offset(self, key, point, now, allowed):
-        previous = self._click_retry_history.get(key)
-        if previous is None or now - previous[0] > 20:
-            return (0, 0), tuple(random.sample(CLICK_RETRY_OFFSETS, len(CLICK_RETRY_OFFSETS)))
-        _, previous_offset, remaining = previous
-        if not remaining:
-            remaining = tuple(random.sample(CLICK_RETRY_OFFSETS, len(CLICK_RETRY_OFFSETS)))
-        return remaining[0], remaining[1:]
+    @staticmethod
+    def _mouse_buttons_down():
+        return any(u32.GetAsyncKeyState(key) & 0x8000 for key in (0x01, 0x02, 0x04, 0x05, 0x06))
+
+    @staticmethod
+    def _position_cursor(sx, sy):
+        cursor = wintypes.POINT()
+        def arrived():
+            return bool(u32.GetCursorPos(ctypes.byref(cursor)) and (cursor.x, cursor.y) == (sx, sy))
+
+        if arrived() or (u32.SetCursorPos(sx, sy) and arrived()):
+            return True
+        left, top = u32.GetSystemMetrics(76), u32.GetSystemMetrics(77)
+        width, height = u32.GetSystemMetrics(78), u32.GetSystemMetrics(79)
+        if width < 2 or height < 2 or not (left <= sx < left + width and top <= sy < top + height):
+            return False
+        move = INPUT(type=INPUT_MOUSE)
+        move.mi.dx = round((sx - left) * 65535 / (width - 1))
+        move.mi.dy = round((sy - top) * 65535 / (height - 1))
+        move.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | 0x4000  # VIRTUALDESK
+        return bool(u32.SendInput(1, ctypes.byref(move), ctypes.sizeof(INPUT)) and arrived())
+
+    def _move_cursor_released(self, sx, sy):
+        if not win32_input.release_pending_touch() or self._mouse_buttons_down():
+            return False
+        return win32_input.move_cursor_with_touch_hover(sx, sy) or self._position_cursor(sx, sy)
 
     def _hover_reset_away_point(self, sx, sy, viewport=None):
         """Retorna um ponto seguro ~3-4 células distante do alvo para reset de hover sem clicar nele."""
@@ -11600,7 +12442,9 @@ class Overlay:
         return None
 
     def _schedule_game_click(self, sx, sy, game_hwnd=None, *, target_point=None, retry_key=None,
-                             hover_reset=False, hover_reset_point=None, completion=None):
+                             hover_reset=False, hover_reset_point=None, completion=None,
+                             allow_offsets=True, direct_touch=False, trace_touch=False,
+                             click_action=None, pickup_click=False, hover_ms=None, hold_ms=None):
         """Agenda o clique do jogo e mantém o estado da automação."""
         now = time.perf_counter()
         if self._automation_click_active():
@@ -11621,77 +12465,100 @@ class Overlay:
         root_hwnd = game_window[1]
 
         sx, sy = int(sx), int(sy)
-        click_x, click_y = sx, sy
-        aim = target_point
+        attempt = 0
         offset = (0, 0)
         if retry_key is not None:
             retry_key = (root_hwnd, retry_key)
-            viewport = self.current_viewport
-
-            def allowed(point):
-                if not viewport:
-                    return False
-                vx, vy, vw, vh = viewport
-                x, y = point
-                return (vx <= x < vx + vw and vy <= y < vy + vh
-                        and not self._is_point_in_game_ui(x, y)
-                        and not self._is_point_in_vending_shop(x, y))
-
-            offset, remaining = self._click_retry_offset(retry_key, (sx, sy), now, allowed)
-            click_x, click_y = sx + offset[0], sy + offset[1]
-            if target_point is not None and offset != (0, 0):
-                def aim(lead):
-                    point = target_point(lead)
-                    if point is None:
-                        return None
-                    shifted = point[0] + offset[0], point[1] + offset[1]
-                    return shifted if allowed(shifted) else point
+            last_at, last_attempt = self._click_retry_history.get(retry_key, (float("-inf"), -1))
+            if now - last_at <= 20.0:
+                attempt = last_attempt + 1
+            if allow_offsets and attempt >= 2:
+                offset = CLICK_RETRY_OFFSETS[(attempt - 2) % len(CLICK_RETRY_OFFSETS)]
+        reset_hover = hover_reset or (allow_offsets and attempt == 1)
 
         def can_click():
             return self._game_input_ready(hwnd) and self._is_game_focused(game_window=game_window)
 
+        prepared = False
+
         def ready_aim(lead):
-            if not can_click():
+            nonlocal prepared
+            if (not can_click() or not win32_input.release_pending_touch()
+                    or self._mouse_buttons_down()):
                 return None
-            return aim(lead) if aim is not None else (click_x, click_y)
+            point = target_point(lead) if target_point is not None else (sx, sy)
+            if point is None:
+                return None
+            x, y = map(int, point)
+            if offset != (0, 0) and self.current_viewport:
+                shifted = x + offset[0], y + offset[1]
+                vx, vy, vw, vh = self.current_viewport
+                if (vx <= shifted[0] < vx + vw and vy <= shifted[1] < vy + vh
+                        and not self._is_point_in_hud(*shifted, margin=10)
+                        and not self._is_point_in_game_ui(*shifted)
+                        and not self._is_point_in_vending_shop(*shifted)):
+                    x, y = shifted
+            prepared = True
+            return x, y
 
         def _do_smooth_click():
             sent = False
             try:
                 if not can_click():
+                    if trace_touch:
+                        log_click_file("[PIN Debug] Envio cancelado pelo agendador: janela indisponível ou sem foco.")
                     return
-                if u32.GetAsyncKeyState(0x01) & 0x8000:  # VK_LBUTTON
-                    self._click_debug("Clique adiado: botão esquerdo ainda pressionado antes do movimento.")
+                ensure_input_desktop()
+                if not win32_input.release_pending_touch() or self._mouse_buttons_down():
+                    if trace_touch:
+                        log_click_file("[PIN Debug] Envio cancelado pelo agendador: botão ou toque ainda ativo.")
                     return
-                world = getattr(self.feed, "world", None)
-                if hover_reset and (world is None or not world._is_player_walking()):
+                if reset_hover:
                     away = (hover_reset_point if hover_reset_point is not None
-                            else self._hover_reset_away_point(click_x, click_y))
-                    if away is not None and can_click():
-                        win32_input.move_cursor_relative(away[0], away[1])
+                            else self._hover_reset_away_point(sx, sy))
+                    moved = away is not None and self._move_cursor_released(*away)
+                    if moved:
                         time.sleep(0.05)
-                        if not can_click():
+                    if pickup_click:
+                        cursor = wintypes.POINT()
+                        if (not moved or not u32.GetCursorPos(ctypes.byref(cursor))
+                                or math.dist((cursor.x, cursor.y), away) > 5):
                             return
-                        if u32.GetAsyncKeyState(0x01) & 0x8000:
-                            self._click_debug("Clique adiado: botão esquerdo ainda pressionado após afastar o cursor.")
-                            return
-                last_post_error = None
-
-                def pin_click_log(message):
-                    nonlocal last_post_error
-                    last_post_error = ctypes.get_last_error()
-                    log_click_file(message.removeprefix("[ClickDebug] "))
-
-                sent = win32_input.move_and_click(
-                    click_x, click_y, hwnd, root_hwnd,
-                    is_focused=can_click, target_point=ready_aim,
-                    cursor_tolerance=1 if offset != (0, 0) else 3,
-                    debug=self._click_debug, log=pin_click_log if completion is not None else log_click_file,
-                    is_admin=getattr(self, "is_admin", False),
-                )
-                if not sent and last_post_error is not None:
-                    log_click_file(f"[PIN Debug] Último erro de PostMessageW: {last_post_error}. "
-                                   f"Overlay elevado: {'sim' if self.is_admin else 'não'}.")
+                if click_action is not None:
+                    point = ready_aim(0.075)
+                    if point is not None:
+                        sent = click_action(point)
+                elif direct_touch:
+                    point = ready_aim(0.075)
+                    if point is None:
+                        return
+                    if not self._move_cursor_released(*point):
+                        if trace_touch:
+                            log_click_file("[PIN Debug] Toque direto adiado: posicionamento recusado.")
+                        return
+                    time.sleep(0.09)
+                    latest = ready_aim(0.022)
+                    if latest is None or math.dist(point, latest) > 4:
+                        return
+                    win32_input.begin_bot_click()
+                    try:
+                        down, down_error, up, up_error = win32_input.tap_touch(point)
+                    finally:
+                        win32_input.finish_bot_click()
+                    sent = bool(down and up)
+                    if trace_touch or not sent:
+                        log_click_file(f"[Clique] Toque em {point}: pressionar={down} ({down_error}), "
+                                       f"soltar={up} ({up_error}).")
+                else:
+                    sent = win32_input.move_and_click(
+                        sx, sy, hwnd, root_hwnd,
+                        is_focused=can_click, target_point=ready_aim,
+                        cursor_tolerance=1 if offset != (0, 0) else 3,
+                        debug=self._click_debug, log=log_click_file,
+                        is_admin=getattr(self, "is_admin", False),
+                        pickup_click=pickup_click,
+                        hover_ms=hover_ms, hold_ms=hold_ms,
+                    )
             except Exception as exc:
                 print(f"[ClickDebug] move_and_click erro: {exc}", flush=True)
             finally:
@@ -11705,10 +12572,15 @@ class Overlay:
                         self._sprite_click_lead = lead * 0.75 + measured * 0.25
                 completed_at = time.monotonic()
                 self._last_touch_result = ((int(sx), int(sy)), completed_at, sent)
-                if completion is not None:
-                    completion.set_result((completed_at, sent))
+                if retry_key is not None and prepared:
+                    self._click_retry_history[retry_key] = (finished_at, attempt)
+                    self._click_retry_history.move_to_end(retry_key)
+                    if len(self._click_retry_history) > 256:
+                        self._click_retry_history.popitem(last=False)
                 self._click_busy = False
                 self._click_in_progress = False
+                if completion is not None:
+                    completion.set_result((completed_at, sent))
 
         started = False
         try:
@@ -11718,11 +12590,6 @@ class Overlay:
             self._last_click_ts = self.last_bot_click_ts = now
             threading.Thread(target=_do_smooth_click, daemon=True).start()
             started = True
-            if retry_key is not None:
-                self._click_retry_history[retry_key] = (now, offset, remaining)
-                self._click_retry_history.move_to_end(retry_key)
-                if len(self._click_retry_history) > 256:
-                    self._click_retry_history.popitem(last=False)
         finally:
             if not started:
                 self._click_busy = self._click_in_progress = False
@@ -11825,37 +12692,31 @@ class Overlay:
                             if call(control, 0, (ptr, out_ptr), iid_volume, ctypes.byref(volume)) >= 0:
                                 call(volume, 5, (wintypes.BOOL, ptr), True, None)  # ISimpleAudioVolume::SetMute
 
-    @staticmethod
-    def _tuck_osk_window(osk_hwnd):
-        if not osk_hwnd:
-            return
-        sw = u32.GetSystemMetrics(0) or 1920
-        sh = u32.GetSystemMetrics(1) or 1080
-        x = max(0, sw - 260)
-        y = max(0, sh - 80)
-        # SWP_NOSIZE (0x01) | SWP_NOZORDER (0x04) | SWP_NOACTIVATE (0x10) | SWP_FRAMECHANGED (0x20)
-        u32.SetWindowPos(osk_hwnd, None, x, y, 0, 0, 0x0035)
-        u32.ShowWindow(osk_hwnd, 7)  # SW_SHOWMINNOACTIVE
-
     def _prepare_osk_startup(self):
         try:
-            if existing_osk := u32.FindWindowW("OSKMainClass", None):
-                self._tuck_osk_window(existing_osk)
-            self._ensure_stealth_osk()
+            with self._osk_send_lock:
+                self._ensure_stealth_osk()
         except Exception as exc:
             print(f"[OSK] Falha ao preparar OSK na inicialização: {exc}", flush=True)
 
-    def _ensure_stealth_osk(self):
+    def _ensure_stealth_osk(self, *, require_numpad=False):
         import winreg
 
         sw = u32.GetSystemMetrics(0) or 1920
         sh = u32.GetSystemMetrics(1) or 1080
+        numpad_configured = False
         try:
             with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Osk") as key:
+                winreg.SetValueEx(key, "ShowNumPad", 0, winreg.REG_DWORD, 1)
+                numpad_configured = True
                 winreg.SetValueEx(key, "ClickSound", 0, winreg.REG_DWORD, 0)
                 winreg.SetValueEx(key, "WindowLeft", 0, winreg.REG_DWORD, max(0, sw - 260))
                 winreg.SetValueEx(key, "WindowTop", 0, winreg.REG_DWORD, max(0, sh - 80))
+                winreg.SetValueEx(key, "WindowWidth", 0, winreg.REG_DWORD, 260)
+                winreg.SetValueEx(key, "WindowHeight", 0, winreg.REG_DWORD, 80)
         except OSError as exc:
+            if require_numpad and not numpad_configured:
+                raise
             print(f"[OSK] Não foi possível configurar registro do OSK: {exc}", flush=True)
 
         osk_hwnd = u32.FindWindowW("OSKMainClass", None)
@@ -11872,26 +12733,17 @@ class Overlay:
                 osk_hwnd = u32.FindWindowW("OSKMainClass", None)
 
         self._mute_osk_audio(osk_hwnd)
-        ctypes.set_last_error(0)
-        styles = u32.GetWindowLongW(osk_hwnd, -20)  # GWL_EXSTYLE
-        if not styles and ctypes.get_last_error():
-            raise ctypes.WinError(ctypes.get_last_error())
-        stealth_styles = 0x80000 | 0x20 | 0x08000000 | 0x80
-        desired_styles = (styles | stealth_styles) & ~0x40000  # Remove WS_EX_APPWINDOW.
-        if styles != desired_styles:
-            ctypes.set_last_error(0)
-            if not u32.SetWindowLongW(osk_hwnd, -20, desired_styles) and ctypes.get_last_error():
-                raise ctypes.WinError(ctypes.get_last_error())
-        self._tuck_osk_window(osk_hwnd)
         if was_missing:
             time.sleep(0.05)
+        try:
+            # Garante que o OSK fique recolhido no canto inferior direito fora da área do jogo
+            u32.SetWindowPos(osk_hwnd, 0, max(0, sw - 260), max(0, sh - 80), 260, 80, 0x0010 | 0x0004)
+        except Exception:
+            pass
         self._osk_hwnd = osk_hwnd
         return osk_hwnd
 
-    def _send_key_via_osk(self, vk: int, *, game_window=None, allowed=None) -> bool:
-        from contextlib import ExitStack
-        from uuid import UUID
-
+    def _send_key_via_osk(self, vk: int, *, game_window=None, allowed=None, alt=False) -> bool:
         is_function_key = 0x70 <= vk <= 0x7B
         aliases = {
             0x2D: {"insert", "ins"},
@@ -11904,12 +12756,22 @@ class Overlay:
             0x25: {"seta para a esquerda", "esquerda", "left", "left arrow"},
             0x28: {"seta para baixo", "para baixo", "baixo", "down", "down arrow"},
             0x27: {"seta para a direita", "direita", "right", "right arrow"},
+            0x45: {"e"},
         }.get(vk, {f"f{vk - 0x6F}", f"fn+f{vk - 0x6F}"} if is_function_key else set())
         if not aliases:
             return False
+        return self._invoke_osk_key(aliases, vk=vk, game_window=game_window, allowed=allowed, alt=alt)
 
-        prefix = f"[OSK VK=0x{vk:02X}]"
-        osk_hwnd = self._ensure_stealth_osk()
+    def _invoke_osk_key(self, aliases, *, vk=None, osk_hwnd=None, game_window=None, allowed=None,
+                        numpad5=False, allow_numpad_fallback=False, alt=False) -> bool | None:
+        from contextlib import ExitStack
+        from uuid import UUID
+
+        pin_click = vk is None
+        is_function_key = not pin_click and 0x70 <= vk <= 0x7B
+        prefix = "[OSK PIN]" if pin_click else f"[OSK VK=0x{vk:02X}]"
+        if not osk_hwnd:
+            osk_hwnd = self._ensure_stealth_osk()
         ptr = ctypes.c_void_p
         out_ptr = ctypes.POINTER(ptr)
         hresult = ctypes.c_long
@@ -11932,9 +12794,12 @@ class Overlay:
                 self._focus_hud_game()
 
         def can_invoke(_hwnd, restore_fn=False):
+            if pin_click:
+                return allowed is None or allowed()
             return self._is_game_focused(game_window=game_window) and (restore_fn or allowed is None or allowed())
 
-        if vk not in self._osk_fn_keys and (pattern := self._osk_invoke_cache.get(vk)):
+        if (not pin_click and not alt and can_invoke(osk_hwnd)
+                and vk not in self._osk_fn_keys and (pattern := self._osk_invoke_cache.get(vk))):
             if invoke(pattern) == 0:
                 game_has_focus(osk_hwnd)
                 return True
@@ -11971,10 +12836,11 @@ class Overlay:
                     oleaut32.SysFreeString(value)
 
         with ExitStack() as session:
-            session.callback(game_has_focus, osk_hwnd)
+            if not pin_click:
+                session.callback(game_has_focus, osk_hwnd)
             root = true_condition = None
 
-            def find_and_invoke(names, cache_vk, *, restore_fn=False):
+            def find_and_invoke(names, cache_vk, *, restore_fn=False, matches=None):
                 nonlocal root, true_condition
                 if cache_vk is not None and (pattern := self._osk_invoke_cache.get(cache_vk)):
                     if not can_invoke(osk_hwnd, restore_fn):
@@ -12014,7 +12880,11 @@ class Overlay:
                             automation_id = read_bstr(element, 29)
                             if name or automation_id:
                                 found.add((name, automation_id))
-                            if names.isdisjoint((name.strip().casefold(), automation_id.strip().casefold())):
+                            name_key, id_key = name.strip().casefold(), automation_id.strip().casefold()
+                            if matches is not None:
+                                if not matches(name_key, id_key):
+                                    continue
+                            elif names.isdisjoint((name_key, id_key)):
                                 continue
                             state_type = (ctypes.POINTER(wintypes.BOOL),)
                             offscreen, enabled = wintypes.BOOL(), wintypes.BOOL()
@@ -12037,6 +12907,9 @@ class Overlay:
                                 print(f"{prefix} descartado: jogo sem foco.", flush=True)
                                 return False, found
                             hr = invoke(pattern)
+                            if numpad5:
+                                log_click_file(f"[PIN] InvokePattern Numpad 5 Name={name!r}, "
+                                               f"AutomationId={automation_id!r}, HRESULT=0x{hr & 0xFFFFFFFF:08X}.")
                             if hr == 0:
                                 if cache_vk is not None:
                                     call(pattern, 1, wintypes.ULONG)  # IUnknown::AddRef
@@ -12049,6 +12922,27 @@ class Overlay:
             def log_missing(names, found):
                 print(f"{prefix} botão {sorted(names)} indisponível. "
                       f"Controles (nome, ID): {sorted(found)}", flush=True)
+
+            if pin_click:
+                if numpad5:
+                    sent, found = find_and_invoke((), None, matches=lambda _name, aid: aid == "10664")
+                    if sent is not None:
+                        return sent
+                    if any(aid.strip() == "10664" for _, aid in found):
+                        log_click_file("[PIN] Controle 10664 encontrado, mas sem InvokePattern disponível.")
+                        return False
+                    if allow_numpad_fallback:
+                        sent, _ = find_and_invoke(
+                            (), None, matches=lambda name, aid: name == "5" and bool(aid) and aid != "6",
+                        )
+                        if sent is not None:
+                            return sent
+                    log_click_file("[PIN] Controle 10664 indisponível na árvore do OSK.")
+                    return None
+                sent, found = find_and_invoke(aliases, None)
+                if sent is None:
+                    log_missing(aliases, found)
+                return bool(sent)
 
             titlebar_controls = {
                 "fechar", "maximizar", "minimizar", "restaurar",
@@ -12067,6 +12961,29 @@ class Overlay:
                 time.sleep(0.12)
                 game_has_focus(osk_hwnd)
                 return True
+
+            if alt:
+                if u32.GetAsyncKeyState(0x12) & 0x8000:
+                    return False
+                alt_names = {"alt", "left alt", "alt (left)", "alt esquerdo", "alt esquerda", "alt (esquerdo)"}
+                latched, found = find_and_invoke(alt_names, None)
+                if latched is None and restore_collapsed_osk(found):
+                    latched, found = find_and_invoke(alt_names, None)
+                if not latched:
+                    if latched is None:
+                        log_missing(alt_names, found)
+                    return False
+                sent = False
+                try:
+                    time.sleep(0.04)
+                    sent, found = find_and_invoke(aliases, vk)
+                    if sent is None:
+                        log_missing(aliases, found)
+                    return bool(sent)
+                finally:
+                    if not sent:
+                        game_has_focus(osk_hwnd)
+                        find_and_invoke(alt_names, None, restore_fn=True)
 
             if vk not in self._osk_fn_keys:
                 sent, found = find_and_invoke(aliases, vk)
@@ -12100,8 +13017,31 @@ class Overlay:
                     log_missing(fn_names, found)
             return bool(sent and restored_fn)
 
+    def _send_osk_with_retry(self, vk, *, game_window, allowed=None, alt=False):
+        with self._osk_send_lock:
+            if time.monotonic() < self._osk_retry_after:
+                return False
+            for attempt in range(3):
+                if (self._game_key_closed or not self._is_game_focused(game_window=game_window)
+                        or (allowed is not None and not allowed())):
+                    return False
+                try:
+                    if self._send_key_via_osk(vk, game_window=game_window, allowed=allowed, alt=alt):
+                        self._osk_retry_after = 0.0
+                        return True
+                except OSError as exc:
+                    transient = (isinstance(exc, TimeoutError)
+                                 or "ElementFromHandle HRESULT=0x80040201" in str(exc))
+                    if transient and attempt < 2:
+                        time.sleep((0.15, 0.35)[attempt])
+                        continue
+                    print(f"[OSK] Falha ao enviar VK=0x{vk:02X}: {exc}", flush=True)
+                self._osk_retry_after = time.monotonic() + 1.25
+                return False
+        return False
+
     def _send_game_key(self, vk: int, *, restore_focus=False, completion=None, allowed=None,
-                       allow_storage_escape=False) -> bool:
+                       allow_storage_escape=False, osk_alt=False) -> bool:
         if self._automation_click_active():
             return False
         if vk == 0x1B and self._is_storage_or_pin_escape_blocked(allow_storage_escape=allow_storage_escape):
@@ -12117,7 +13057,7 @@ class Overlay:
             return False
 
         mapping = None
-        if vk not in OSK_ABNT2_KEYS and not 0x70 <= vk <= 0x7B:
+        if not osk_alt and vk not in OSK_ABNT2_KEYS and not 0x70 <= vk <= 0x7B:
             size = ctypes.sizeof(INPUT)
             if size != 40:
                 print(f"[Teclado] INPUT inválido para Win32 x64: {size} bytes.", flush=True)
@@ -12129,10 +13069,15 @@ class Overlay:
             if not mapping[0]:
                 print(f"[Teclado] VK=0x{vk:02X} descartado: scan code indisponível.", flush=True)
                 return False
+        queued_at = time.monotonic()
+        key = (game_window, vk, osk_alt)
         with self._game_key_ready:
-            if self._game_key_closed:
+            if (self._game_key_closed or self._menu_selection_active
+                    or (mapping is None and (key in self._game_key_pending or queued_at < self._osk_retry_after))):
                 return False
-            self._game_key_queue.append((game_window, vk, mapping, completion, allowed))
+            if mapping is None:
+                self._game_key_pending.add(key)
+            self._game_key_queue.append((game_window, vk, mapping, completion, allowed, queued_at, osk_alt))
             if not self._game_key_worker_active:
                 worker = threading.Thread(target=self._drain_game_keys, name="game-keyboard", daemon=True)
                 self._game_key_worker_active = True
@@ -12141,6 +13086,8 @@ class Overlay:
                 except RuntimeError as exc:
                     self._game_key_worker_active = False
                     self._game_key_queue.pop()
+                    if mapping is None:
+                        self._game_key_pending.discard(key)
                     print(f"[Teclado] Falha ao iniciar envio: {exc}", flush=True)
                     return False
             self._game_key_ready.notify()
@@ -12160,15 +13107,16 @@ class Overlay:
                         self._game_key_ready.wait()
                     if self._game_key_closed and not self._game_key_queue:
                         return
-                    game_window, vk, mapping, completion, allowed = self._game_key_queue.popleft()
+                    game_window, vk, mapping, completion, allowed, queued_at, osk_alt = self._game_key_queue.popleft()
                 sent_at = None
                 try:
-                    if allowed is not None and not allowed():
+                    if (self._game_key_closed or self._menu_selection_active or time.monotonic() - queued_at > 2.0
+                            or (allowed is not None and not allowed())):
                         continue
                     if not self._is_game_focused(game_window=game_window):
                         continue
                     if mapping is None:
-                        if self._send_key_via_osk(vk, game_window=game_window, allowed=allowed):
+                        if self._send_osk_with_retry(vk, game_window=game_window, allowed=allowed, alt=osk_alt):
                             sent_at = time.monotonic()
                     else:
                         scancode, extended = mapping
@@ -12187,6 +13135,9 @@ class Overlay:
                 except Exception as exc:
                     print(f"[Teclado] Falha ao enviar VK=0x{vk:02X}: {exc}", flush=True)
                 finally:
+                    if mapping is None:
+                        with self._game_key_ready:
+                            self._game_key_pending.discard((game_window, vk, osk_alt))
                     if completion is not None and not completion.done():
                         completion.set_result(sent_at)
         finally:
@@ -12238,7 +13189,7 @@ class Overlay:
         print(f"[Teste Sentar] {status}", flush=True)
 
     def _send_menu_selection(self, index: int, *, allowed=None):
-        if self._menu_selection_active or index < 0:
+        if self._menu_selection_active or index < 0 or time.monotonic() < self._osk_retry_after:
             return None
         dialog = dict(self.feed.world.npc_dialog)
         allowed = allowed or self._dialog_action_guard(dialog, lambda: True)
@@ -12246,6 +13197,9 @@ class Overlay:
         self._menu_selection_active = True
         hwnd = self.get_game_hwnd()
         game_window = self._remember_game_window(hwnd)
+        menu_key = (game_window, self.feed.world.map, dialog.get("npc_id"), dialog.get("seq"), index)
+        if self._menu_osk_progress is None or self._menu_osk_progress[0] != menu_key:
+            self._menu_osk_progress = (menu_key, 0)
 
         def _worker():
             sent_at = None
@@ -12259,19 +13213,18 @@ class Overlay:
                 delay = dialog.get("last_ts", 0.0) + 0.15 - time.perf_counter()
                 if delay > 0:
                     time.sleep(delay)
-                for step_down in range(index):
-                    if not allowed():
+                with self._osk_send_lock:
+                    for step_down in range(self._menu_osk_progress[1], index):
+                        if not self._send_osk_with_retry(0x28, game_window=game_window, allowed=allowed):
+                            return
+                        self._menu_osk_progress = (menu_key, step_down + 1)
+                        if step_down < index - 1:
+                            time.sleep(0.120)
+                    time.sleep(0.150)
+                    if not self._send_osk_with_retry(0x0D, game_window=game_window, allowed=allowed):
                         return
-                    if not self._send_key_via_osk(0x28, game_window=game_window, allowed=allowed):
-                        return
-                    if step_down < index - 1:
-                        time.sleep(0.120)
-                time.sleep(0.150)
-                if not allowed():
-                    return
-                if not self._send_key_via_osk(0x0D, game_window=game_window, allowed=allowed):
-                    return
-                sent_at = time.monotonic()
+                    self._menu_osk_progress = None
+                    sent_at = time.monotonic()
             except Exception as exc:
                 print(f"[Kafra] Falha ao enviar teclas via OSK: {exc}", flush=True)
             finally:
@@ -12296,10 +13249,15 @@ class Overlay:
         """Dispara clique via touch_postmsg (pipeline funcional de 9e1ac16)."""
         return self._dispatch_game_click(game_hwnd, sx, sy, method="touch_postmsg", test_mode=test_mode)
 
-    def patrol_move_and_click(self, sx, sy, *, hwnd=None, target_point=None, retry_key=None, hover_reset=False):
+    def patrol_move_and_click(self, sx, sy, *, hwnd=None, target_point=None, retry_key=None,
+                              hover_reset=False, hover_reset_point=None, allow_offsets=True,
+                              completion=None, direct_touch=False, pickup_click=False,
+                              hover_ms=None, hold_ms=None):
         return self._dispatch_game_click(
             hwnd, sx, sy, method="touch_postmsg", target_point=target_point,
-            retry_key=retry_key, hover_reset=hover_reset,
+            retry_key=retry_key, hover_reset=hover_reset, hover_reset_point=hover_reset_point,
+            allow_offsets=allow_offsets, completion=completion, direct_touch=direct_touch,
+            pickup_click=pickup_click, hover_ms=hover_ms, hold_ms=hold_ms,
         )
 
     def _send_click(self, hwnd, screen_x, screen_y, test_mode=False, **_kwargs):
@@ -12356,7 +13314,10 @@ class Overlay:
         return False
 
     def _dispatch_game_click(self, hwnd, screen_x, screen_y, *, method, test_mode=False,
-                             target_point=None, retry_key=None, hover_reset=False):
+                             target_point=None, retry_key=None, hover_reset=False,
+                             hover_reset_point=None, allow_offsets=True,
+                             completion=None, direct_touch=False, pickup_click=False,
+                             hover_ms=None, hold_ms=None):
         """Envia clique na posição física (screen_x, screen_y)."""
         hwnd = self.get_game_hwnd(hwnd)
         if not self._game_input_ready(hwnd):
@@ -12396,7 +13357,9 @@ class Overlay:
                 return False
             self._action_click_used = True
 
-        owns_click_lock = not test_mode and method != "touch_postmsg"
+        if self._mouse_buttons_down():
+            return False
+        owns_click_lock = method != "touch_postmsg"
         if owns_click_lock:
             self._click_in_progress = True
         try:
@@ -12412,7 +13375,11 @@ class Overlay:
                     world = getattr(self.feed, "world", None)
                     retry_key = ("screen", getattr(world, "map", None), sx, sy)
                 return self._schedule_game_click(
-                    sx, sy, hwnd, target_point=target_point, retry_key=retry_key, hover_reset=hover_reset,
+                    sx, sy, hwnd, target_point=target_point, retry_key=retry_key,
+                    hover_reset=hover_reset, hover_reset_point=hover_reset_point,
+                    allow_offsets=allow_offsets, completion=completion,
+                    direct_touch=direct_touch, pickup_click=pickup_click,
+                    hover_ms=hover_ms, hold_ms=hold_ms,
                 )
 
             # ── 0. Hardware USB HID (Serial) Bypass se conectado ────────────────
@@ -12478,7 +13445,7 @@ class Overlay:
                 inp_up = INPUT(type=INPUT_MOUSE)
                 inp_up.mi.dx = norm_x
                 inp_up.mi.dy = norm_y
-                inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
+                inp_up.mi.dwFlags = MOUSEEVENTF_LEFTUP
                 ctypes.windll.kernel32.SetLastError(0)
                 r_si_up = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
                 err_si_up = ctypes.get_last_error()
@@ -12552,7 +13519,7 @@ class Overlay:
                 inp_up = INPUT(type=INPUT_MOUSE)
                 inp_up.mi.dx = norm_x
                 inp_up.mi.dy = norm_y
-                inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
+                inp_up.mi.dwFlags = MOUSEEVENTF_LEFTUP
                 ctypes.windll.kernel32.SetLastError(0)
                 r_si_up = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
                 err_si_up = ctypes.get_last_error()
@@ -12656,7 +13623,7 @@ class Overlay:
             inp_up = INPUT(type=INPUT_MOUSE)
             inp_up.mi.dx = norm_x
             inp_up.mi.dy = norm_y
-            inp_up.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP | abs_flags
+            inp_up.mi.dwFlags = MOUSEEVENTF_LEFTUP
             k32.SetLastError(0)
             r_up_si = int(u32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT)))
             err_si_up = ctypes.get_last_error()
@@ -12713,27 +13680,31 @@ class Overlay:
                 f"D={r_down}(err={err_down}) U={r_up}(err={err_up})"
             )
 
-    def _try_auto_farm(self, snapshot, position, entities, *, defense=False, direct_only=False):
+    def _try_auto_farm(self, snapshot, position, entities, *, defense=False, direct_only=False,
+                       loot_defense=False):
         if self._locked_farm_target_id is not None:
             return True
         world = self.feed.world
         now = time.monotonic()
+        if not defense and self.auto_patrol and now < self._farm_patrol_until:
+            return False
+        self.ignored_mobs = {gid: until for gid, until in self.ignored_mobs.items() if until > now}
         combat_gid = world.locked_combat_mob_gid
         self.locked_combat_mob_gid = combat_gid
         candidates = []
         for (kind, gid), mob in entities:
-            if kind != "mob" or mob.unreachable_until > now:
+            if kind != "mob" or mob.unreachable_until > now or gid in self.ignored_mobs:
                 continue
             cell = mob.track.cell()
             distance = math.dist(position, cell)
+            if distance > 20.0:
+                continue
             active = (gid == combat_gid and distance <= 2.5) or self._is_active_threat(world, gid, mob, position, now)
             if defense:
-                if not active and not (distance <= 2.5 and self._is_mob_hostile(world, mob)):
+                if not loot_defense and not active and not (distance <= 2.5 and self._is_mob_hostile(world, mob)):
                     continue
-                if direct_only and distance > 2.5:
+                if direct_only and not loot_defense and distance > 2.5:
                     continue
-            elif distance > 22 and gid != combat_gid:
-                continue
             if mob.engaged_by_other_until > now and gid != combat_gid and not active:
                 continue
             name = self.names.get("mob", {}).get(mob.catalog_id, "").strip().lower()
@@ -12751,53 +13722,45 @@ class Overlay:
         terrain = getattr(self.feed, "terrain", None)
         gat = terrain.for_map(world.map) if terrain and world.map else None
         start = tuple(round(coord) for coord in position)
-        blocked, penalties = self._navigation_obstacles(snapshot.map, gat)
+        blocked, _ = self._navigation_obstacles(snapshot.map, gat)
         ranked = []
-        attack_range = max(2.0, getattr(world, "player_attack_range", 1.0))
         for gid, mob, cell, distance, active, attacking_player in candidates:
             target_cell = tuple(round(coord) for coord in cell)
             if target_cell in blocked:
                 continue
-            cost = distance * 10
-            if gat:
-                has_los = (self._has_gat_line_of_sight(*start, *target_cell, gat)
-                           and not self._segment_hits_obstacle(*start, *target_cell, blocked))
-                if not has_los:
-                    if direct_only:
-                        continue
-                    path = self._approach_path(gat, start, target_cell, blocked, penalties)
-                    if not path:
-                        path = self._approach_path(
-                            gat, start, target_cell, blocked, penalties,
-                            ring=lambda ground: (
-                                ground != start and ground not in blocked
-                                and math.dist(ground, target_cell) <= attack_range
-                                and not self._segment_hits_obstacle(*ground, *target_cell, blocked)
-                                and self._has_gat_line_of_sight(*ground, *target_cell, gat)
-                            ),
-                        )
-                    if not path:
-                        mob.unreachable_until = now + 6.0
-                        continue
-                    cost = self._path_cost(path) + sum(penalties.get(step, 0.0) for step in path[1:])
-            ranked.append((not attacking_player, defense and not active, cost, gid, distance, mob))
+            has_los = (self._has_gat_line_of_sight(*start, *target_cell, gat)
+                       and not self._segment_hits_obstacle(*start, *target_cell, blocked))
+            if direct_only and gat is not None and not has_los:
+                continue
+            immediate = self._is_immediate_loot_threat(world, gid, mob, position, now)
+            path = self._farm_path(gat, start, target_cell, blocked, max_steps=FARM_MAX_PATH_STEPS) if not immediate else []
+            steps = len(path) - 1 if path else math.ceil(distance)
+            if not immediate and (not path or steps > FARM_MAX_PATH_STEPS):
+                continue
+            ranked.append((not attacking_player, defense and not active, steps, gid, distance, target_cell, path))
 
         if not ranked:
             return False
-        _, _, _, gid, distance, mob = min(ranked)
+        _, _, steps, gid, distance, cell, path = min(ranked)
         self._locked_farm_target_id = self._locked_mob_gid = gid
+        with world.lock:
+            world.farm_target_gid = gid
+        self._farm_route = {"cell": cell, "path": path, "index": 0, "started": False} if path else None
         self._farm_lock_started_at = now
         self._farm_attack_ts = self._farm_range_hit_ts = 0.0
         self._farm_attack_action = None
         self._farm_retry_at = 0.0
         self._farm_range = 1.0
         self._farm_reachability_check = None
+        self._farm_target_missing_since = None
         self._in_active_combat = False
-        print(f"[FarmLock] Alvo travado: #{gid} (dist={distance:.1f})", flush=True)
-        self._continue_farm_lock(snapshot, position, now, direct_only=direct_only)
-        return True
+        print(f"[FarmLock] Alvo travado: #{gid} (dist={distance:.1f}, A*={steps if path else 'defesa imediata'})",
+              flush=True)
+        return self._continue_farm_lock(snapshot, position, now, direct_only=direct_only)
 
     def _position_render_window(self, viewport):
+        if viewport is not None and getattr(self, "_pin_render_suspended", False):
+            return False
         previous = self._render_layout
         if viewport is None:
             self._pin_debug_drawn = None
@@ -13141,8 +14104,12 @@ class Overlay:
         if not viewport:
             return None
         cycle = self._kafra_cycle
+        probe = getattr(self, "_pin_click_probe", None)
         opening = cycle and cycle["phase"] == "opening"
         probe_status = getattr(self, "_pin_probe_status", None)
+        if probe and (seq := probe.get("pin_seq")) and seq["viewport"] == viewport:
+            status = f"Teste de senha · {seq['step']}/{len(seq['pin'])}"
+            return seq["rect"], seq["buttons"], seq["ok"], probe.get("pin_debug_aim"), status
         status = probe_status or ("Kafra aguardando a senha" if opening else "Só leitura")
         rect = None
         if opening and (seen := cycle.get("pin_debug_rect")):
@@ -13194,10 +14161,9 @@ class Overlay:
             return True
         if not stale_reading and reading != getattr(self, "_pin_debug_logged", None):
             screen_rect = (vx + x, vy + y, width, height)
-            screen_buttons = {digit: (vx + x + bx, vy + y + by) for digit, (bx, by) in ordered_buttons}
             screen_ok = (vx + x + ok[0], vy + y + ok[1]) if ok is not None else None
             log_click_file(f"[PIN Debug] Janela (x, y, largura, altura) {screen_rect}, "
-                           f"dígitos {screen_buttons}, OK {screen_ok} (tela).")
+                           f"{len(ordered_buttons)} teclas reconhecidas, OK {screen_ok} (tela).")
             self._pin_debug_logged = reading
 
         pool = self.canvas_pool
@@ -13205,7 +14171,7 @@ class Overlay:
         outline = "#14b8a6"
         pool.get_rect(x - 2, y - 2, x + width + 2, y + height + 2,
                       fill="", outline=outline, width=1, dash=())
-        info = f"{len(reading[2])}/10 dígitos"
+        info = f"Grade: {len(reading[2])}/10 teclas"
         summary = pool.get_text(x + 6, y - 6, text=f"{info} · {status}",
                                 anchor="sw", font=("Segoe UI", 9, "bold"), fill="#e0f2fe")
         left, top, right, bottom = self.canvas.bbox(summary)
@@ -13237,10 +14203,10 @@ class Overlay:
         return True
 
     def draw(self, snapshot, stats=None):
+        world = getattr(self.feed, "world", None)
         if not self._hud_render_foreground:
             self._position_render_window(None)
             return False
-        world = getattr(self.feed, "world", None)
         live_dialog = world.npc_dialog if world is not None else None
         dialog = snapshot.npc_dialog or live_dialog
         now = time.monotonic()
@@ -13252,7 +14218,7 @@ class Overlay:
             getattr(self, "_pin_dialog_screen_rect", None) is not None
             and now < getattr(self, "_pin_hud_suppress_until", 0.0)
         )
-        if self.filters_config["kafra_pin_debug"]:
+        if self.filters_config["kafra_pin_debug"] or getattr(self, "_pin_click_probe", None) is not None:
             if frame := self._pin_debug_frame(snapshot.viewport, now):
                 return self._draw_pin_debug(snapshot.viewport, *frame)
             pin_active = pin_active or bool(getattr(self, "_pin_overlay_visible_cache", False))
@@ -13341,7 +14307,9 @@ class Overlay:
 
                 if is_locked_drop:
                     label += " [VIGÍLIA]" if tier == 1 and retrying else " [COLETANDO]"
-                    self.canvas_pool.get_oval(cx - 5, cy - 5, cx + 5, cy + 5, outline="#4ADE80", width=3)
+                    radius = LOOT_CLICK_RADIUS
+                    self.canvas_pool.get_oval(cx - radius, cy - radius, cx + radius, cy + radius,
+                                              outline="#4ADE80", width=3)
                 else:
                     self.canvas_pool.get_oval(cx - 4, cy - 4, cx + 4, cy + 4, outline=color, width=2)
                 self.canvas_pool.get_oval(ax - 3, ay - 3, ax + 3, ay + 3, outline=color, width=1)
@@ -13563,7 +14531,7 @@ def find_process_window(pid):
                     u32.GetClientRect(hwnd, ctypes.byref(rect))
                     w = rect.right - rect.left
                     h = rect.bottom - rect.top
-                    if w > 50 and h > 50:
+                    if (w > 50 and h > 50) or u32.IsIconic(hwnd):
                         windows.append((hwnd, buf.value))
         return True
 
@@ -13728,6 +14696,8 @@ def autodetect_live_session(args):
 
     # 3. Janela e handle pertencente ao Ragexe.exe (com override manual)
     hwnd, title = find_process_window(target_proc.pid)
+    if not hwnd:
+        hwnd, _, title = find_ragnarok_window(target_proc.pid)
     args.window_handle = hwnd
     args.ragexe_pid = target_proc.pid
     if not args.window:
@@ -13831,7 +14801,7 @@ def run_live(root, args, names):
         overlay.auto_patrol = True
     if getattr(args, "route", None):
         r_map, r_x, r_y, r_target = args.route
-        overlay.patrol_target_route = (r_map, int(r_x), int(r_y), r_target)
+        overlay.patrol_target_route = (r_map, int(r_x), int(r_y), int(r_target) if r_target.isdecimal() else r_target)
     if getattr(args, "serial_port", None):
         overlay.serial_hid.connect(args.serial_port, getattr(args, "serial_baud", 115200))
     if getattr(args, "interception_dll", None):
@@ -13939,8 +14909,6 @@ def main():
     if args.admin or args.live or args.mock:
         shell = ctypes.windll.shell32
         if not shell.IsUserAnAdmin():
-            if existing_osk := u32.FindWindowW("OSKMainClass", None):
-                Overlay._tuck_osk_window(existing_osk)
             relaunch = shell.ShellExecuteW
             relaunch.argtypes = (
                 wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,
@@ -13955,8 +14923,6 @@ def main():
             if result > 32:
                 return
             print(f"[Admin] Elevação UAC não concedida (código {result}). O Windows pode bloquear cliques no jogo.", flush=True)
-    if existing_osk := u32.FindWindowW("OSKMainClass", None):
-        Overlay._tuck_osk_window(existing_osk)
     if args.list_interfaces:
         try:
             list_interfaces()
